@@ -291,3 +291,38 @@ SKIP line). Never include `.env`, private keys, or addresses in screenshots.
   (~3 s); delete the file to resume. **Test-covered.**
 - Signed supervisor `pause` / `emergency_stop` (optional, audited).
 - Full stop on EC2: `sudo systemctl stop hl-trading-bot.target`.
+
+---
+
+## Appendix C — Feature tiers: implemented vs. roadmap
+
+The system is organised as feature *tiers*. Tier 1, Tier 1.5, and the
+data-collection half of Tier 2 are **implemented** in this repository; the
+remaining Tier 2 signals and all of Tier 3–4 are **designed roadmap items**, kept
+toggle-controlled and off by default so they cannot affect the live path. Status
+is stated honestly: "implemented" means the code exists and runs; "shadow" means it
+collects/logs only and never influences orders; "roadmap" means not yet built.
+
+| Tier | Capability | Status | Where |
+|------|------------|--------|-------|
+| **1** | Deep-learning ensemble (LSTM / TCN / Transformer / advanced) | ✅ Implemented | `ml_dl/dl_ensemble.py`, `ml_dl/dl_models*.py` |
+| **1** | Price/volatility/volume features (returns, realized vol, volume ratios, OBV, money-flow, range/wick structure; EMA/RSI/VOLZ config) | ✅ Implemented | `features.py`, `config/run.json` (`FEATURE_*`) |
+| **1** | Market microstructure (order-book imbalance, bid/ask spread, volume bursts) | ✅ Implemented | `atb/features/microstructure.py`, `ml_dl/micro_gates.py` |
+| **1** | Risk controls (position sizing, max exposure, TP/SL, time-stop, daily loss/DD) | ✅ Implemented | `tools/live_executor.py`, `v2/risk_controls.py` |
+| **1.5** | Telegram controller + notifier bots | ✅ Implemented (optional) | `tools/telegram_controller.py`, `tools/telegram_notifier.py` |
+| **1.5** | Heartbeat + watchdog (stall detection / auto-restart) | ✅ Implemented | heartbeat JSON in `logs/`, `tools/watchdog.py` |
+| **1.5** | Unified config (`.env` + `run.json`) and log rotation | ✅ Implemented | `runtime/loader.py`, `config/run.json`, `tools/v2_log_archive.py` |
+| **2** | Funding rate + open interest collectors | ✅ Implemented (shadow) | `tier2/collectors/funding_rate.py`, `open_interest.py` |
+| **2** | Tier-2 feature store + shadow runner + shadow-influence engine | ✅ Implemented (shadow, off by default) | `tier2/shadow_runner.py`, `config/run.json` (`TIER2_*`, `TIER2_INFLUENCE_MODE=shadow`) |
+| **2** | Token-unlock schedule, news/sentiment, whale/CEX flow | 🗺️ Roadmap | — |
+| **3** | Weighted Attention Memory Routing (WAMR), BTC/ETH-dominance & stablecoin-flow regime detection, social sentiment, regime-aware heads | 🗺️ Roadmap | — |
+| **4** | Dev activity, on-chain usage, Google Trends, macro correlations (DXY/Gold/S&P) | 🗺️ Roadmap | — |
+
+**Honest evaluation note.** In paper/testnet runs the current Tier-1 signal does not
+yet produce consistent profit — exits are dominated by flip-churn at a tight
+threshold. This is treated as a **finding**: the execution, risk-management,
+monitoring, and deployment framework is complete and robust, while *alpha* is the
+open problem. The tiers above are the planned path to add predictive edge; each
+roadmap item is designed to be added behind a toggle and validated in shadow mode
+against the baseline before it is ever allowed to influence orders (the same
+discipline already used for the Tier-2 shadow-influence engine).
