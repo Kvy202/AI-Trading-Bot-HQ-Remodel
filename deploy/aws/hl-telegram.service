@@ -1,0 +1,22 @@
+[Unit]
+Description=Hyperliquid AI Bot - Telegram Notifier
+After=network-online.target hl-executor.service
+Wants=network-online.target
+# Sends health alerts and daily PnL summaries to a Telegram chat.
+# Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/.env
+Environment=PYTHONPATH=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/.venv/bin/python tools/telegram_notifier.py \
+    --interval 60
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:__INSTALL_DIR__/logs/telegram_notifier.out
+StandardError=append:__INSTALL_DIR__/logs/telegram_notifier.err
+
+[Install]
+WantedBy=hl-trading-bot.target

@@ -1,0 +1,25 @@
+[Unit]
+Description=Hyperliquid AI Bot - Tier 2 Shadow Data Collector
+After=network-online.target
+Wants=network-online.target
+# Tier 2 is completely independent of writer/executor — it only writes to the
+# SQLite feature store and never touches live_signals.csv.
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/.env
+Environment=PYTHONPATH=__INSTALL_DIR__
+# Requires TIER2_ENABLED=1 in .env (default is 0 in run.json for safety).
+# TIER2_SHADOW_ONLY=1 is enforced inside the runner — it will refuse to start
+# if set to 0, guarding against accidental signal injection into the live path.
+ExecStart=__INSTALL_DIR__/.venv/bin/python tier2/shadow_runner.py \
+    --interval 60
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:__INSTALL_DIR__/logs/tier2_shadow.out
+StandardError=append:__INSTALL_DIR__/logs/tier2_shadow.err
+
+[Install]
+WantedBy=hl-trading-bot.target
