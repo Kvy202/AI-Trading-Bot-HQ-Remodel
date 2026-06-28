@@ -511,6 +511,18 @@ def lock_master_cols(path: Path, base_cols: List[str], extra_cols: List[str]) ->
     return list(base_cols) + sorted(c for c in extra_cols if c not in base_cols)
 
 
+def ensure_csv_schema(path: Path, cols: List[str], label: str) -> None:
+    """Ensure a CSV has the requested schema, rotating old schemas aside."""
+    existing = read_existing_header(path)
+    if existing and existing != cols:
+        rotated = path.with_name(
+            f"{path.stem}_{datetime.now(timezone.utc):%Y%m%d%H%M%S}{path.suffix}"
+        )
+        path.rename(rotated)
+        log(f"{label} schema changed; rotated old file to {rotated.name}")
+    ensure_header(path, cols)
+
+
 # ---------------------------------------------------------------------------
 # Main writer loop
 # ---------------------------------------------------------------------------
@@ -551,11 +563,14 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     isolation_filter = None
     isolation_shadow_cols: Optional[List[str]] = None
+    isolation_blocking = False
     if exp_flags.use_isolation_forest:
         try:
             from ml_optional.isolation_filter import (
                 ISOLATION_SHADOW_COLS,
                 IsolationFilter,
+                isolation_blocking_from_env,
+                should_block_entry,
             )
             isolation_filter = IsolationFilter.from_env(
                 enabled=True,
@@ -563,9 +578,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 log_fn=log,
             )
             isolation_shadow_cols = ISOLATION_SHADOW_COLS
+            isolation_blocking = isolation_blocking_from_env(False)
+            ensure_csv_schema(ISOLATION_SHADOW_LOG, isolation_shadow_cols, "isolation shadow log")
             log(
                 "isolation_enabled=1 "
                 f"isolation_status={isolation_filter.isolation_status} "
+                f"isolation_blocking={int(isolation_blocking)} "
                 f"artifact_path={isolation_filter.artifact_path}"
             )
         except Exception as e:
@@ -821,22 +839,6 @@ def main(argv: Optional[List[str]] = None) -> None:
                 # 5) Write per-symbol signal rows — each from its OWN prediction.
                 missing_price_syms: List[str] = []
                 for sym in syms:
-                    if isolation_filter is not None and isolation_filter.ready:
-                        try:
-                            _iso_window = windows.get(sym)
-                            if _iso_window is not None and isolation_shadow_cols is not None:
-                                _iso = isolation_filter.evaluate(sym, _iso_window)
-                                append_aligned_row(
-                                    ISOLATION_SHADOW_LOG,
-                                    isolation_shadow_cols,
-                                    _iso.to_log_row(ts_now, sym),
-                                )
-                        except Exception as _iso_exc:
-                            log_err(
-                                "isolation_status=prediction_log_error "
-                                f"symbol={sym} reason={type(_iso_exc).__name__}: {_iso_exc}"
-                            )
-
                     pred = per_symbol_pred.get(sym)
                     if pred is None:
                         # No window/score for this symbol this tick -> safe no-trade.
@@ -875,6 +877,35 @@ def main(argv: Optional[List[str]] = None) -> None:
                     # Feature-distribution guard: refuse to trade on OOD inputs.
                     if feature_guard_block:
                         sig_allow = 0
+                    _iso = None
+                    isolation_actually_blocked = False
+                    if isolation_filter is not None:
+                        try:
+                            _iso_window = windows.get(sym)
+                            _iso = isolation_filter.evaluate(sym, _iso_window)
+                            isolation_actually_blocked = (
+                                bool(sig_allow)
+                                and should_block_entry(_iso, isolation_blocking)
+                            )
+                            if isolation_actually_blocked:
+                                sig_allow = 0
+                                log(
+                                    "SKIP "
+                                    f"{sym} reason=isolation_forest_block "
+                                    f"anomaly_status={_iso.anomaly_status} "
+                                    f"anomaly_score={_iso.anomaly_score}"
+                                )
+                            if _iso.isolation_status == "model_error":
+                                log(
+                                    "isolation_status=model_error "
+                                    f"symbol={sym} reason={_iso.reason}"
+                                )
+                        except Exception as _iso_exc:
+                            log_err(
+                                "isolation_status=model_error "
+                                f"symbol={sym} reason={type(_iso_exc).__name__}: {_iso_exc}"
+                            )
+                            _iso = None
                     row = {
                         "ts": ts_now,
                         "symbol": sym,
@@ -887,6 +918,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                         "kinds_used": ",".join(sorted(per_model_sym.keys())),
                         "side_hint": side_hint(p_centered),
                     }
+                    if _iso is not None and isolation_shadow_cols is not None:
+                        append_aligned_row(
+                            ISOLATION_SHADOW_LOG,
+                            isolation_shadow_cols,
+                            _iso.to_log_row(ts_now, sym, actually_blocked=isolation_actually_blocked),
+                        )
                     append_aligned_row(signals_path, SIGNAL_COLS, row)
 
                     if xgboost_confirmer is not None and xgboost_confirmer.ready:

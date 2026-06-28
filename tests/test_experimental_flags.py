@@ -1,7 +1,9 @@
 """Tests for default-off experimental flags."""
 
+import os
 from pathlib import Path
 
+from ml_optional.isolation_filter import isolation_blocking_from_env
 from runtime.experimental_flags import EXPERIMENTAL_FLAG_NAMES, ExperimentalFlags
 from runtime.loader import apply_run_config
 
@@ -31,11 +33,15 @@ def test_env_bool_parsing(monkeypatch):
 
 def test_run_config_false_defaults_load_through_existing_loader(monkeypatch):
     _clear_flags(monkeypatch)
+    monkeypatch.delenv("ISOLATION_FOREST_BLOCKING", raising=False)
 
     loaded = apply_run_config(ROOT)
     flags = ExperimentalFlags.from_env()
 
     assert set(EXPERIMENTAL_FLAG_NAMES).issubset(loaded)
+    assert loaded["ISOLATION_FOREST_BLOCKING"] == "False"
+    assert os.getenv("ISOLATION_FOREST_BLOCKING") == "False"
+    assert isolation_blocking_from_env() is False
     assert flags.as_env_dict() == {name: False for name in EXPERIMENTAL_FLAG_NAMES}
 
 

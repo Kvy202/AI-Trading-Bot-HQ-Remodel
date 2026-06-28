@@ -48,6 +48,7 @@
 
   "experimental": {
     "USE_ISOLATION_FOREST": false,
+    "ISOLATION_FOREST_BLOCKING": false,
     "USE_XGBOOST_SIGNAL": false,
     "USE_SURVIVAL_EXIT": false,
     "USE_ADVANCED_RISK": false

@@ -3,7 +3,7 @@
 Phase 2 contract:
 * optional and default-off via USE_ISOLATION_FOREST
 * missing artifacts never crash the writer
-* predictions are logged only; they never block trades in this phase
+* Phase 6 blocking only activates when ISOLATION_FOREST_BLOCKING is also true
 """
 
 from __future__ import annotations
@@ -17,14 +17,18 @@ import numpy as np
 
 DEFAULT_ARTIFACT = "model_artifacts/isolation_forest.joblib"
 
+_TRUE = {"1", "true", "yes", "y", "on"}
+
 ISOLATION_SHADOW_COLS = [
     "ts",
+    "timestamp",
     "symbol",
     "isolation_enabled",
     "isolation_status",
     "anomaly_status",
     "anomaly_score",
     "would_block",
+    "actually_blocked",
     "reason",
     "model_version",
     "artifact_path",
@@ -35,6 +39,13 @@ def artifact_path_from_env(base_dir: Path | str) -> Path:
     raw = (os.getenv("ISOLATION_FOREST_ARTIFACT") or DEFAULT_ARTIFACT).strip()
     path = Path(raw)
     return path if path.is_absolute() else Path(base_dir) / path
+
+
+def isolation_blocking_from_env(default: bool = False) -> bool:
+    raw = os.getenv("ISOLATION_FOREST_BLOCKING")
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    return raw.strip().lower() in _TRUE
 
 
 def window_to_isolation_vector(window: Any) -> np.ndarray:
@@ -63,16 +74,19 @@ class IsolationResult:
     model_version: str
     artifact_path: str
 
-    def to_log_row(self, ts: str, symbol: str) -> Dict[str, Any]:
+    def to_log_row(self, ts: str, symbol: str, actually_blocked: bool = False) -> Dict[str, Any]:
+        reason = "isolation_forest_block" if actually_blocked else self.reason
         return {
             "ts": ts,
+            "timestamp": ts,
             "symbol": symbol,
             "isolation_enabled": int(self.isolation_enabled),
             "isolation_status": self.isolation_status,
             "anomaly_status": self.anomaly_status,
             "anomaly_score": "" if self.anomaly_score is None else float(self.anomaly_score),
             "would_block": int(self.would_block),
-            "reason": self.reason,
+            "actually_blocked": int(bool(actually_blocked)),
+            "reason": reason,
             "model_version": self.model_version,
             "artifact_path": self.artifact_path,
         }
@@ -162,6 +176,17 @@ class IsolationFilter:
                 model_version=self.model_version,
                 artifact_path=str(self.artifact_path),
             )
+        if window is None:
+            return IsolationResult(
+                isolation_enabled=True,
+                isolation_status="no_window",
+                anomaly_status="not_run",
+                anomaly_score=None,
+                would_block=False,
+                reason="no_window",
+                model_version=self.model_version,
+                artifact_path=str(self.artifact_path),
+            )
         try:
             x = window_to_isolation_vector(window)
             score: Optional[float] = None
@@ -191,12 +216,26 @@ class IsolationFilter:
         except Exception as exc:
             return IsolationResult(
                 isolation_enabled=True,
-                isolation_status="prediction_error",
+                isolation_status="model_error",
                 anomaly_status="error",
                 anomaly_score=None,
                 would_block=False,
-                reason=f"prediction_error:{type(exc).__name__}",
+                reason=f"model_error:{type(exc).__name__}",
                 model_version=self.model_version,
                 artifact_path=str(self.artifact_path),
             )
 
+
+def should_block_entry(result: IsolationResult, blocking_enabled: bool) -> bool:
+    """Return whether Phase 6 should block a new entry.
+
+    This helper is intentionally strict: only a loaded model's anomaly result can
+    block, and only when the explicit blocking flag is true.
+    """
+    return bool(
+        blocking_enabled
+        and result.isolation_enabled
+        and result.isolation_status == "loaded"
+        and result.anomaly_status == "anomaly"
+        and result.would_block
+    )
