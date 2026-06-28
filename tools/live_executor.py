@@ -90,6 +90,7 @@ HEARTBEAT_JSON      = LOGS_DIR / "heartbeat.json"
 SUPERVISOR_CMD_FILE = LOGS_DIR / "supervisor_cmd.json"
 SUPERVISOR_ACK_FILE = LOGS_DIR / "supervisor_ack.json"
 CLOSED_MASTER_CSV   = LOGS_DIR / "trades_closed.csv"
+SURVIVAL_SHADOW_LOG = LOGS_DIR / "survival_exit_shadow.csv"
 
 # V2 optional risk controls (v2/risk_controls.py). Stays None unless main()
 # initializes it; every use is None-guarded + try/except so a V2 failure can
@@ -887,6 +888,8 @@ def build_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Suspend new entries when >=95%% of recent allowed signals are "
                              "one-sided. TP/SL exits and flip-closes remain active.")
     parser.add_argument("--no-bias-guard", dest="bias_guard", action="store_false")
+    parser.add_argument("--survival-self-test", action="store_true",
+                        help="Verify Survival Analysis shadow logging, then exit before execution.")
     return parser.parse_args(argv)
 
 
@@ -924,8 +927,68 @@ def main(argv: Optional[List[str]] = None) -> None:
     live = decision.place_real_orders
     sandbox = decision.sandbox
     mode_name = decision.mode_name
+    exp_flags = ExperimentalFlags.from_env()
     log(f"settings: {settings.summary()}")
-    log(f"experimental_flags: {ExperimentalFlags.from_env().summary()}")
+    log(f"experimental_flags: {exp_flags.summary()}")
+
+    survival_exit_model = None
+    survival_shadow_cols: Optional[List[str]] = None
+    if exp_flags.use_survival_exit:
+        try:
+            from ml_optional.survival_exit import (
+                SURVIVAL_SHADOW_COLS,
+                SurvivalExitModel,
+            )
+            survival_exit_model = SurvivalExitModel.from_env(
+                enabled=True,
+                base_dir=BASE_DIR,
+                log_fn=log,
+            )
+            survival_shadow_cols = SURVIVAL_SHADOW_COLS
+            log(
+                "survival_enabled=1 "
+                f"survival_status={survival_exit_model.survival_status} "
+                f"artifact_path={survival_exit_model.artifact_path}"
+            )
+        except Exception as e:
+            log_err(f"survival_status=disabled_init_error reason={type(e).__name__}: {e}")
+            survival_exit_model = None
+
+    if args.survival_self_test:
+        try:
+            if survival_exit_model is not None and survival_exit_model.ready and survival_shadow_cols is not None:
+                _surv = survival_exit_model.evaluate(
+                    symbol="VERIFY",
+                    side="long",
+                    trade_id="self-test",
+                    entry_time="2026-06-28 00:00:00+0000",
+                    current_age_seconds=900.0,
+                    current_unrealized_pnl=-0.02,
+                    entry_price=100.0,
+                    current_price=99.0,
+                    qty=0.1,
+                )
+                _row = _surv.to_log_row(utc_ts(), "VERIFY")
+                append_csv(SURVIVAL_SHADOW_LOG, survival_shadow_cols, [_row.get(c, "") for c in survival_shadow_cols])
+                log(
+                    "survival_self_test=shadow_row_written "
+                    f"survival_risk_score={_surv.survival_risk_score} "
+                    f"estimated_time_to_exit={_surv.estimated_time_to_exit} "
+                    f"would_hold={int(_surv.would_hold)} "
+                    f"would_exit_early={int(_surv.would_exit_early)} "
+                    f"reason={_surv.reason}"
+                )
+            elif survival_exit_model is not None:
+                log(
+                    "survival_self_test=not_ready "
+                    f"survival_status={survival_exit_model.survival_status} "
+                    f"reason={survival_exit_model.reason}"
+                )
+            else:
+                log("survival_self_test=not_enabled")
+        finally:
+            pass
+        return
 
     single_instance_lock()
     atexit.register(unlock)
@@ -964,6 +1027,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     last_fill_time: Dict[str, float] = {}
     last_fill_price: Dict[str, float] = {}
     positions: Dict[str, Position] = {}
+    survival_entry_ts: Dict[str, float] = {}
+    survival_trade_ids: Dict[str, str] = {}
     active_symbols: set[str] = set()
     idle_no_file = 0
     idle_no_new = 0
@@ -1035,6 +1100,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 log(f"RESTART_CLOSE {mode_name} {action} {sym} qty={pos.qty} "
                     f"px={exit_fill:.8f} order={order_id} {reason}")
                 positions.pop(sym)
+                survival_entry_ts.pop(sym, None)
+                survival_trade_ids.pop(sym, None)
                 active_symbols.discard(sym)
 
     # --- V2 optional risk controls (all flags off by default) ---------------
@@ -1176,6 +1243,39 @@ def main(argv: Optional[List[str]] = None) -> None:
 
                 pos = positions.get(sig.symbol)
 
+                if pos and survival_exit_model is not None and survival_exit_model.ready:
+                    try:
+                        entry_epoch = survival_entry_ts.get(sig.symbol)
+                        signal_epoch = _parse_signal_ts(sig.ts) or time.time()
+                        age_seconds = None if entry_epoch is None else max(0.0, signal_epoch - entry_epoch)
+                        entry_time = (
+                            datetime.fromtimestamp(entry_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
+                            if entry_epoch is not None else ""
+                        )
+                        _surv = survival_exit_model.evaluate(
+                            symbol=sig.symbol,
+                            side=pos.side,
+                            trade_id=survival_trade_ids.get(sig.symbol, ""),
+                            entry_time=entry_time,
+                            current_age_seconds=age_seconds,
+                            current_unrealized_pnl=pnl_on_close(pos, price),
+                            entry_price=pos.avg,
+                            current_price=price,
+                            qty=pos.qty,
+                        )
+                        if survival_shadow_cols is not None:
+                            _row = _surv.to_log_row(sig.ts, sig.symbol)
+                            append_csv(
+                                SURVIVAL_SHADOW_LOG,
+                                survival_shadow_cols,
+                                [_row.get(c, "") for c in survival_shadow_cols],
+                            )
+                    except Exception as _surv_exc:
+                        log_err(
+                            "survival_status=prediction_log_error "
+                            f"symbol={sig.symbol} reason={type(_surv_exc).__name__}: {_surv_exc}"
+                        )
+
                 # 1) Exit on TP/SL before any new-entry logic.
                 if pos:
                     hit_tp, hit_sl = check_tp_sl(pos, price, args.tp_pct, args.sl_pct)
@@ -1190,6 +1290,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                         record_closed_trade(sig.ts, sig.symbol, action, pos.qty, pos.avg, exit_fill, pnl, reason)
                         log(f"TRADE {mode_name} {action} {sig.symbol} qty={pos.qty} px={exit_fill:.8f} order={order_id} {reason}")
                         positions.pop(sig.symbol, None)
+                        survival_entry_ts.pop(sig.symbol, None)
+                        survival_trade_ids.pop(sig.symbol, None)
                         active_symbols.discard(sig.symbol)
                         _flip_pending.pop(sig.symbol, None)
                         last_fill_time[sig.symbol] = time.time()
@@ -1216,6 +1318,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                         record_closed_trade(sig.ts, sig.symbol, action, pos.qty, pos.avg, exit_fill, pnl, reason)
                         log(f"TRADE {mode_name} {action} {sig.symbol} qty={pos.qty} px={exit_fill:.8f} order={order_id} {reason}")
                         positions.pop(sig.symbol, None)
+                        survival_entry_ts.pop(sig.symbol, None)
+                        survival_trade_ids.pop(sig.symbol, None)
                         active_symbols.discard(sig.symbol)
                         _flip_pending.pop(sig.symbol, None)
                         last_fill_time[sig.symbol] = time.time()
@@ -1334,6 +1438,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                     record_closed_trade(sig.ts, sig.symbol, action_close, pos.qty, pos.avg, exit_fill, pnl, reason)
                     log(f"TRADE {mode_name} {action_close} {sig.symbol} qty={pos.qty} px={exit_fill:.8f} order={order_id} {reason}")
                     positions.pop(sig.symbol, None)
+                    survival_entry_ts.pop(sig.symbol, None)
+                    survival_trade_ids.pop(sig.symbol, None)
                     active_symbols.discard(sig.symbol)
                     last_fill_time[sig.symbol] = now_s
                     last_fill_price[sig.symbol] = price
@@ -1384,6 +1490,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 reason = f"ENTRY p={sig.p_meta:.4f} rv={sig.rv_mean:.6f} eff_thr={exec_thr:.4f}"
                 record_trade(paper_path, [sig.ts, sig.symbol, action_open, entry_fill, qty, reason, mode_name, order_id])
                 positions[sig.symbol] = Position(want, qty, entry_fill)
+                survival_entry_ts[sig.symbol] = _parse_signal_ts(sig.ts) or now_s
+                survival_trade_ids[sig.symbol] = f"{sig.symbol}:{sig.ts}"
                 active_symbols.add(sig.symbol)
                 _flip_pending.pop(sig.symbol, None)
                 # V2 hook: start the time-stop clock (single entry site - the

@@ -57,6 +57,12 @@
     "XGBOOST_SIGNAL_ARTIFACT": "model_artifacts/xgboost_signal.joblib",
     "XGBOOST_CONFIDENCE_THRESHOLD": 0.60
   },
+
+  "survival_exit": {
+    "SURVIVAL_EXIT_ARTIFACT": "model_artifacts/survival_exit.joblib",
+    "SURVIVAL_EXIT_RISK_THRESHOLD": 0.60
+  },
+
   "features": {
     "FEATURE_ENABLE":       1,
     "FEATURE_TIMEFRAME":    "1m",
