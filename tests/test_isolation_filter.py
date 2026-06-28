@@ -2,9 +2,10 @@
 
 from pathlib import Path
 
+import joblib
 import numpy as np
 
-from ml_optional.isolation_filter import IsolationFilter
+from ml_optional.isolation_filter import ISOLATION_SHADOW_COLS, IsolationFilter
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -86,3 +87,38 @@ def test_abnormal_prediction_behavior_using_mocked_model():
     assert res.anomaly_score == -0.34
     assert res.would_block is True
     assert res.reason == "isolation_anomaly"
+
+
+def test_artifact_save_load_behavior(monkeypatch):
+    artifact_path = ROOT / "tests" / ".tmp_isolation_filter_test.joblib"
+    try:
+        joblib.dump(
+            {"model": MockIsolationModel(pred=1, score=0.25), "model_version": "unit-test"},
+            artifact_path,
+        )
+        monkeypatch.setenv("ISOLATION_FOREST_ARTIFACT", str(artifact_path))
+        flt = IsolationFilter.from_env(enabled=True, base_dir=ROOT)
+        assert flt.ready is True
+        assert flt.model_version == "unit-test"
+        res = flt.evaluate("BTCUSDT", _window())
+        assert res.anomaly_status == "normal"
+        assert res.anomaly_score == 0.25
+    finally:
+        if artifact_path.exists():
+            artifact_path.unlink()
+
+
+def test_shadow_log_row_format():
+    model = MockIsolationModel(pred=-1, score=-0.2)
+    flt = IsolationFilter(
+        enabled=True,
+        artifact_path=Path("mock.joblib"),
+        model=model,
+        model_version="row-format",
+        isolation_status="loaded",
+    )
+    row = flt.evaluate("BTCUSDT", _window()).to_log_row("2026-06-28 00:00:00+0000", "BTCUSDT")
+    assert list(row.keys()) == ISOLATION_SHADOW_COLS
+    assert row["anomaly_status"] == "anomaly"
+    assert row["would_block"] == 1
+    assert row["reason"] == "isolation_anomaly"

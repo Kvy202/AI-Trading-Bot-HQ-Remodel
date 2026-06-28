@@ -298,6 +298,8 @@ def build_args() -> argparse.Namespace:
                    choices=["abs", "raw"])
     p.add_argument("--lookback-pad", type=int, default=int(os.getenv("DL_MAX_LOOKBACK_PAD", "6000")))
     p.add_argument("--stale-sec", type=int, default=int(os.getenv("DL_WRITER_STALE_SEC", "600")))
+    p.add_argument("--isolation-self-test", action="store_true",
+                   help="Verify Isolation Forest shadow logging, then exit before market/model work.")
     return p.parse_args()
 
 
@@ -323,6 +325,15 @@ def _is_valid_price(x: Any) -> bool:
         return math.isfinite(v) and v > 0
     except Exception:
         return False
+
+
+def _isolation_sample_window(model: Any) -> np.ndarray:
+    n_features = int(getattr(model, "n_features_in_", 0) or 0)
+    if n_features <= 0:
+        raise RuntimeError("Isolation model does not expose n_features_in_")
+    live_width = n_features // 4 if n_features % 4 == 0 else n_features
+    base = np.linspace(-0.5, 0.5, live_width, dtype=np.float32)
+    return np.vstack([base * 0.25, base * 0.5, base * 0.75, base]).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +554,34 @@ def main(argv: Optional[List[str]] = None) -> None:
         except Exception as e:
             log_err(f"isolation_status=disabled_init_error reason={type(e).__name__}: {e}")
             isolation_filter = None
+
+    if args.isolation_self_test:
+        try:
+            if isolation_filter is not None and isolation_filter.ready and isolation_shadow_cols is not None:
+                _iso = isolation_filter.evaluate("VERIFY", _isolation_sample_window(isolation_filter.model))
+                append_aligned_row(
+                    ISOLATION_SHADOW_LOG,
+                    isolation_shadow_cols,
+                    _iso.to_log_row(_ts(), "VERIFY"),
+                )
+                log(
+                    "isolation_self_test=shadow_row_written "
+                    f"anomaly_status={_iso.anomaly_status} "
+                    f"anomaly_score={_iso.anomaly_score} "
+                    f"would_block={int(_iso.would_block)} "
+                    f"reason={_iso.reason}"
+                )
+            elif isolation_filter is not None:
+                log(
+                    "isolation_self_test=not_ready "
+                    f"isolation_status={isolation_filter.isolation_status} "
+                    f"reason={isolation_filter.reason}"
+                )
+            else:
+                log("isolation_self_test=not_enabled")
+        finally:
+            writer_unlock()
+        return
 
     # Load the model ensemble.
     try:
