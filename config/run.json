@@ -46,6 +46,13 @@
     "DL_TEMP_TX":     1.0
   },
 
+  "experimental": {
+    "USE_ISOLATION_FOREST": false,
+    "USE_XGBOOST_SIGNAL": false,
+    "USE_SURVIVAL_EXIT": false,
+    "USE_ADVANCED_RISK": false
+  },
+
   "features": {
     "FEATURE_ENABLE":       1,
     "FEATURE_TIMEFRAME":    "1m",

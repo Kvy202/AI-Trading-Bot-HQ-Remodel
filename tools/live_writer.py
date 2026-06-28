@@ -74,6 +74,8 @@ try:
 except ImportError:
     pass
 
+from runtime.experimental_flags import ExperimentalFlags
+
 LOGS = BASE_DIR / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
 
@@ -514,6 +516,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     # full locked schema on their first append_aligned_row call instead.
     # (The signals file has a fixed schema, so pre-creating it is fine.)
     ensure_header(signals_path, SIGNAL_COLS)
+
+    exp_flags = ExperimentalFlags.from_env()
+    log(f"experimental_flags: {exp_flags.summary()}")
 
     # Load the model ensemble.
     try:

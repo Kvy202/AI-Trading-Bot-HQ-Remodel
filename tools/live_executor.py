@@ -77,6 +77,7 @@ if str(BASE_DIR) not in sys.path:
 # lazily, and settings/guardrails are stdlib-only.
 from exchanges.types import Position
 from exchanges.factory import make_adapter
+from runtime.experimental_flags import ExperimentalFlags
 from runtime.settings import Settings, scrub
 from runtime.guardrails import resolve_trading_mode
 
@@ -924,6 +925,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     sandbox = decision.sandbox
     mode_name = decision.mode_name
     log(f"settings: {settings.summary()}")
+    log(f"experimental_flags: {ExperimentalFlags.from_env().summary()}")
 
     single_instance_lock()
     atexit.register(unlock)
