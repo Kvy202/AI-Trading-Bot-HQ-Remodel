@@ -39,3 +39,9 @@ config/secrets.json
 # Local trained model artifacts
 model_artifacts/*.joblib
 
+
+# Local generated experimental outputs
+model_artifacts/*.joblib
+reports/experimental_shadow_summary.json
+logs/*shadow*.csv
+
