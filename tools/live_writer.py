@@ -93,6 +93,7 @@ DAILY_PREFIX = "live_meta_log_"
 # on the trading path.
 MODELS_BY_SYMBOL: Path = LOGS / "live_models_by_symbol.csv"
 ISOLATION_SHADOW_LOG: Path = LOGS / "isolation_forest_shadow.csv"
+XGBOOST_SHADOW_LOG: Path = LOGS / "xgboost_signal_shadow.csv"
 
 # Stable column schemas. The executor reads the first 8 columns of SIGNALS,
 # in this exact order, so don't reorder these without updating the executor.
@@ -300,6 +301,8 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--stale-sec", type=int, default=int(os.getenv("DL_WRITER_STALE_SEC", "600")))
     p.add_argument("--isolation-self-test", action="store_true",
                    help="Verify Isolation Forest shadow logging, then exit before market/model work.")
+    p.add_argument("--xgboost-self-test", action="store_true",
+                   help="Verify XGBoost signal shadow logging, then exit before market/model work.")
     return p.parse_args()
 
 
@@ -332,6 +335,20 @@ def _isolation_sample_window(model: Any) -> np.ndarray:
     if n_features <= 0:
         raise RuntimeError("Isolation model does not expose n_features_in_")
     live_width = n_features // 4 if n_features % 4 == 0 else n_features
+    base = np.linspace(-0.5, 0.5, live_width, dtype=np.float32)
+    return np.vstack([base * 0.25, base * 0.5, base * 0.75, base]).astype(np.float32)
+
+
+def _xgboost_sample_window(model: Any) -> np.ndarray:
+    n_features = int(getattr(model, "n_features_in_", 0) or 0)
+    if n_features <= 0 and hasattr(model, "get_booster"):
+        try:
+            n_features = int(model.get_booster().num_features())
+        except Exception:
+            n_features = 0
+    if n_features <= 0:
+        raise RuntimeError("XGBoost model does not expose n_features_in_")
+    live_width = (n_features - 3) // 5 if n_features > 3 and (n_features - 3) % 5 == 0 else n_features
     base = np.linspace(-0.5, 0.5, live_width, dtype=np.float32)
     return np.vstack([base * 0.25, base * 0.5, base * 0.75, base]).astype(np.float32)
 
@@ -555,6 +572,28 @@ def main(argv: Optional[List[str]] = None) -> None:
             log_err(f"isolation_status=disabled_init_error reason={type(e).__name__}: {e}")
             isolation_filter = None
 
+    xgboost_confirmer = None
+    xgboost_shadow_cols: Optional[List[str]] = None
+    if exp_flags.use_xgboost_signal:
+        try:
+            from ml_optional.xgboost_signal import (
+                XGBOOST_SHADOW_COLS,
+                XGBoostSignalConfirmer,
+            )
+            xgboost_confirmer = XGBoostSignalConfirmer.from_env(
+                enabled=True,
+                base_dir=BASE_DIR,
+                log_fn=log,
+            )
+            xgboost_shadow_cols = XGBOOST_SHADOW_COLS
+            log(
+                "xgboost_enabled=1 "
+                f"xgboost_status={xgboost_confirmer.xgboost_status} "
+                f"artifact_path={xgboost_confirmer.artifact_path}"
+            )
+        except Exception as e:
+            log_err(f"xgboost_status=disabled_init_error reason={type(e).__name__}: {e}")
+            xgboost_confirmer = None
     if args.isolation_self_test:
         try:
             if isolation_filter is not None and isolation_filter.ready and isolation_shadow_cols is not None:
@@ -583,6 +622,41 @@ def main(argv: Optional[List[str]] = None) -> None:
             writer_unlock()
         return
 
+    if args.xgboost_self_test:
+        try:
+            if xgboost_confirmer is not None and xgboost_confirmer.ready and xgboost_shadow_cols is not None:
+                _xgb = xgboost_confirmer.evaluate(
+                    symbol="VERIFY",
+                    window=_xgboost_sample_window(xgboost_confirmer.model),
+                    existing_signal="LONG",
+                    existing_score=0.25,
+                    rv_mean=0.0,
+                    price=0.0,
+                )
+                append_aligned_row(
+                    XGBOOST_SHADOW_LOG,
+                    xgboost_shadow_cols,
+                    _xgb.to_log_row(_ts(), "VERIFY"),
+                )
+                log(
+                    "xgboost_self_test=shadow_row_written "
+                    f"xgboost_direction={_xgb.xgboost_direction} "
+                    f"xgboost_confidence={_xgb.xgboost_confidence} "
+                    f"would_confirm={int(_xgb.would_confirm)} "
+                    f"would_reject={int(_xgb.would_reject)} "
+                    f"reason={_xgb.reason}"
+                )
+            elif xgboost_confirmer is not None:
+                log(
+                    "xgboost_self_test=not_ready "
+                    f"xgboost_status={xgboost_confirmer.xgboost_status} "
+                    f"reason={xgboost_confirmer.reason}"
+                )
+            else:
+                log("xgboost_self_test=not_enabled")
+        finally:
+            writer_unlock()
+        return
     # Load the model ensemble.
     try:
         models, dev = load_ensemble(X_dim=30, device=None)
@@ -815,6 +889,28 @@ def main(argv: Optional[List[str]] = None) -> None:
                     }
                     append_aligned_row(signals_path, SIGNAL_COLS, row)
 
+                    if xgboost_confirmer is not None and xgboost_confirmer.ready:
+                        try:
+                            _xgb_window = windows.get(sym)
+                            if _xgb_window is not None and xgboost_shadow_cols is not None:
+                                _xgb = xgboost_confirmer.evaluate(
+                                    symbol=sym,
+                                    window=_xgb_window,
+                                    existing_signal=row["side_hint"],
+                                    existing_score=row.get("p_meta"),
+                                    rv_mean=row.get("rv_mean", 0.0),
+                                    price=px_final,
+                                )
+                                append_aligned_row(
+                                    XGBOOST_SHADOW_LOG,
+                                    xgboost_shadow_cols,
+                                    _xgb.to_log_row(ts_now, sym),
+                                )
+                        except Exception as _xgb_exc:
+                            log_err(
+                                "xgboost_status=prediction_log_error "
+                                f"symbol={sym} reason={type(_xgb_exc).__name__}: {_xgb_exc}"
+                            )
                     # Per-symbol-per-model diagnostics (missing models -> blank).
                     mbs_row: Dict[str, Any] = {"ts": ts_now, "symbol": sym, "px": px_final}
                     for _name, _vals in per_model_sym.items():

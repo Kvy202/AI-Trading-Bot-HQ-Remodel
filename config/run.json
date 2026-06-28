@@ -53,6 +53,10 @@
     "USE_ADVANCED_RISK": false
   },
 
+  "xgboost_signal": {
+    "XGBOOST_SIGNAL_ARTIFACT": "model_artifacts/xgboost_signal.joblib",
+    "XGBOOST_CONFIDENCE_THRESHOLD": 0.60
+  },
   "features": {
     "FEATURE_ENABLE":       1,
     "FEATURE_TIMEFRAME":    "1m",
