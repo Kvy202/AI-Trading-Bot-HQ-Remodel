@@ -35,3 +35,7 @@ config/secrets.json
 *.p12
 *.key
 *.crt
+
+# Local trained model artifacts
+model_artifacts/*.joblib
+
