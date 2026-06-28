@@ -92,6 +92,7 @@ DAILY_PREFIX = "live_meta_log_"
 # p_long for each symbol on every tick. Diagnostic only — nothing reads it
 # on the trading path.
 MODELS_BY_SYMBOL: Path = LOGS / "live_models_by_symbol.csv"
+ISOLATION_SHADOW_LOG: Path = LOGS / "isolation_forest_shadow.csv"
 
 # Stable column schemas. The executor reads the first 8 columns of SIGNALS,
 # in this exact order, so don't reorder these without updating the executor.
@@ -520,6 +521,29 @@ def main(argv: Optional[List[str]] = None) -> None:
     exp_flags = ExperimentalFlags.from_env()
     log(f"experimental_flags: {exp_flags.summary()}")
 
+    isolation_filter = None
+    isolation_shadow_cols: Optional[List[str]] = None
+    if exp_flags.use_isolation_forest:
+        try:
+            from ml_optional.isolation_filter import (
+                ISOLATION_SHADOW_COLS,
+                IsolationFilter,
+            )
+            isolation_filter = IsolationFilter.from_env(
+                enabled=True,
+                base_dir=BASE_DIR,
+                log_fn=log,
+            )
+            isolation_shadow_cols = ISOLATION_SHADOW_COLS
+            log(
+                "isolation_enabled=1 "
+                f"isolation_status={isolation_filter.isolation_status} "
+                f"artifact_path={isolation_filter.artifact_path}"
+            )
+        except Exception as e:
+            log_err(f"isolation_status=disabled_init_error reason={type(e).__name__}: {e}")
+            isolation_filter = None
+
     # Load the model ensemble.
     try:
         models, dev = load_ensemble(X_dim=30, device=None)
@@ -684,6 +708,22 @@ def main(argv: Optional[List[str]] = None) -> None:
                 # 5) Write per-symbol signal rows — each from its OWN prediction.
                 missing_price_syms: List[str] = []
                 for sym in syms:
+                    if isolation_filter is not None and isolation_filter.ready:
+                        try:
+                            _iso_window = windows.get(sym)
+                            if _iso_window is not None and isolation_shadow_cols is not None:
+                                _iso = isolation_filter.evaluate(sym, _iso_window)
+                                append_aligned_row(
+                                    ISOLATION_SHADOW_LOG,
+                                    isolation_shadow_cols,
+                                    _iso.to_log_row(ts_now, sym),
+                                )
+                        except Exception as _iso_exc:
+                            log_err(
+                                "isolation_status=prediction_log_error "
+                                f"symbol={sym} reason={type(_iso_exc).__name__}: {_iso_exc}"
+                            )
+
                     pred = per_symbol_pred.get(sym)
                     if pred is None:
                         # No window/score for this symbol this tick -> safe no-trade.
