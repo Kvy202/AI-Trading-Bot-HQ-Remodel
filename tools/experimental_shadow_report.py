@@ -76,14 +76,18 @@ def summarize_isolation(logs_dir: Path) -> Dict[str, Any]:
         for row in rows
         if str(row.get("anomaly_status", "")).strip().lower() in {"anomaly", "abnormal"}
     )
+    would_block_count = sum(1 for row in rows if _truthy(row.get("would_block")))
+    actually_blocked_count = sum(1 for row in rows if _truthy(row.get("actually_blocked")))
+    total_rows = len(rows)
     return {
         "file": str(path),
         "file_status": status,
-        "total_rows": len(rows),
+        "total_rows": total_rows,
         "normal_count": normal,
         "abnormal_count": abnormal,
-        "would_block_count": sum(1 for row in rows if _truthy(row.get("would_block"))),
-        "actually_blocked_count": sum(1 for row in rows if _truthy(row.get("actually_blocked"))),
+        "would_block_count": would_block_count,
+        "actually_blocked_count": actually_blocked_count,
+        "block_rate": 0.0 if total_rows == 0 else actually_blocked_count / total_rows,
         "top_reasons": _top_reasons(rows),
         "latest_anomaly_score": _latest_float(rows, "anomaly_score"),
         "latest_model_version": _latest(rows, "model_version"),
@@ -155,6 +159,7 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         f"  abnormal_count: {iso['abnormal_count']}",
         f"  would_block_count: {iso['would_block_count']}",
         f"  actually_blocked_count: {iso['actually_blocked_count']}",
+        f"  block_rate: {_fmt(iso['block_rate'])}",
         f"  top_reasons: {iso['top_reasons']}",
         f"  latest_anomaly_score: {_fmt(iso['latest_anomaly_score'])}",
         f"  latest_model_version: {_fmt(iso['latest_model_version'])}",

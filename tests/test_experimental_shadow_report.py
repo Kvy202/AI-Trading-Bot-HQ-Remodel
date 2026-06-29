@@ -66,6 +66,7 @@ def test_valid_log_files_are_summarized(tmp_path):
     assert iso["abnormal_count"] == 1
     assert iso["would_block_count"] == 1
     assert iso["actually_blocked_count"] == 1
+    assert iso["block_rate"] == 0.5
     assert iso["latest_anomaly_score"] == -0.30
     assert iso["latest_model_version"] == "iso-v2"
     assert iso["top_reasons"]["isolation_anomaly"] == 1

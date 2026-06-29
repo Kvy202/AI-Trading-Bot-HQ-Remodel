@@ -165,3 +165,37 @@ passes `--paper` or `--live` (CLI overrides env). To actually switch you must ed
 unit's `ExecStart` (`sudo systemctl edit --full bot-executor`), `sudo systemctl
 daemon-reload`, and restart. **Do not do this before 25 June.** Going live additionally
 requires the supervisor approval flow and the checklist in SAFETY_CONTROLS.md.
+
+---
+
+## 9. Isolation Forest blocking paper test
+
+Use this only as a paper/test runbook. It starts `live_writer.py` only, refuses
+if a repo-scoped writer/executor is already running, refuses live/mainnet
+runtime settings, and does not start or change the executor.
+
+PowerShell:
+
+```powershell
+Set-Location "C:\Project\Ai-trading-bot-Hyperliquid Remodel"
+.\tools\stop_live.ps1
+.\tools\run_isolation_forest_blocking_paper_test.ps1 -Minutes 30 -FreshShadowLog
+```
+
+For a longer run, use `-Minutes 60`. The script forces only this child writer
+process to use:
+
+```text
+USE_ISOLATION_FOREST=true
+ISOLATION_FOREST_BLOCKING=true
+ISOLATION_FOREST_ARTIFACT=model_artifacts/isolation_forest.joblib
+USE_XGBOOST_SIGNAL=false
+USE_SURVIVAL_EXIT=false
+```
+
+Expected outputs:
+
+- `logs/isolation_forest_shadow.csv` gains new rows.
+- `reports/isolation_forest_blocking_paper_summary.json` is written.
+- The text report includes `total_rows`, `would_block_count`,
+  `actually_blocked_count`, `block_rate`, and `top_reasons`.
