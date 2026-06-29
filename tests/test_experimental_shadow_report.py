@@ -35,10 +35,10 @@ def test_missing_log_files_do_not_crash(tmp_path):
 def test_valid_log_files_are_summarized(tmp_path):
     _write_csv(
         tmp_path / ISOLATION_LOG,
-        ["ts", "symbol", "anomaly_status", "anomaly_score", "would_block", "reason", "model_version"],
+        ["ts", "symbol", "anomaly_status", "anomaly_score", "would_block", "actually_blocked", "reason", "model_version"],
         [
-            ["t1", "BTCUSDT", "normal", "0.12", "0", "normal_market", "iso-v1"],
-            ["t2", "BTCUSDT", "anomaly", "-0.30", "1", "isolation_anomaly", "iso-v2"],
+            ["t1", "BTCUSDT", "normal", "0.12", "0", "0", "normal_market", "iso-v1"],
+            ["t2", "BTCUSDT", "anomaly", "-0.30", "1", "1", "isolation_anomaly", "iso-v2"],
         ],
     )
     _write_csv(
@@ -65,6 +65,7 @@ def test_valid_log_files_are_summarized(tmp_path):
     assert iso["normal_count"] == 1
     assert iso["abnormal_count"] == 1
     assert iso["would_block_count"] == 1
+    assert iso["actually_blocked_count"] == 1
     assert iso["latest_anomaly_score"] == -0.30
     assert iso["latest_model_version"] == "iso-v2"
     assert iso["top_reasons"]["isolation_anomaly"] == 1
