@@ -68,6 +68,12 @@ def test_valid_log_files_are_summarized(tmp_path):
     assert iso["actually_blocked_count"] == 1
     assert iso["block_rate"] == 0.5
     assert iso["latest_anomaly_score"] == -0.30
+    assert iso["min_anomaly_score"] == -0.30
+    assert iso["max_anomaly_score"] == 0.12
+    assert iso["average_anomaly_score"] == -0.09
+    assert round(iso["p10_anomaly_score"], 6) == -0.258
+    assert round(iso["p50_anomaly_score"], 6) == -0.09
+    assert round(iso["p90_anomaly_score"], 6) == 0.078
     assert iso["latest_model_version"] == "iso-v2"
     assert iso["top_reasons"]["isolation_anomaly"] == 1
 
@@ -88,6 +94,33 @@ def test_valid_log_files_are_summarized(tmp_path):
     assert survival["latest_model_version"] == "surv-v2"
 
 
+def test_isolation_report_includes_score_distribution(tmp_path):
+    _write_csv(
+        tmp_path / ISOLATION_LOG,
+        ["ts", "symbol", "anomaly_status", "anomaly_score", "would_block", "actually_blocked", "reason", "model_version"],
+        [
+            ["t1", "BTCUSDT", "anomaly", "-0.50", "1", "0", "isolation_anomaly", "iso-v1"],
+            ["t2", "BTCUSDT", "anomaly", "-0.40", "1", "0", "isolation_anomaly", "iso-v1"],
+            ["t3", "BTCUSDT", "anomaly", "-0.30", "1", "0", "isolation_anomaly", "iso-v1"],
+            ["t4", "BTCUSDT", "anomaly", "-0.20", "1", "0", "isolation_anomaly", "iso-v1"],
+            ["t5", "BTCUSDT", "anomaly", "-0.10", "1", "0", "isolation_anomaly", "iso-v1"],
+        ],
+    )
+
+    summary = summarize_all(tmp_path)
+    iso = summary["isolation_forest"]
+
+    assert iso["min_anomaly_score"] == -0.50
+    assert iso["max_anomaly_score"] == -0.10
+    assert iso["average_anomaly_score"] == -0.30
+    assert round(iso["p10_anomaly_score"], 6) == -0.46
+    assert round(iso["p50_anomaly_score"], 6) == -0.30
+    assert round(iso["p90_anomaly_score"], 6) == -0.14
+    text = format_text_summary(summary)
+    assert "min_anomaly_score" in text
+    assert "p90_anomaly_score" in text
+
+
 def test_empty_log_files_are_handled(tmp_path):
     for name in (ISOLATION_LOG, XGBOOST_LOG, SURVIVAL_LOG):
         (tmp_path / name).write_text("", encoding="utf-8")
@@ -98,6 +131,8 @@ def test_empty_log_files_are_handled(tmp_path):
     assert summary["xgboost_signal"]["file_status"] == "empty"
     assert summary["survival_exit"]["file_status"] == "empty"
     assert summary["survival_exit"]["average_survival_risk_score"] is None
+    assert summary["isolation_forest"]["min_anomaly_score"] is None
+    assert summary["isolation_forest"]["p50_anomaly_score"] is None
 
 
 def test_json_output_format(tmp_path):

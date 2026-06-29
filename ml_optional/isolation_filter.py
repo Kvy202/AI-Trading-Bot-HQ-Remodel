@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Optional
 import numpy as np
 
 DEFAULT_ARTIFACT = "model_artifacts/isolation_forest.joblib"
+SCORE_THRESHOLD_ENV = "ISOLATION_FOREST_SCORE_THRESHOLD"
 
 _TRUE = {"1", "true", "yes", "y", "on"}
 
@@ -46,6 +47,24 @@ def isolation_blocking_from_env(default: bool = False) -> bool:
     if raw is None or raw.strip() == "":
         return bool(default)
     return raw.strip().lower() in _TRUE
+
+
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        out = float(value)
+        return out if out == out and abs(out) != float("inf") else None
+    except Exception:
+        return None
+
+
+def isolation_score_threshold_from_env(default: Optional[float] = None) -> Optional[float]:
+    raw = os.getenv(SCORE_THRESHOLD_ENV)
+    if raw is None or raw.strip() == "":
+        return default
+    parsed = _finite_float_or_none(raw)
+    return default if parsed is None else parsed
 
 
 def window_to_isolation_vector(window: Any) -> np.ndarray:
@@ -102,6 +121,7 @@ class IsolationFilter:
         model_version: str = "",
         isolation_status: str = "disabled_flag_false",
         reason: str = "flag_disabled",
+        score_threshold: Optional[float] = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.artifact_path = Path(artifact_path)
@@ -109,6 +129,7 @@ class IsolationFilter:
         self.model_version = str(model_version or "")
         self.isolation_status = str(isolation_status)
         self.reason = str(reason)
+        self.score_threshold = _finite_float_or_none(score_threshold)
 
     @property
     def ready(self) -> bool:
@@ -124,8 +145,14 @@ class IsolationFilter:
     ) -> "IsolationFilter":
         path = artifact_path_from_env(base_dir)
         emit = log_fn or (lambda msg: None)
+        score_threshold = isolation_score_threshold_from_env()
+        raw_threshold = os.getenv(SCORE_THRESHOLD_ENV)
+        if raw_threshold is not None and raw_threshold.strip() and score_threshold is None:
+            emit(f"isolation_score_threshold=invalid raw={raw_threshold!r} using=unset")
+        elif score_threshold is not None:
+            emit(f"isolation_score_threshold={score_threshold}")
         if not enabled:
-            return cls(enabled=False, artifact_path=path)
+            return cls(enabled=False, artifact_path=path, score_threshold=score_threshold)
         if not path.exists():
             emit(f"isolation_status=disabled_missing_artifact artifact_path={path}")
             return cls(
@@ -133,6 +160,7 @@ class IsolationFilter:
                 artifact_path=path,
                 isolation_status="disabled_missing_artifact",
                 reason="artifact_missing",
+                score_threshold=score_threshold,
             )
         try:
             import joblib
@@ -154,6 +182,7 @@ class IsolationFilter:
                 model_version=str(version),
                 isolation_status="loaded",
                 reason="loaded",
+                score_threshold=score_threshold,
             )
         except Exception as exc:
             emit(f"isolation_status=disabled_load_error artifact_path={path} reason={type(exc).__name__}: {exc}")
@@ -162,6 +191,7 @@ class IsolationFilter:
                 artifact_path=path,
                 isolation_status="disabled_load_error",
                 reason=f"load_error:{type(exc).__name__}",
+                score_threshold=score_threshold,
             )
 
     def evaluate(self, symbol: str, window: Any) -> IsolationResult:
@@ -203,13 +233,26 @@ class IsolationFilter:
             else:
                 raise ValueError("model has neither predict nor scoring method")
 
+            would_block = bool(is_anomaly)
+            if self.score_threshold is not None:
+                would_block = bool(is_anomaly and score is not None and score <= self.score_threshold)
+
+            if not is_anomaly:
+                reason = "normal_market"
+            elif would_block:
+                reason = "isolation_anomaly"
+            elif score is None:
+                reason = "isolation_anomaly_missing_score_threshold"
+            else:
+                reason = "isolation_anomaly_threshold_allow"
+
             return IsolationResult(
                 isolation_enabled=True,
                 isolation_status="loaded",
                 anomaly_status="anomaly" if is_anomaly else "normal",
                 anomaly_score=score,
-                would_block=bool(is_anomaly),
-                reason="isolation_anomaly" if is_anomaly else "normal_market",
+                would_block=would_block,
+                reason=reason,
                 model_version=self.model_version,
                 artifact_path=str(self.artifact_path),
             )

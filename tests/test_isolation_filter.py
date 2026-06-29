@@ -9,6 +9,7 @@ from ml_optional.isolation_filter import (
     ISOLATION_SHADOW_COLS,
     IsolationFilter,
     isolation_blocking_from_env,
+    isolation_score_threshold_from_env,
     should_block_entry,
 )
 
@@ -191,6 +192,69 @@ def test_default_blocking_flag_false(monkeypatch):
     assert isolation_blocking_from_env() is False
     monkeypatch.setenv("ISOLATION_FOREST_BLOCKING", "true")
     assert isolation_blocking_from_env() is True
+
+
+def test_score_threshold_unset_preserves_predict_blocking(monkeypatch):
+    monkeypatch.delenv("ISOLATION_FOREST_SCORE_THRESHOLD", raising=False)
+    model = MockIsolationModel(pred=-1, score=0.99)
+    flt = IsolationFilter(
+        enabled=True,
+        artifact_path=Path("mock.joblib"),
+        model=model,
+        model_version="mock-anomaly",
+        isolation_status="loaded",
+    )
+
+    res = flt.evaluate("ETHUSDT", _window())
+
+    assert isolation_score_threshold_from_env() is None
+    assert res.anomaly_status == "anomaly"
+    assert res.anomaly_score == 0.99
+    assert res.would_block is True
+    assert should_block_entry(res, blocking_enabled=True) is True
+
+
+def test_score_threshold_set_reduces_blocking(monkeypatch):
+    monkeypatch.setenv("ISOLATION_FOREST_SCORE_THRESHOLD", "-0.30")
+    threshold = isolation_score_threshold_from_env()
+    flt = IsolationFilter(
+        enabled=True,
+        artifact_path=Path("mock.joblib"),
+        model=MockIsolationModel(pred=-1, score=-0.10),
+        model_version="mock-anomaly",
+        isolation_status="loaded",
+        score_threshold=threshold,
+    )
+
+    res = flt.evaluate("ETHUSDT", _window())
+
+    assert threshold == -0.30
+    assert res.anomaly_status == "anomaly"
+    assert res.would_block is False
+    assert res.reason == "isolation_anomaly_threshold_allow"
+    assert should_block_entry(res, blocking_enabled=True) is False
+
+
+def test_from_env_applies_score_threshold(monkeypatch):
+    artifact_path = ROOT / "tests" / ".tmp_isolation_threshold_test.joblib"
+    try:
+        joblib.dump(
+            {"model": MockIsolationModel(pred=-1, score=-0.10), "model_version": "unit-test-threshold"},
+            artifact_path,
+        )
+        monkeypatch.setenv("ISOLATION_FOREST_ARTIFACT", str(artifact_path))
+        monkeypatch.setenv("ISOLATION_FOREST_SCORE_THRESHOLD", "-0.30")
+
+        flt = IsolationFilter.from_env(enabled=True, base_dir=ROOT)
+        res = flt.evaluate("BTCUSDT", _window())
+
+        assert flt.score_threshold == -0.30
+        assert res.anomaly_status == "anomaly"
+        assert res.would_block is False
+        assert should_block_entry(res, blocking_enabled=True) is False
+    finally:
+        if artifact_path.exists():
+            artifact_path.unlink()
 
 
 def test_artifact_save_load_behavior(monkeypatch):

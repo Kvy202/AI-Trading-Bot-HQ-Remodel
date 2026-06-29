@@ -49,9 +49,38 @@ def _float_or_none(value: Any) -> Optional[float]:
         return None
 
 
+def _numeric_values(values: Iterable[Any]) -> List[float]:
+    return [v for v in (_float_or_none(x) for x in values) if v is not None]
+
+
 def _avg(values: Iterable[Any]) -> Optional[float]:
-    nums = [v for v in (_float_or_none(x) for x in values) if v is not None]
+    nums = _numeric_values(values)
     return None if not nums else sum(nums) / len(nums)
+
+
+def _percentile(values: Iterable[Any], percentile: float) -> Optional[float]:
+    nums = sorted(_numeric_values(values))
+    if not nums:
+        return None
+    if len(nums) == 1:
+        return nums[0]
+    rank = (max(0.0, min(100.0, float(percentile))) / 100.0) * (len(nums) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(nums) - 1)
+    weight = rank - lower
+    return nums[lower] + ((nums[upper] - nums[lower]) * weight)
+
+
+def _score_distribution(values: Iterable[Any]) -> Dict[str, Optional[float]]:
+    nums = _numeric_values(values)
+    return {
+        "min_anomaly_score": None if not nums else min(nums),
+        "max_anomaly_score": None if not nums else max(nums),
+        "average_anomaly_score": None if not nums else sum(nums) / len(nums),
+        "p10_anomaly_score": _percentile(nums, 10),
+        "p50_anomaly_score": _percentile(nums, 50),
+        "p90_anomaly_score": _percentile(nums, 90),
+    }
 
 
 def _latest(rows: List[Dict[str, str]], key: str) -> str:
@@ -79,6 +108,7 @@ def summarize_isolation(logs_dir: Path) -> Dict[str, Any]:
     would_block_count = sum(1 for row in rows if _truthy(row.get("would_block")))
     actually_blocked_count = sum(1 for row in rows if _truthy(row.get("actually_blocked")))
     total_rows = len(rows)
+    score_distribution = _score_distribution(row.get("anomaly_score") for row in rows)
     return {
         "file": str(path),
         "file_status": status,
@@ -90,6 +120,7 @@ def summarize_isolation(logs_dir: Path) -> Dict[str, Any]:
         "block_rate": 0.0 if total_rows == 0 else actually_blocked_count / total_rows,
         "top_reasons": _top_reasons(rows),
         "latest_anomaly_score": _latest_float(rows, "anomaly_score"),
+        **score_distribution,
         "latest_model_version": _latest(rows, "model_version"),
     }
 
@@ -162,6 +193,12 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         f"  block_rate: {_fmt(iso['block_rate'])}",
         f"  top_reasons: {iso['top_reasons']}",
         f"  latest_anomaly_score: {_fmt(iso['latest_anomaly_score'])}",
+        f"  min_anomaly_score: {_fmt(iso['min_anomaly_score'])}",
+        f"  max_anomaly_score: {_fmt(iso['max_anomaly_score'])}",
+        f"  average_anomaly_score: {_fmt(iso['average_anomaly_score'])}",
+        f"  p10_anomaly_score: {_fmt(iso['p10_anomaly_score'])}",
+        f"  p50_anomaly_score: {_fmt(iso['p50_anomaly_score'])}",
+        f"  p90_anomaly_score: {_fmt(iso['p90_anomaly_score'])}",
         f"  latest_model_version: {_fmt(iso['latest_model_version'])}",
         "",
         "XGBoost Signal",
