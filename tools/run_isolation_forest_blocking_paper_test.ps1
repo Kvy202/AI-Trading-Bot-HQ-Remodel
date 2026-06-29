@@ -1,5 +1,5 @@
 param(
-  [ValidateRange(30,60)] [int]$Minutes = 45,
+  [ValidateScript({ $_ -eq 1 -or ($_ -ge 30 -and $_ -le 60) })] [int]$Minutes = 45,
   [string]$Artifact = "model_artifacts/isolation_forest.joblib",
   [switch]$FreshShadowLog,
   [switch]$SkipVerifier
@@ -80,6 +80,20 @@ if (-not (Test-Path $artifactFull)) {
   exit 1
 }
 
+$forcedPaperEnv = [ordered]@{
+  LIVE_TRADING = 'false'
+  PAPER_TRADING = 'true'
+  LIVE_MODE = 'false'
+  EXEC_PAPER = 'true'
+  PLACE_REAL_ORDERS = 'false'
+  USE_ISOLATION_FOREST = 'true'
+  ISOLATION_FOREST_BLOCKING = 'true'
+  ISOLATION_FOREST_ARTIFACT = $artifactFull
+}
+foreach ($name in $forcedPaperEnv.Keys) {
+  Set-Item -Path "Env:$name" -Value $forcedPaperEnv[$name]
+}
+
 $existing = Get-ScopedLiveProcess -RootDir $root
 if ($existing) {
   Write-Host "[isolation-paper] REFUSING: live writer/executor process is already running under this repo." -ForegroundColor Red
@@ -110,6 +124,16 @@ try:
     load_dotenv(root / ".env", override=True)
 except Exception:
     pass
+
+os.environ.update({
+    "LIVE_TRADING": "false",
+    "PAPER_TRADING": "true",
+    "LIVE_MODE": "false",
+    "EXEC_PAPER": "true",
+    "PLACE_REAL_ORDERS": "false",
+    "USE_ISOLATION_FOREST": "true",
+    "ISOLATION_FOREST_BLOCKING": "true",
+})
 
 from runtime.guardrails import resolve_trading_mode
 from runtime.settings import Settings
@@ -148,7 +172,11 @@ print(json.dumps({
 }))
 '@
 
-$preflightRaw = & $py -c $preflightCode $root
+# Write the here-string to a file instead of passing it through python -c.
+# Windows PowerShell can strip embedded double quotes from native arguments.
+$preflightPath = Join-Path $logsDir 'isolation_forest_blocking_preflight.py'
+Set-Content -Path $preflightPath -Value $preflightCode -Encoding UTF8
+$preflightRaw = & $py $preflightPath $root
 if ($LASTEXITCODE -ne 0) {
   Write-Host "[isolation-paper] REFUSING: mode preflight failed." -ForegroundColor Red
   exit 1
@@ -213,8 +241,9 @@ os.environ["USE_XGBOOST_SIGNAL"] = "false"
 os.environ["USE_SURVIVAL_EXIT"] = "false"
 os.environ["LIVE_TRADING"] = "false"
 os.environ["PAPER_TRADING"] = "true"
-os.environ["LIVE_MODE"] = "0"
-os.environ["EXEC_PAPER"] = "1"
+os.environ["LIVE_MODE"] = "false"
+os.environ["EXEC_PAPER"] = "true"
+os.environ["PLACE_REAL_ORDERS"] = "false"
 os.environ["CONFIRM_LIVE_TRADING"] = ""
 os.environ.setdefault("HL_TESTNET", "true")
 
