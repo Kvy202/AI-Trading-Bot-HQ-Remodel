@@ -28,6 +28,10 @@ def test_missing_log_files_do_not_crash(tmp_path):
     assert summary["isolation_forest"]["file_status"] == "missing"
     assert summary["isolation_forest"]["total_rows"] == 0
     assert summary["xgboost_signal"]["file_status"] == "missing"
+    assert summary["xgboost_signal"]["actually_rejected_count"] == 0
+    assert summary["xgboost_signal"]["would_reject_rate"] == 0.0
+    assert summary["xgboost_signal"]["actual_reject_rate"] == 0.0
+    assert summary["xgboost_signal"]["reject_reasons"] == {}
     assert summary["survival_exit"]["file_status"] == "missing"
     assert "Experimental Shadow Report" in format_text_summary(summary)
 
@@ -43,10 +47,22 @@ def test_valid_log_files_are_summarized(tmp_path):
     )
     _write_csv(
         tmp_path / XGBOOST_LOG,
-        ["timestamp", "symbol", "xgboost_direction", "xgboost_confidence", "would_confirm", "would_reject", "reason", "model_version"],
         [
-            ["t1", "BTCUSDT", "LONG", "0.70", "1", "0", "confirmed", "xgb-v1"],
-            ["t2", "BTCUSDT", "SHORT", "0.90", "0", "1", "direction_mismatch", "xgb-v2"],
+            "timestamp",
+            "symbol",
+            "direction",
+            "confidence",
+            "would_confirm",
+            "would_reject",
+            "actually_rejected",
+            "reason",
+            "reject_reason",
+            "model_version",
+        ],
+        [
+            ["t1", "BTCUSDT", "LONG", "0.70", "1", "0", "0", "confirmed", "", "xgb-v1"],
+            ["t2", "BTCUSDT", "LONG", "0.55", "0", "1", "0", "low_confidence", "", "xgb-v2"],
+            ["t3", "BTCUSDT", "SHORT", "0.90", "0", "1", "1", "direction_mismatch", "direction_mismatch", "xgb-v3"],
         ],
     )
     _write_csv(
@@ -81,11 +97,15 @@ def test_valid_log_files_are_summarized(tmp_path):
 
     xgb = summary["xgboost_signal"]
     assert xgb["would_confirm_count"] == 1
-    assert xgb["would_reject_count"] == 1
-    assert xgb["average_confidence"] == 0.80
+    assert xgb["would_reject_count"] == 2
+    assert xgb["actually_rejected_count"] == 1
+    assert xgb["would_reject_rate"] == 2 / 3
+    assert xgb["actual_reject_rate"] == 1 / 3
+    assert xgb["reject_reasons"] == {"direction_mismatch": 1}
+    assert round(xgb["average_confidence"], 6) == 0.716667
     assert xgb["latest_confidence"] == 0.90
     assert xgb["latest_direction"] == "SHORT"
-    assert xgb["latest_model_version"] == "xgb-v2"
+    assert xgb["latest_model_version"] == "xgb-v3"
 
     survival = summary["survival_exit"]
     assert survival["would_hold_count"] == 1
@@ -160,6 +180,9 @@ def test_empty_log_files_are_handled(tmp_path):
     assert summary["survival_exit"]["average_survival_risk_score"] is None
     assert summary["isolation_forest"]["min_anomaly_score"] is None
     assert summary["isolation_forest"]["p50_anomaly_score"] is None
+    assert summary["xgboost_signal"]["actually_rejected_count"] == 0
+    assert summary["xgboost_signal"]["would_reject_rate"] == 0.0
+    assert summary["xgboost_signal"]["actual_reject_rate"] == 0.0
 
 
 def test_json_output_format(tmp_path):
@@ -170,4 +193,5 @@ def test_json_output_format(tmp_path):
     assert set(data) == {"logs_dir", "isolation_forest", "xgboost_signal", "survival_exit"}
     assert data["isolation_forest"]["total_rows"] == 0
     assert data["xgboost_signal"]["file_status"] == "missing"
+    assert data["xgboost_signal"]["actually_rejected_count"] == 0
     assert data["survival_exit"]["would_exit_early_count"] == 0

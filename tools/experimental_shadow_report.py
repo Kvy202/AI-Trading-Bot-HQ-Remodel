@@ -91,8 +91,41 @@ def _latest_float(rows: List[Dict[str, str]], key: str) -> Optional[float]:
     return _float_or_none(_latest(rows, key))
 
 
+def _first_non_empty(row: Dict[str, str], *keys: str) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value)
+    return ""
+
+
+def _latest_any(rows: List[Dict[str, str]], *keys: str) -> str:
+    for row in reversed(rows):
+        value = _first_non_empty(row, *keys)
+        if value:
+            return value
+    return ""
+
+
+def _latest_any_float(rows: List[Dict[str, str]], *keys: str) -> Optional[float]:
+    for row in reversed(rows):
+        value = _float_or_none(_first_non_empty(row, *keys))
+        if value is not None:
+            return value
+    return None
+
+
 def _top_reasons(rows: List[Dict[str, str]], limit: int = 5) -> Dict[str, int]:
     counts = Counter((row.get("reason") or "unknown").strip() or "unknown" for row in rows)
+    return dict(counts.most_common(limit))
+
+
+def _top_reject_reasons(rows: List[Dict[str, str]], limit: int = 5) -> Dict[str, int]:
+    counts = Counter(
+        (_first_non_empty(row, "reject_reason", "reason") or "unknown").strip() or "unknown"
+        for row in rows
+        if _truthy(row.get("actually_rejected"))
+    )
     return dict(counts.most_common(limit))
 
 
@@ -132,15 +165,22 @@ def summarize_isolation(logs_dir: Path) -> Dict[str, Any]:
 def summarize_xgboost(logs_dir: Path) -> Dict[str, Any]:
     path = logs_dir / XGBOOST_LOG
     status, rows = _read_csv_rows(path)
+    total_rows = len(rows)
+    would_reject_count = sum(1 for row in rows if _truthy(row.get("would_reject")))
+    actually_rejected_count = sum(1 for row in rows if _truthy(row.get("actually_rejected")))
     return {
         "file": str(path),
         "file_status": status,
-        "total_rows": len(rows),
+        "total_rows": total_rows,
         "would_confirm_count": sum(1 for row in rows if _truthy(row.get("would_confirm"))),
-        "would_reject_count": sum(1 for row in rows if _truthy(row.get("would_reject"))),
-        "average_confidence": _avg(row.get("xgboost_confidence") for row in rows),
-        "latest_confidence": _latest_float(rows, "xgboost_confidence"),
-        "latest_direction": _latest(rows, "xgboost_direction"),
+        "would_reject_count": would_reject_count,
+        "actually_rejected_count": actually_rejected_count,
+        "would_reject_rate": 0.0 if total_rows == 0 else would_reject_count / total_rows,
+        "actual_reject_rate": 0.0 if total_rows == 0 else actually_rejected_count / total_rows,
+        "reject_reasons": _top_reject_reasons(rows),
+        "average_confidence": _avg(_first_non_empty(row, "confidence", "xgboost_confidence") for row in rows),
+        "latest_confidence": _latest_any_float(rows, "confidence", "xgboost_confidence"),
+        "latest_direction": _latest_any(rows, "direction", "xgboost_direction"),
         "latest_model_version": _latest(rows, "model_version"),
     }
 
@@ -212,6 +252,10 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         f"  total_rows: {xgb['total_rows']}",
         f"  would_confirm_count: {xgb['would_confirm_count']}",
         f"  would_reject_count: {xgb['would_reject_count']}",
+        f"  actually_rejected_count: {xgb['actually_rejected_count']}",
+        f"  would_reject_rate: {_fmt(xgb['would_reject_rate'])}",
+        f"  actual_reject_rate: {_fmt(xgb['actual_reject_rate'])}",
+        f"  reject_reasons: {xgb['reject_reasons']}",
         f"  average_confidence: {_fmt(xgb['average_confidence'])}",
         f"  latest_confidence: {_fmt(xgb['latest_confidence'])}",
         f"  latest_direction: {_fmt(xgb['latest_direction'])}",
