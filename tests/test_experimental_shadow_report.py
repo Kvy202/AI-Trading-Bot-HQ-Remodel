@@ -66,7 +66,9 @@ def test_valid_log_files_are_summarized(tmp_path):
     assert iso["abnormal_count"] == 1
     assert iso["would_block_count"] == 1
     assert iso["actually_blocked_count"] == 1
-    assert iso["block_rate"] == 0.5
+    assert iso["would_block_rate"] == 0.5
+    assert iso["actual_block_rate"] == 0.5
+    assert iso["block_rate"] == iso["actual_block_rate"]
     assert iso["latest_anomaly_score"] == -0.30
     assert iso["min_anomaly_score"] == -0.30
     assert iso["max_anomaly_score"] == 0.12
@@ -92,6 +94,31 @@ def test_valid_log_files_are_summarized(tmp_path):
     assert survival["latest_risk_score"] == 0.80
     assert survival["latest_reason"] == "high_exit_risk"
     assert survival["latest_model_version"] == "surv-v2"
+
+
+def test_isolation_report_distinguishes_would_and_actual_block_rates(tmp_path):
+    _write_csv(
+        tmp_path / ISOLATION_LOG,
+        ["ts", "symbol", "anomaly_status", "anomaly_score", "would_block", "actually_blocked", "reason", "model_version"],
+        [
+            ["t1", "BTCUSDT", "normal", "0.10", "0", "0", "normal_market", "iso-v1"],
+            ["t2", "BTCUSDT", "anomaly", "-0.40", "1", "0", "isolation_anomaly", "iso-v1"],
+            ["t3", "BTCUSDT", "anomaly", "-0.35", "1", "0", "isolation_anomaly", "iso-v1"],
+        ],
+    )
+
+    summary = summarize_all(tmp_path)
+    iso = summary["isolation_forest"]
+
+    assert iso["would_block_count"] == 2
+    assert iso["actually_blocked_count"] == 0
+    assert iso["would_block_rate"] == 2 / 3
+    assert iso["actual_block_rate"] == 0.0
+    assert iso["block_rate"] == iso["actual_block_rate"]
+
+    text = format_text_summary(summary)
+    assert "would_block_rate" in text
+    assert "actual_block_rate" in text
 
 
 def test_isolation_report_includes_score_distribution(tmp_path):
