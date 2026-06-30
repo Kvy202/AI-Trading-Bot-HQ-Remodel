@@ -592,11 +592,14 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     xgboost_confirmer = None
     xgboost_shadow_cols: Optional[List[str]] = None
+    xgboost_blocking = False
     if exp_flags.use_xgboost_signal:
         try:
             from ml_optional.xgboost_signal import (
                 XGBOOST_SHADOW_COLS,
                 XGBoostSignalConfirmer,
+                should_reject_signal as should_reject_xgboost_signal,
+                xgboost_signal_blocking_from_env,
             )
             xgboost_confirmer = XGBoostSignalConfirmer.from_env(
                 enabled=True,
@@ -604,9 +607,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 log_fn=log,
             )
             xgboost_shadow_cols = XGBOOST_SHADOW_COLS
+            xgboost_blocking = xgboost_signal_blocking_from_env(False)
+            ensure_csv_schema(XGBOOST_SHADOW_LOG, xgboost_shadow_cols, "xgboost shadow log")
             log(
                 "xgboost_enabled=1 "
                 f"xgboost_status={xgboost_confirmer.xgboost_status} "
+                f"xgboost_blocking={int(xgboost_blocking)} "
                 f"artifact_path={xgboost_confirmer.artifact_path}"
             )
         except Exception as e:
@@ -924,30 +930,53 @@ def main(argv: Optional[List[str]] = None) -> None:
                             isolation_shadow_cols,
                             _iso.to_log_row(ts_now, sym, actually_blocked=isolation_actually_blocked),
                         )
-                    append_aligned_row(signals_path, SIGNAL_COLS, row)
 
-                    if xgboost_confirmer is not None and xgboost_confirmer.ready:
+                    _xgb = None
+                    xgboost_actually_rejected = False
+                    if xgboost_confirmer is not None and xgboost_shadow_cols is not None:
                         try:
                             _xgb_window = windows.get(sym)
-                            if _xgb_window is not None and xgboost_shadow_cols is not None:
-                                _xgb = xgboost_confirmer.evaluate(
-                                    symbol=sym,
-                                    window=_xgb_window,
-                                    existing_signal=row["side_hint"],
-                                    existing_score=row.get("p_meta"),
-                                    rv_mean=row.get("rv_mean", 0.0),
-                                    price=px_final,
+                            _xgb = xgboost_confirmer.evaluate(
+                                symbol=sym,
+                                window=_xgb_window,
+                                existing_signal=row["side_hint"],
+                                existing_score=row.get("p_meta"),
+                                rv_mean=row.get("rv_mean", 0.0),
+                                price=px_final,
+                            )
+                            xgboost_actually_rejected = (
+                                bool(row["allow"])
+                                and should_reject_xgboost_signal(_xgb, xgboost_blocking)
+                            )
+                            if xgboost_actually_rejected:
+                                row["allow"] = 0
+                                log(
+                                    "SKIP "
+                                    f"{sym} reason=xgboost_signal_reject "
+                                    f"reject_reason={_xgb.reason} "
+                                    f"xgboost_direction={_xgb.xgboost_direction} "
+                                    f"xgboost_confidence={_xgb.xgboost_confidence}"
                                 )
-                                append_aligned_row(
-                                    XGBOOST_SHADOW_LOG,
-                                    xgboost_shadow_cols,
-                                    _xgb.to_log_row(ts_now, sym),
+                            if _xgb.xgboost_status == "model_error":
+                                log(
+                                    "xgboost_status=model_error "
+                                    f"symbol={sym} reason={_xgb.reason}"
                                 )
+                            append_aligned_row(
+                                XGBOOST_SHADOW_LOG,
+                                xgboost_shadow_cols,
+                                _xgb.to_log_row(
+                                    ts_now,
+                                    sym,
+                                    actually_rejected=xgboost_actually_rejected,
+                                ),
+                            )
                         except Exception as _xgb_exc:
                             log_err(
-                                "xgboost_status=prediction_log_error "
+                                "xgboost_status=model_error "
                                 f"symbol={sym} reason={type(_xgb_exc).__name__}: {_xgb_exc}"
                             )
+                    append_aligned_row(signals_path, SIGNAL_COLS, row)
                     # Per-symbol-per-model diagnostics (missing models -> blank).
                     mbs_row: Dict[str, Any] = {"ts": ts_now, "symbol": sym, "px": px_final}
                     for _name, _vals in per_model_sym.items():

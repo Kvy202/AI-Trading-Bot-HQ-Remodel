@@ -50,6 +50,7 @@
     "USE_ISOLATION_FOREST": false,
     "ISOLATION_FOREST_BLOCKING": false,
     "USE_XGBOOST_SIGNAL": false,
+    "XGBOOST_SIGNAL_BLOCKING": false,
     "USE_SURVIVAL_EXIT": false,
     "USE_ADVANCED_RISK": false
   },

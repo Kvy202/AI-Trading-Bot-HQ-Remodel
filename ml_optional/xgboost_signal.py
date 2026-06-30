@@ -1,9 +1,9 @@
 """XGBoost signal confirmation in shadow mode.
 
-Phase 3 contract:
+Phase 7 contract:
 * optional and default-off via USE_XGBOOST_SIGNAL
 * missing artifacts or missing xgboost dependency never crash the writer
-* predictions are logged only; they never block, skip, or modify trades
+* rejections only activate when XGBOOST_SIGNAL_BLOCKING is also true
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import numpy as np
 DEFAULT_ARTIFACT = "model_artifacts/xgboost_signal.joblib"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.60
 
+_TRUE = {"1", "true", "yes", "y", "on"}
+
 XGBOOST_SHADOW_COLS = [
     "timestamp",
     "symbol",
@@ -29,9 +31,13 @@ XGBOOST_SHADOW_COLS = [
     "existing_score",
     "xgboost_direction",
     "xgboost_confidence",
+    "direction",
+    "confidence",
     "would_confirm",
     "would_reject",
+    "actually_rejected",
     "reason",
+    "reject_reason",
     "model_version",
     "artifact_path",
 ]
@@ -45,6 +51,13 @@ def artifact_path_from_env(base_dir: Path | str) -> Path:
     raw = (os.getenv("XGBOOST_SIGNAL_ARTIFACT") or DEFAULT_ARTIFACT).strip()
     path = Path(raw)
     return path if path.is_absolute() else Path(base_dir) / path
+
+
+def xgboost_signal_blocking_from_env(default: bool = False) -> bool:
+    raw = os.getenv("XGBOOST_SIGNAL_BLOCKING")
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    return raw.strip().lower() in _TRUE
 
 
 def confidence_threshold_from_env(default: float = DEFAULT_CONFIDENCE_THRESHOLD) -> float:
@@ -167,7 +180,8 @@ class XGBoostSignalResult:
     model_version: str
     artifact_path: str
 
-    def to_log_row(self, timestamp: str, symbol: str) -> Dict[str, Any]:
+    def to_log_row(self, timestamp: str, symbol: str, actually_rejected: bool = False) -> Dict[str, Any]:
+        reject_reason = self.reason if bool(actually_rejected) else ""
         return {
             "timestamp": timestamp,
             "symbol": symbol,
@@ -177,9 +191,13 @@ class XGBoostSignalResult:
             "existing_score": "" if self.existing_score is None else float(self.existing_score),
             "xgboost_direction": self.xgboost_direction,
             "xgboost_confidence": "" if self.xgboost_confidence is None else float(self.xgboost_confidence),
+            "direction": self.xgboost_direction,
+            "confidence": "" if self.xgboost_confidence is None else float(self.xgboost_confidence),
             "would_confirm": int(self.would_confirm),
             "would_reject": int(self.would_reject),
+            "actually_rejected": int(bool(actually_rejected)),
             "reason": self.reason,
+            "reject_reason": reject_reason,
             "model_version": self.model_version,
             "artifact_path": self.artifact_path,
         }
@@ -351,14 +369,24 @@ class XGBoostSignalConfirmer:
         except Exception as exc:
             return XGBoostSignalResult(
                 xgboost_enabled=True,
-                xgboost_status="prediction_error",
+                xgboost_status="model_error",
                 existing_signal=normalized_signal,
                 existing_score=existing_score_f,
                 xgboost_direction="",
                 xgboost_confidence=None,
                 would_confirm=False,
                 would_reject=False,
-                reason=f"prediction_error:{type(exc).__name__}",
+                reason=f"model_error:{type(exc).__name__}",
                 model_version=self.model_version,
                 artifact_path=str(self.artifact_path),
             )
+
+
+def should_reject_signal(result: XGBoostSignalResult, blocking_enabled: bool) -> bool:
+    """Return whether Phase 7 should reject the current entry candidate."""
+    return bool(
+        blocking_enabled
+        and result.xgboost_enabled
+        and result.xgboost_status == "loaded"
+        and result.would_reject
+    )

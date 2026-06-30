@@ -5,7 +5,12 @@ from pathlib import Path
 import numpy as np
 
 import ml_optional.xgboost_signal as xgs
-from ml_optional.xgboost_signal import XGBOOST_SHADOW_COLS, XGBoostSignalConfirmer
+from ml_optional.xgboost_signal import (
+    XGBOOST_SHADOW_COLS,
+    XGBoostSignalConfirmer,
+    should_reject_signal,
+    xgboost_signal_blocking_from_env,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,6 +24,11 @@ class MockXGBoostModel:
     def predict_proba(self, x):
         self.last_shape = x.shape
         return np.asarray([self.probs], dtype=float)
+
+
+class ErrorXGBoostModel:
+    def predict_proba(self, x):
+        raise RuntimeError("boom")
 
 
 def _window():
@@ -56,6 +66,15 @@ def test_use_xgboost_signal_false_behavior(monkeypatch):
     assert result.would_confirm is False
     assert result.would_reject is False
     assert result.reason == "flag_disabled"
+    assert should_reject_signal(result, blocking_enabled=True) is False
+
+
+def test_xgboost_signal_blocking_defaults_false(monkeypatch):
+    monkeypatch.delenv("XGBOOST_SIGNAL_BLOCKING", raising=False)
+    assert xgboost_signal_blocking_from_env() is False
+
+    monkeypatch.setenv("XGBOOST_SIGNAL_BLOCKING", "true")
+    assert xgboost_signal_blocking_from_env() is True
 
 
 def test_missing_artifact_behavior(monkeypatch):
@@ -76,6 +95,7 @@ def test_missing_artifact_behavior(monkeypatch):
     assert result.would_confirm is False
     assert result.would_reject is False
     assert result.reason == "artifact_missing"
+    assert should_reject_signal(result, blocking_enabled=True) is False
 
 
 def test_missing_xgboost_dependency_behavior(monkeypatch, tmp_path):
@@ -97,6 +117,16 @@ def test_missing_xgboost_dependency_behavior(monkeypatch, tmp_path):
     assert confirmer.ready is False
     assert confirmer.xgboost_status == "disabled_missing_dependency"
     assert any("xgboost_status=disabled_missing_dependency" in msg for msg in logs)
+
+    result = confirmer.evaluate(
+        symbol="BTCUSDT",
+        window=_window(),
+        existing_signal="LONG",
+        existing_score=0.2,
+    )
+    assert result.would_reject is False
+    assert result.reason == "missing_dependency:xgboost"
+    assert should_reject_signal(result, blocking_enabled=True) is False
 
 
 def test_normal_prediction_using_mocked_model():
@@ -120,6 +150,7 @@ def test_normal_prediction_using_mocked_model():
     assert result.would_reject is False
     assert result.reason == "confirmed"
     assert model.last_shape == (1, 18)
+    assert should_reject_signal(result, blocking_enabled=True) is False
 
 
 def test_low_confidence_would_reject_true():
@@ -137,6 +168,43 @@ def test_low_confidence_would_reject_true():
     assert result.would_confirm is False
     assert result.would_reject is True
     assert result.reason == "low_confidence"
+    assert should_reject_signal(result, blocking_enabled=False) is False
+    assert should_reject_signal(result, blocking_enabled=True) is True
+
+
+def test_blocking_true_direction_disagreement_rejects():
+    confirmer = _confirmer(MockXGBoostModel([0.8, 0.2]), threshold=0.60)
+
+    result = confirmer.evaluate(
+        symbol="BTCUSDT",
+        window=_window(),
+        existing_signal="LONG",
+        existing_score=0.2,
+    )
+
+    assert result.xgboost_direction == "SHORT"
+    assert result.xgboost_confidence == 0.8
+    assert result.would_confirm is False
+    assert result.would_reject is True
+    assert result.reason == "direction_mismatch"
+    assert should_reject_signal(result, blocking_enabled=True) is True
+
+
+def test_model_error_never_rejects():
+    confirmer = _confirmer(ErrorXGBoostModel())
+
+    result = confirmer.evaluate(
+        symbol="BTCUSDT",
+        window=_window(),
+        existing_signal="LONG",
+        existing_score=0.2,
+    )
+
+    assert result.xgboost_status == "model_error"
+    assert result.would_confirm is False
+    assert result.would_reject is False
+    assert result.reason == "model_error:RuntimeError"
+    assert should_reject_signal(result, blocking_enabled=True) is False
 
 
 def test_high_confidence_would_confirm_true():
@@ -152,6 +220,40 @@ def test_high_confidence_would_confirm_true():
     assert result.would_confirm is True
     assert result.would_reject is False
     assert result.reason == "confirmed"
+    assert should_reject_signal(result, blocking_enabled=True) is False
+
+
+def test_blocking_false_logs_would_reject_without_actual_rejection():
+    confirmer = _confirmer(MockXGBoostModel([0.45, 0.55]), threshold=0.60)
+    result = confirmer.evaluate(
+        symbol="BTCUSDT",
+        window=_window(),
+        existing_signal="LONG",
+        existing_score=0.2,
+    )
+    actually_rejected = should_reject_signal(result, blocking_enabled=False)
+    row = result.to_log_row("2026-06-28 00:00:00+0000", "BTCUSDT", actually_rejected=actually_rejected)
+
+    assert result.would_reject is True
+    assert actually_rejected is False
+    assert row["actually_rejected"] == 0
+    assert row["reject_reason"] == ""
+
+
+def test_blocking_true_low_confidence_sets_actual_rejection_reason():
+    confirmer = _confirmer(MockXGBoostModel([0.45, 0.55]), threshold=0.60)
+    result = confirmer.evaluate(
+        symbol="BTCUSDT",
+        window=_window(),
+        existing_signal="LONG",
+        existing_score=0.2,
+    )
+    actually_rejected = should_reject_signal(result, blocking_enabled=True)
+    row = result.to_log_row("2026-06-28 00:00:00+0000", "BTCUSDT", actually_rejected=actually_rejected)
+
+    assert actually_rejected is True
+    assert row["actually_rejected"] == 1
+    assert row["reject_reason"] == "low_confidence"
 
 
 def test_shadow_log_row_format():
@@ -169,7 +271,13 @@ def test_shadow_log_row_format():
     assert row["xgboost_enabled"] == 1
     assert row["existing_signal"] == "LONG"
     assert row["existing_score"] == 0.25
+    assert row["direction"] == "LONG"
+    assert row["confidence"] == 0.8
+    assert row["xgboost_direction"] == "LONG"
+    assert row["xgboost_confidence"] == 0.8
     assert row["would_confirm"] == 1
     assert row["would_reject"] == 0
+    assert row["actually_rejected"] == 0
+    assert row["reject_reason"] == ""
     assert row["model_version"] == "unit-test"
     assert row["artifact_path"] == "mock.joblib"
