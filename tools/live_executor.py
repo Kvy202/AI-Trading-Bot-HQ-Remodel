@@ -190,9 +190,9 @@ def write_heartbeat(event: str, **fields: Any) -> None:
 # CSV helpers
 # ---------------------------------------------------------------------------
 
-PAPER_HEADER = ["ts", "symbol", "side", "price", "qty", "reason", "mode", "order_id"]
+PAPER_HEADER = ["ts", "symbol", "side", "price", "qty", "reason", "mode", "order_id", "signal_id"]
 CLOSED_HEADER = ["ts", "symbol", "closed_side", "qty", "entry_avg", "exit_price",
-                 "realized_pnl", "reason"]
+                 "realized_pnl", "reason", "signal_id"]
 
 
 def paper_path_for_day(d: date) -> Path:
@@ -210,21 +210,83 @@ def ensure_header(path: Path, header: Iterable[str]) -> None:
             csv.writer(f).writerow(list(header))
 
 
+def read_existing_header(path: Path) -> Optional[List[str]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            first_line = f.readline()
+        if not first_line.strip():
+            return None
+        return next(csv.reader([first_line]))
+    except Exception:
+        return None
+
+
+def ensure_additive_header(path: Path, header: List[str]) -> List[str]:
+    existing = read_existing_header(path)
+    if not existing:
+        ensure_header(path, header)
+        return header
+    if existing == header:
+        return header
+    if existing == header[: len(existing)]:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with path.open("r", encoding="utf-8", newline="") as src, tmp.open(
+                "w", encoding="utf-8", newline=""
+            ) as dst:
+                reader = csv.reader(src)
+                writer = csv.writer(dst)
+                next(reader, None)
+                writer.writerow(header)
+                for row in reader:
+                    writer.writerow(row[: len(existing)] + [""] * (len(header) - len(existing)))
+            os.replace(tmp, path)
+            return header
+        except Exception as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            log_err(f"csv schema extension failed path={path}: {type(exc).__name__}: {exc}")
+    return existing
+
+
 def append_csv(path: Path, header: Iterable[str], row: Iterable[Any]) -> None:
     ensure_header(path, header)
     with path.open("a", encoding="utf-8", newline="") as f:
         csv.writer(f).writerow(list(row))
 
 
-def record_trade(path: Path, row: List[Any]) -> None:
-    append_csv(path, PAPER_HEADER, row)
+def append_csv_dict(path: Path, header: List[str], row: Dict[str, Any]) -> None:
+    active_header = ensure_additive_header(path, header)
+    with path.open("a", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerow([row.get(col, "") for col in active_header])
+
+
+def record_trade(path: Path, row: List[Any], signal_id: str = "") -> None:
+    data = dict(zip(PAPER_HEADER, row))
+    data["signal_id"] = str(signal_id or "")
+    append_csv_dict(path, PAPER_HEADER, data)
 
 
 def record_closed_trade(ts: str, symbol: str, closed_side: str, qty: float, entry_avg: float,
-                        exit_price: float, realized_pnl: float, reason: str) -> None:
-    row = [ts, symbol, closed_side, qty, entry_avg, exit_price, realized_pnl, reason]
-    append_csv(CLOSED_MASTER_CSV, CLOSED_HEADER, row)
-    append_csv(closed_path_for_day(datetime.now(timezone.utc).date()), CLOSED_HEADER, row)
+                        exit_price: float, realized_pnl: float, reason: str,
+                        signal_id: str = "") -> None:
+    row = {
+        "ts": ts,
+        "symbol": symbol,
+        "closed_side": closed_side,
+        "qty": qty,
+        "entry_avg": entry_avg,
+        "exit_price": exit_price,
+        "realized_pnl": realized_pnl,
+        "reason": reason,
+        "signal_id": str(signal_id or ""),
+    }
+    append_csv_dict(CLOSED_MASTER_CSV, CLOSED_HEADER, row)
+    append_csv_dict(closed_path_for_day(datetime.now(timezone.utc).date()), CLOSED_HEADER, row)
     # V2 hook: single choke point through which every close passes (TP/SL/flip/
     # time-stop/restart-close). Feeds the daily SL-count / loss / DD counters.
     if _V2_RISK is not None:
@@ -288,6 +350,7 @@ class SignalRow:
     thr: float
     mode: str  # "abs" or "raw" - as written by the live writer
     kinds_used: Optional[str] = None  # None = old-format row (col absent); "" = present but empty
+    signal_id: str = ""
 
 
 def _is_finite_number(x: float) -> bool:
@@ -305,6 +368,7 @@ def parse_signal_line(line: str) -> Optional[SignalRow]:
         ts, symbol, px, p_meta, rv_mean, allow, thr, mode = parts[:8]
         # kinds_used is column 9 (index 8); None means old-format row without the column.
         kinds_used: Optional[str] = parts[8].strip() if len(parts) > 8 else None
+        signal_id = parts[10].strip() if len(parts) > 10 else ""
         price = float(px) if str(px).strip() else 0.0
         p = float(p_meta)
         rv = float(rv_mean)
@@ -322,6 +386,7 @@ def parse_signal_line(line: str) -> Optional[SignalRow]:
             thr=t,
             mode=(mode or "abs").strip().lower(),
             kinds_used=kinds_used,
+            signal_id=signal_id,
         )
     except Exception:
         return None
@@ -701,7 +766,7 @@ def maybe_rotate_paper_path(current_day: date, paper_path: Path) -> Tuple[date, 
     today = datetime.now(timezone.utc).date()
     if today != current_day:
         new_path = paper_path_for_day(today)
-        ensure_header(new_path, PAPER_HEADER)
+        ensure_additive_header(new_path, PAPER_HEADER)
         return today, new_path
     return current_day, paper_path
 
@@ -1017,8 +1082,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     current_day = datetime.now(timezone.utc).date()
     paper_path = paper_path_for_day(current_day)
-    ensure_header(paper_path, PAPER_HEADER)
-    ensure_header(CLOSED_MASTER_CSV, CLOSED_HEADER)
+    ensure_additive_header(paper_path, PAPER_HEADER)
+    ensure_additive_header(CLOSED_MASTER_CSV, CLOSED_HEADER)
 
     exec_thr = float(args.plong)
     exec_mode = (args.pmode or "abs").lower()
@@ -1027,6 +1092,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     last_fill_time: Dict[str, float] = {}
     last_fill_price: Dict[str, float] = {}
     positions: Dict[str, Position] = {}
+    position_signal_ids: Dict[str, str] = {}
     survival_entry_ts: Dict[str, float] = {}
     survival_trade_ids: Dict[str, str] = {}
     active_symbols: set[str] = set()
@@ -1096,10 +1162,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                                                   args.fee_bps, args.slippage_bps)
                 reason = f"EXIT_{'TP' if hit_tp else 'SL'}_RESTART pnl={pnl:.6f}"
                 record_trade(paper_path, [ts_now, sym, action, exit_fill, pos.qty, reason, mode_name, order_id])
-                record_closed_trade(ts_now, sym, action, pos.qty, pos.avg, exit_fill, pnl, reason)
+                entry_signal_id = position_signal_ids.get(sym, "")
+                record_closed_trade(ts_now, sym, action, pos.qty, pos.avg, exit_fill, pnl, reason, entry_signal_id)
                 log(f"RESTART_CLOSE {mode_name} {action} {sym} qty={pos.qty} "
                     f"px={exit_fill:.8f} order={order_id} {reason}")
                 positions.pop(sym)
+                position_signal_ids.pop(sym, None)
                 survival_entry_ts.pop(sym, None)
                 survival_trade_ids.pop(sym, None)
                 active_symbols.discard(sym)
@@ -1286,10 +1354,18 @@ def main(argv: Optional[List[str]] = None) -> None:
                                                           args.fee_bps, args.slippage_bps)
                         reason = (f"EXIT_{'TP' if hit_tp else 'SL'} "
                                   f"p={sig.p_meta:.4f} rv={sig.rv_mean:.6f} pnl={pnl:.6f}")
-                        record_trade(paper_path, [sig.ts, sig.symbol, action, exit_fill, pos.qty, reason, mode_name, order_id])
-                        record_closed_trade(sig.ts, sig.symbol, action, pos.qty, pos.avg, exit_fill, pnl, reason)
+                        entry_signal_id = position_signal_ids.get(sig.symbol, "")
+                        record_trade(
+                            paper_path,
+                            [sig.ts, sig.symbol, action, exit_fill, pos.qty, reason, mode_name, order_id],
+                            signal_id=sig.signal_id,
+                        )
+                        record_closed_trade(
+                            sig.ts, sig.symbol, action, pos.qty, pos.avg, exit_fill, pnl, reason, entry_signal_id
+                        )
                         log(f"TRADE {mode_name} {action} {sig.symbol} qty={pos.qty} px={exit_fill:.8f} order={order_id} {reason}")
                         positions.pop(sig.symbol, None)
+                        position_signal_ids.pop(sig.symbol, None)
                         survival_entry_ts.pop(sig.symbol, None)
                         survival_trade_ids.pop(sig.symbol, None)
                         active_symbols.discard(sig.symbol)
@@ -1314,10 +1390,18 @@ def main(argv: Optional[List[str]] = None) -> None:
                                                           args.fee_bps, args.slippage_bps)
                         reason = (f"EXIT_TIME held_min={held_min:.1f} "
                                   f"p={sig.p_meta:.4f} rv={sig.rv_mean:.6f} pnl={pnl:.6f}")
-                        record_trade(paper_path, [sig.ts, sig.symbol, action, exit_fill, pos.qty, reason, mode_name, order_id])
-                        record_closed_trade(sig.ts, sig.symbol, action, pos.qty, pos.avg, exit_fill, pnl, reason)
+                        entry_signal_id = position_signal_ids.get(sig.symbol, "")
+                        record_trade(
+                            paper_path,
+                            [sig.ts, sig.symbol, action, exit_fill, pos.qty, reason, mode_name, order_id],
+                            signal_id=sig.signal_id,
+                        )
+                        record_closed_trade(
+                            sig.ts, sig.symbol, action, pos.qty, pos.avg, exit_fill, pnl, reason, entry_signal_id
+                        )
                         log(f"TRADE {mode_name} {action} {sig.symbol} qty={pos.qty} px={exit_fill:.8f} order={order_id} {reason}")
                         positions.pop(sig.symbol, None)
+                        position_signal_ids.pop(sig.symbol, None)
                         survival_entry_ts.pop(sig.symbol, None)
                         survival_trade_ids.pop(sig.symbol, None)
                         active_symbols.discard(sig.symbol)
@@ -1404,7 +1488,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                     pos.avg = (pos.avg * pos.qty + entry_fill * qty) / new_qty
                     pos.qty = new_qty
                     reason = f"SCALE_IN p={sig.p_meta:.4f} rv={sig.rv_mean:.6f}"
-                    record_trade(paper_path, [sig.ts, sig.symbol, action_open, entry_fill, qty, reason, mode_name, order_id])
+                    record_trade(
+                        paper_path,
+                        [sig.ts, sig.symbol, action_open, entry_fill, qty, reason, mode_name, order_id],
+                        signal_id=sig.signal_id,
+                    )
                     log(f"TRADE {mode_name} {action_open} {sig.symbol} qty={qty} px={entry_fill:.8f} order={order_id} {reason}")
                     last_fill_time[sig.symbol] = now_s
                     last_fill_price[sig.symbol] = price
@@ -1434,10 +1522,18 @@ def main(argv: Optional[List[str]] = None) -> None:
                     pnl, exit_fill = net_pnl_on_close(pos, price, action_close,
                                                       args.fee_bps, args.slippage_bps)
                     reason = f"FLIP_CLOSE p={sig.p_meta:.4f} rv={sig.rv_mean:.6f} pnl={pnl:.6f}"
-                    record_trade(paper_path, [sig.ts, sig.symbol, action_close, exit_fill, pos.qty, reason, mode_name, order_id])
-                    record_closed_trade(sig.ts, sig.symbol, action_close, pos.qty, pos.avg, exit_fill, pnl, reason)
+                    entry_signal_id = position_signal_ids.get(sig.symbol, "")
+                    record_trade(
+                        paper_path,
+                        [sig.ts, sig.symbol, action_close, exit_fill, pos.qty, reason, mode_name, order_id],
+                        signal_id=sig.signal_id,
+                    )
+                    record_closed_trade(
+                        sig.ts, sig.symbol, action_close, pos.qty, pos.avg, exit_fill, pnl, reason, entry_signal_id
+                    )
                     log(f"TRADE {mode_name} {action_close} {sig.symbol} qty={pos.qty} px={exit_fill:.8f} order={order_id} {reason}")
                     positions.pop(sig.symbol, None)
+                    position_signal_ids.pop(sig.symbol, None)
                     survival_entry_ts.pop(sig.symbol, None)
                     survival_trade_ids.pop(sig.symbol, None)
                     active_symbols.discard(sig.symbol)
@@ -1488,8 +1584,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                 order_id = broker.create_market_order(sig.symbol, action_open, qty, reduce_only=False)
                 entry_fill = apply_slippage(price, action_open, args.slippage_bps)
                 reason = f"ENTRY p={sig.p_meta:.4f} rv={sig.rv_mean:.6f} eff_thr={exec_thr:.4f}"
-                record_trade(paper_path, [sig.ts, sig.symbol, action_open, entry_fill, qty, reason, mode_name, order_id])
+                record_trade(
+                    paper_path,
+                    [sig.ts, sig.symbol, action_open, entry_fill, qty, reason, mode_name, order_id],
+                    signal_id=sig.signal_id,
+                )
                 positions[sig.symbol] = Position(want, qty, entry_fill)
+                position_signal_ids[sig.symbol] = sig.signal_id
                 survival_entry_ts[sig.symbol] = _parse_signal_ts(sig.ts) or now_s
                 survival_trade_ids[sig.symbol] = f"{sig.symbol}:{sig.ts}"
                 active_symbols.add(sig.symbol)

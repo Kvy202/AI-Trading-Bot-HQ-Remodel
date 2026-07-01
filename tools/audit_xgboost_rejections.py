@@ -36,6 +36,7 @@ CloseKey = Tuple[str, datetime, str]
 @dataclass(frozen=True)
 class TradeOutcome:
     entry_key: Key
+    signal_id: str
     symbol: str
     side: str
     entry_ts: str
@@ -128,6 +129,10 @@ def _reject_reason(row: Dict[str, str]) -> str:
     return value or "unknown"
 
 
+def _row_signal_id(row: Dict[str, str]) -> str:
+    return _first_non_empty(row, "signal_id", "decision_id")
+
+
 def _decision(row: Dict[str, str]) -> str:
     if _truthy(row.get("would_reject")):
         return "rejected"
@@ -199,6 +204,15 @@ def _index_rows(rows: Iterable[Dict[str, str]], ts_keys: Sequence[str]) -> tuple
     return index, unparseable
 
 
+def _index_rows_by_id(rows: Iterable[Dict[str, str]]) -> Dict[str, List[Dict[str, str]]]:
+    index: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        signal_id = _row_signal_id(row)
+        if signal_id:
+            index[signal_id].append(row)
+    return index
+
+
 def _direction_from_score(value: Any) -> str:
     score = _float_or_none(value)
     if score is None:
@@ -236,10 +250,14 @@ def _sort_paper_rows(rows: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
 def _build_trade_outcomes(
     paper_rows: List[Dict[str, str]],
     closed_rows: List[Dict[str, str]],
-) -> tuple[Dict[Key, List[TradeOutcome]], Dict[str, int]]:
+) -> tuple[Dict[str, List[TradeOutcome]], Dict[Key, List[TradeOutcome]], Dict[str, int]]:
     diagnostics: Counter[str] = Counter()
     closed_index: Dict[CloseKey, List[Dict[str, str]]] = defaultdict(list)
+    closed_id_index: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     for row in closed_rows:
+        signal_id = _row_signal_id(row)
+        if signal_id:
+            closed_id_index[signal_id].append(row)
         close_key = _close_key_from_row(row)
         if close_key is None:
             diagnostics["closed_trade_unparseable_key"] += 1
@@ -247,7 +265,8 @@ def _build_trade_outcomes(
         closed_index[close_key].append(row)
 
     positions: Dict[str, Dict[str, Any]] = {}
-    outcomes: Dict[Key, List[TradeOutcome]] = defaultdict(list)
+    outcomes_by_id: Dict[str, List[TradeOutcome]] = defaultdict(list)
+    outcomes_by_key: Dict[Key, List[TradeOutcome]] = defaultdict(list)
     for row in _sort_paper_rows(paper_rows):
         key = _key_from_row(row, ("ts", "timestamp"))
         action = _first_non_empty(row, "side").upper()
@@ -264,6 +283,7 @@ def _build_trade_outcomes(
                 positions[symbol] = {
                     "entry_key": key,
                     "entry_ts": _first_non_empty(row, "ts", "timestamp"),
+                    "signal_id": _row_signal_id(row),
                     "side": side,
                     "fresh_entry": reason.upper().startswith("ENTRY"),
                     "scale_ins": 0,
@@ -275,6 +295,7 @@ def _build_trade_outcomes(
                 positions[symbol] = {
                     "entry_key": key,
                     "entry_ts": _first_non_empty(row, "ts", "timestamp"),
+                    "signal_id": _row_signal_id(row),
                     "side": side,
                     "fresh_entry": reason.upper().startswith("ENTRY"),
                     "scale_ins": 0,
@@ -291,12 +312,6 @@ def _build_trade_outcomes(
             continue
         close_key = (symbol, dt, action)
         closed_matches = closed_index.get(close_key, [])
-        if not closed_matches:
-            diagnostics["closed_trade_missing_for_paper_close"] += 1
-            continue
-        if len(closed_matches) > 1:
-            diagnostics["closed_trade_duplicate_key"] += 1
-            continue
         if position.get("unsafe"):
             diagnostics["paper_position_sequence_unsafe"] += 1
             continue
@@ -307,29 +322,61 @@ def _build_trade_outcomes(
             diagnostics["paper_scale_in_attribution_unsafe"] += 1
             continue
 
-        closed = closed_matches[0]
+        entry_signal_id = str(position.get("signal_id") or "")
+        if entry_signal_id:
+            id_matches = [
+                r
+                for r in closed_id_index.get(entry_signal_id, [])
+                if _normalize_symbol(r.get("symbol")) == symbol
+            ]
+            if len(id_matches) == 1:
+                closed = id_matches[0]
+            elif len(id_matches) > 1:
+                diagnostics["closed_trade_duplicate_signal_id"] += 1
+                continue
+            elif not closed_matches:
+                diagnostics["closed_trade_missing_for_signal_id"] += 1
+                continue
+            elif len(closed_matches) == 1:
+                closed = closed_matches[0]
+            else:
+                diagnostics["closed_trade_duplicate_key"] += 1
+                continue
+        else:
+            if not closed_matches:
+                diagnostics["closed_trade_missing_for_paper_close"] += 1
+                continue
+            if len(closed_matches) > 1:
+                diagnostics["closed_trade_duplicate_key"] += 1
+                continue
+            closed = closed_matches[0]
         pnl = _float_or_none(_first_non_empty(closed, "realized_pnl", "pnl"))
         if pnl is None:
             diagnostics["closed_trade_missing_pnl"] += 1
             continue
         entry_key = position["entry_key"]
-        outcomes[entry_key].append(
-            TradeOutcome(
-                entry_key=entry_key,
-                symbol=symbol,
-                side=str(position["side"]),
-                entry_ts=str(position["entry_ts"]),
-                close_ts=_first_non_empty(closed, "ts", "timestamp"),
-                close_side=action,
-                realized_pnl=pnl,
-            )
+        outcome = TradeOutcome(
+            entry_key=entry_key,
+            signal_id=entry_signal_id,
+            symbol=symbol,
+            side=str(position["side"]),
+            entry_ts=str(position["entry_ts"]),
+            close_ts=_first_non_empty(closed, "ts", "timestamp"),
+            close_side=action,
+            realized_pnl=pnl,
         )
+        outcomes_by_key[entry_key].append(outcome)
+        if entry_signal_id:
+            outcomes_by_id[entry_signal_id].append(outcome)
 
     diagnostics["paper_open_positions_without_close"] += len(positions)
-    for entry_key, rows in outcomes.items():
+    for signal_id, rows in outcomes_by_id.items():
+        if len(rows) > 1:
+            diagnostics["paper_duplicate_outcome_signal_id"] += 1
+    for entry_key, rows in outcomes_by_key.items():
         if len(rows) > 1:
             diagnostics["paper_duplicate_outcome_entry_key"] += 1
-    return outcomes, dict(diagnostics)
+    return outcomes_by_id, outcomes_by_key, dict(diagnostics)
 
 
 def _pnl_stats(values: Iterable[float]) -> Dict[str, Optional[float] | int]:
@@ -360,14 +407,23 @@ def _summarize_trade_outcomes(
     closed_status: str,
 ) -> Dict[str, Any]:
     live_index, live_unparseable = _index_rows(live_rows, ("ts", "timestamp"))
+    live_id_index = _index_rows_by_id(live_rows)
     xgb_keys = [_key_from_row(row, ("timestamp", "ts")) for row in xgboost_rows]
     xgb_key_counts = Counter(key for key in xgb_keys if key is not None)
-    outcomes, trade_diagnostics = _build_trade_outcomes(paper_rows, closed_rows)
+    xgb_ids = [_row_signal_id(row) for row in xgboost_rows]
+    xgb_id_counts = Counter(signal_id for signal_id in xgb_ids if signal_id)
+    outcomes_by_id, outcomes_by_key, trade_diagnostics = _build_trade_outcomes(paper_rows, closed_rows)
 
     unmatched_reasons: Counter[str] = Counter()
     matched_pnls: Dict[str, List[float]] = {"allowed": [], "rejected": []}
     matched_closed_trade_count = 0
+    id_matched_count = 0
+    fallback_matched_count = 0
     decision_rows = 0
+    id_decision_rows = 0
+    missing_id_count = 0
+    unmatched_due_missing_id = 0
+    unmatched_due_missing_trade = 0
     unmatched_allowed = 0
     unmatched_rejected = 0
 
@@ -379,15 +435,57 @@ def _summarize_trade_outcomes(
         elif decision == "rejected":
             unmatched_rejected += 1
 
-    for row, key in zip(xgboost_rows, xgb_keys):
+    def mark_missing_trade(decision: str, reason: str) -> None:
+        nonlocal unmatched_due_missing_trade
+        unmatched_due_missing_trade += 1
+        mark_unmatched(decision, reason)
+
+    def record_match(decision: str, outcome: TradeOutcome, method: str) -> None:
+        nonlocal matched_closed_trade_count, id_matched_count, fallback_matched_count
+        matched_closed_trade_count += 1
+        if method == "id":
+            id_matched_count += 1
+        else:
+            fallback_matched_count += 1
+        matched_pnls[decision].append(outcome.realized_pnl)
+
+    for row, key, signal_id in zip(xgboost_rows, xgb_keys, xgb_ids):
         decision = _decision(row)
         if decision not in {"allowed", "rejected"}:
             continue
         decision_rows += 1
+        if signal_id:
+            id_decision_rows += 1
+            if xgb_id_counts[signal_id] > 1:
+                mark_unmatched(decision, "xgboost_duplicate_signal_id")
+                continue
+            live_matches = live_id_index.get(signal_id, [])
+            if len(live_matches) > 1:
+                mark_unmatched(decision, "live_signal_duplicate_signal_id")
+                continue
+            outcome_matches = outcomes_by_id.get(signal_id, [])
+            if not outcome_matches:
+                mark_missing_trade(decision, "paper_entry_or_closed_trade_missing")
+                continue
+            if len(outcome_matches) > 1:
+                mark_unmatched(decision, "paper_duplicate_outcome_signal_id")
+                continue
+            outcome = outcome_matches[0]
+            live = live_matches[0] if live_matches else row
+            expected_direction = _signal_direction(live) or _signal_direction(row)
+            if expected_direction and outcome.side != expected_direction:
+                mark_unmatched(decision, "paper_entry_side_mismatch")
+                continue
+            record_match(decision, outcome, "id")
+            continue
+
+        missing_id_count += 1
         if key is None:
+            unmatched_due_missing_id += 1
             mark_unmatched(decision, "xgboost_unparseable_key")
             continue
         if xgb_key_counts[key] > 1:
+            unmatched_due_missing_id += 1
             mark_unmatched(decision, "xgboost_duplicate_key")
             continue
 
@@ -403,9 +501,9 @@ def _summarize_trade_outcomes(
             mark_unmatched(decision, "live_signal_not_allowed")
             continue
 
-        outcome_matches = outcomes.get(key, [])
+        outcome_matches = outcomes_by_key.get(key, [])
         if not outcome_matches:
-            mark_unmatched(decision, "paper_entry_or_closed_trade_missing")
+            mark_missing_trade(decision, "paper_entry_or_closed_trade_missing")
             continue
         if len(outcome_matches) > 1:
             mark_unmatched(decision, "paper_duplicate_outcome_entry_key")
@@ -417,10 +515,24 @@ def _summarize_trade_outcomes(
             mark_unmatched(decision, "paper_entry_side_mismatch")
             continue
 
-        matched_closed_trade_count += 1
-        matched_pnls[decision].append(outcome.realized_pnl)
+        record_match(decision, outcome, "fallback")
 
     unmatched_decisions = unmatched_allowed + unmatched_rejected
+    if id_matched_count > 0 and fallback_matched_count > 0:
+        join_method = "signal_id+timestamp_symbol_fallback"
+    elif id_matched_count > 0:
+        join_method = "signal_id"
+    elif fallback_matched_count > 0:
+        join_method = "timestamp_symbol_fallback"
+    elif id_decision_rows > 0 and missing_id_count > 0:
+        join_method = "signal_id+timestamp_symbol_fallback"
+    elif id_decision_rows > 0:
+        join_method = "signal_id"
+    elif missing_id_count > 0:
+        join_method = "timestamp_symbol_fallback"
+    else:
+        join_method = "none"
+
     if not xgboost_rows:
         status = "not_available"
         message = "No XGBoost shadow rows were available for trade outcome joining."
@@ -446,7 +558,7 @@ def _summarize_trade_outcomes(
         status = "unreliable"
         message = (
             "Trade outcome join is not reliable: no XGBoost decision rows matched "
-            "a unique live signal, paper entry, and closed trade by exact timestamp and symbol."
+            "a unique paper entry and closed trade by signal_id or conservative timestamp+symbol fallback."
         )
     elif unmatched_decisions > 0:
         status = "partial"
@@ -461,9 +573,15 @@ def _summarize_trade_outcomes(
     return {
         "status": status,
         "message": message,
+        "join_method": join_method,
         "live_unparseable_count": live_unparseable,
         "trade_diagnostics": trade_diagnostics,
         "matched_closed_trade_count": matched_closed_trade_count,
+        "id_matched_count": id_matched_count,
+        "fallback_matched_count": fallback_matched_count,
+        "missing_id_count": missing_id_count,
+        "unmatched_due_missing_id": unmatched_due_missing_id,
+        "unmatched_due_missing_trade": unmatched_due_missing_trade,
         "matched_closed_trade_pnl": {
             "allowed": _pnl_stats(matched_pnls["allowed"]),
             "rejected": _pnl_stats(matched_pnls["rejected"]),
@@ -567,8 +685,14 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         "",
         "Trade Outcome Join",
         f"  status: {join['status']}",
+        f"  join_method: {join['join_method']}",
         f"  message: {join['message']}",
         f"  matched_closed_trade_count: {join['matched_closed_trade_count']}",
+        f"  id_matched_count: {join['id_matched_count']}",
+        f"  fallback_matched_count: {join['fallback_matched_count']}",
+        f"  missing_id_count: {join['missing_id_count']}",
+        f"  unmatched_due_missing_id: {join['unmatched_due_missing_id']}",
+        f"  unmatched_due_missing_trade: {join['unmatched_due_missing_trade']}",
         f"  allowed_matched_count: {allowed_pnl['count']}",
         f"  allowed_total_pnl: {_fmt(allowed_pnl['total_pnl'])}",
         f"  allowed_average_pnl: {_fmt(allowed_pnl['average_pnl'])}",

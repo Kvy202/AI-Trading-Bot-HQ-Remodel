@@ -40,6 +40,7 @@ XGBOOST_SHADOW_COLS = [
     "reject_reason",
     "model_version",
     "artifact_path",
+    "signal_id",
 ]
 
 
@@ -180,7 +181,13 @@ class XGBoostSignalResult:
     model_version: str
     artifact_path: str
 
-    def to_log_row(self, timestamp: str, symbol: str, actually_rejected: bool = False) -> Dict[str, Any]:
+    def to_log_row(
+        self,
+        timestamp: str,
+        symbol: str,
+        actually_rejected: bool = False,
+        signal_id: str = "",
+    ) -> Dict[str, Any]:
         reject_reason = self.reason if bool(actually_rejected) else ""
         return {
             "timestamp": timestamp,
@@ -200,6 +207,7 @@ class XGBoostSignalResult:
             "reject_reason": reject_reason,
             "model_version": self.model_version,
             "artifact_path": self.artifact_path,
+            "signal_id": str(signal_id or ""),
         }
 
 

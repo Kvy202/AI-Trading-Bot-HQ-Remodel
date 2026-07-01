@@ -99,7 +99,7 @@ XGBOOST_SHADOW_LOG: Path = LOGS / "xgboost_signal_shadow.csv"
 # in this exact order, so don't reorder these without updating the executor.
 SIGNAL_COLS: List[str] = [
     "ts", "symbol", "px", "p_meta", "rv_mean", "allow", "thr", "mode",
-    "kinds_used", "side_hint",
+    "kinds_used", "side_hint", "signal_id",
 ]
 BASE_COLS: List[str] = ["ts", "p_meta", "thr", "mode", "rv_mean", "allow", "kinds_used"]
 
@@ -189,6 +189,38 @@ def read_existing_header(path: Path) -> Optional[List[str]]:
         return next(csv.reader([first_line]))
     except Exception:
         return None
+
+
+def ensure_csv_schema_additive(path: Path, cols: List[str], label: str) -> None:
+    """Ensure a CSV has `cols`, padding old rows when the new schema is additive."""
+    existing = read_existing_header(path)
+    if not existing:
+        ensure_header(path, cols)
+        return
+    if existing == cols:
+        return
+    if existing == cols[: len(existing)]:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with path.open("r", encoding="utf-8", newline="") as src, tmp.open(
+                "w", encoding="utf-8", newline=""
+            ) as dst:
+                reader = csv.reader(src)
+                writer = csv.writer(dst)
+                next(reader, None)
+                writer.writerow(cols)
+                for row in reader:
+                    writer.writerow(row[: len(existing)] + [""] * (len(cols) - len(existing)))
+            os.replace(tmp, path)
+            log(f"{label} schema extended with {cols[len(existing):]}")
+            return
+        except Exception as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            log_err(f"{label} schema extension failed: {type(exc).__name__}: {exc}")
+    ensure_csv_schema(path, cols, label)
 
 
 def today_daily(prefix: str) -> Path:
@@ -319,6 +351,19 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return v
     except Exception:
         return default
+
+
+def make_signal_id(timestamp: str, symbol: str, sequence: int) -> str:
+    ts_part = (
+        str(timestamp or "")
+        .strip()
+        .replace("-", "")
+        .replace(":", "")
+        .replace(" ", "T")
+        .replace("+0000", "Z")
+    )
+    sym_part = "".join(ch if ch.isalnum() else "_" for ch in str(symbol or "").upper())
+    return f"sig_{ts_part}_{sym_part}_{int(sequence):08d}"
 
 
 def _is_valid_price(x: Any) -> bool:
@@ -556,7 +601,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # and tools/calibrate_temperature.py read. Both files are created with the
     # full locked schema on their first append_aligned_row call instead.
     # (The signals file has a fixed schema, so pre-creating it is fine.)
-    ensure_header(signals_path, SIGNAL_COLS)
+    ensure_csv_schema_additive(signals_path, SIGNAL_COLS, "live signals")
 
     exp_flags = ExperimentalFlags.from_env()
     log(f"experimental_flags: {exp_flags.summary()}")
@@ -608,7 +653,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             )
             xgboost_shadow_cols = XGBOOST_SHADOW_COLS
             xgboost_blocking = xgboost_signal_blocking_from_env(False)
-            ensure_csv_schema(XGBOOST_SHADOW_LOG, xgboost_shadow_cols, "xgboost shadow log")
+            ensure_csv_schema_additive(XGBOOST_SHADOW_LOG, xgboost_shadow_cols, "xgboost shadow log")
             log(
                 "xgboost_enabled=1 "
                 f"xgboost_status={xgboost_confirmer.xgboost_status} "
@@ -660,7 +705,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                 append_aligned_row(
                     XGBOOST_SHADOW_LOG,
                     xgboost_shadow_cols,
-                    _xgb.to_log_row(_ts(), "VERIFY"),
+                    _xgb.to_log_row(
+                        _ts(),
+                        "VERIFY",
+                        signal_id=make_signal_id("XGB_SELF_TEST", "VERIFY", 0),
+                    ),
                 )
                 log(
                     "xgboost_self_test=shadow_row_written "
@@ -732,6 +781,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     locked_master_cols: Optional[List[str]] = None
     feature_guard_block: Optional[bool] = None  # set once; True = refuse to trade
     tick_count = 0
+    decision_seq = 0
 
     try:
         while True:
@@ -845,6 +895,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 # 5) Write per-symbol signal rows — each from its OWN prediction.
                 missing_price_syms: List[str] = []
                 for sym in syms:
+                    decision_seq += 1
+                    signal_id = make_signal_id(ts_now, sym, decision_seq)
                     pred = per_symbol_pred.get(sym)
                     if pred is None:
                         # No window/score for this symbol this tick -> safe no-trade.
@@ -923,6 +975,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                         "mode": args.mode,
                         "kinds_used": ",".join(sorted(per_model_sym.keys())),
                         "side_hint": side_hint(p_centered),
+                        "signal_id": signal_id,
                     }
                     if _iso is not None and isolation_shadow_cols is not None:
                         append_aligned_row(
@@ -969,6 +1022,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                                     ts_now,
                                     sym,
                                     actually_rejected=xgboost_actually_rejected,
+                                    signal_id=signal_id,
                                 ),
                             )
                         except Exception as _xgb_exc:
