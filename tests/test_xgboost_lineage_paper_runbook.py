@@ -36,6 +36,7 @@ def test_lineage_runbook_forces_paper_xgboost_flags():
         "XGBOOST_SIGNAL_ARTIFACT = $artifactFull",
         "USE_ISOLATION_FOREST = 'false'",
         "USE_SURVIVAL_EXIT = 'false'",
+        "EXEC_RESTORE_STATE = 'false'",
         "tools\\verify_xgboost_signal.py",
         "--missing-artifact-check",
         "tools\\audit_xgboost_rejections.py",
@@ -75,10 +76,23 @@ def test_lineage_runbook_does_not_enable_isolation_or_survival():
 
     assert 'os.environ["USE_ISOLATION_FOREST"] = "false"' in text
     assert 'os.environ["USE_SURVIVAL_EXIT"] = "false"' in text
+    assert 'os.environ["EXEC_RESTORE_STATE"] = "false"' in text
     assert '"USE_ISOLATION_FOREST": "false"' in text
     assert '"USE_SURVIVAL_EXIT": "false"' in text
+    assert '"EXEC_RESTORE_STATE": "false"' in text
     assert "USE_ISOLATION_FOREST = 'true'" not in text
     assert "USE_SURVIVAL_EXIT = 'true'" not in text
+
+
+def test_lineage_runbook_checks_aggregate_and_dated_closed_logs():
+    text = _script_text()
+
+    assert "trades_closed.csv" in text
+    assert "trades_closed_*.csv" in text
+    assert "closed_master_signal_id_count" in text
+    assert "closed_dated_signal_id_count" in text
+    assert "aggregate closed trade rows occurred but no signal_id was logged" in text
+    assert "dated closed trade rows occurred but no signal_id was logged" in text
 
 
 def test_lineage_runbook_parses_when_powershell_available():

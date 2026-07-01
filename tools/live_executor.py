@@ -267,7 +267,7 @@ def append_csv_dict(path: Path, header: List[str], row: Dict[str, Any]) -> None:
 
 def record_trade(path: Path, row: List[Any], signal_id: str = "") -> None:
     data = dict(zip(PAPER_HEADER, row))
-    data["signal_id"] = str(signal_id or "")
+    data["signal_id"] = str(signal_id or data.get("signal_id") or "")
     append_csv_dict(path, PAPER_HEADER, data)
 
 
@@ -773,13 +773,27 @@ def maybe_rotate_paper_path(current_day: date, paper_path: Path) -> Tuple[date, 
 
 def write_state_snapshot(mode_name: str, exec_thr: float, exec_mode: str, adaptive: bool,
                          positions: Dict[str, Position],
-                         paused: bool = False, risk_mode: str = "normal") -> None:
+                         paused: bool = False, risk_mode: str = "normal",
+                         position_signal_ids: Optional[Dict[str, str]] = None) -> None:
     """Atomically write the executor's current state to STATE_JSON.
 
     Used both as a status file for dashboards and as a way to recover
     open positions after a restart (see load_positions_from_state).
     """
     try:
+        signal_ids = {
+            str(sym): str(signal_id)
+            for sym, signal_id in (position_signal_ids or {}).items()
+            if str(signal_id or "").strip()
+        }
+        open_positions: Dict[str, Dict[str, Any]] = {}
+        for sym, pos in positions.items():
+            pos_payload = dict(pos.__dict__)
+            signal_id = signal_ids.get(str(sym), "")
+            if signal_id:
+                pos_payload["signal_id"] = signal_id
+            open_positions[str(sym)] = pos_payload
+
         payload = {
             "ts":             utc_ts(),
             "mode":           mode_name,
@@ -788,7 +802,8 @@ def write_state_snapshot(mode_name: str, exec_thr: float, exec_mode: str, adapti
             "adaptive":       bool(adaptive),
             "paused":         paused,
             "risk_mode":      risk_mode,
-            "open_positions": {k: v.__dict__ for k, v in positions.items()},
+            "open_positions": open_positions,
+            "open_position_signal_ids": signal_ids,
         }
         tmp = STATE_JSON.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -835,6 +850,36 @@ def load_positions_from_state(path: Path) -> Dict[str, Position]:
         if avg <= 0 or not math.isfinite(avg):
             continue
         out[str(sym)] = Position(side=side, qty=qty, avg=avg)
+    return out
+
+
+def load_position_signal_ids_from_state(path: Path) -> Dict[str, str]:
+    """Read optional entry signal IDs from STATE_JSON without affecting positions."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    out: Dict[str, str] = {}
+    raw_ids = data.get("open_position_signal_ids", {})
+    if isinstance(raw_ids, dict):
+        for sym, signal_id in raw_ids.items():
+            value = str(signal_id or "").strip()
+            if value:
+                out[str(sym)] = value
+
+    raw_positions = data.get("open_positions", {})
+    if isinstance(raw_positions, dict):
+        for sym, pos_dict in raw_positions.items():
+            if not isinstance(pos_dict, dict):
+                continue
+            value = str(pos_dict.get("signal_id") or pos_dict.get("decision_id") or "").strip()
+            if value:
+                out[str(sym)] = value
     return out
 
 
@@ -1116,6 +1161,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # atomically every tick so it should always be a consistent snapshot.
     if args.restore_state:
         restored = load_positions_from_state(STATE_JSON)
+        restored_signal_ids = load_position_signal_ids_from_state(STATE_JSON)
         if restored:
             log(f"state_restore: loaded {len(restored)} position(s) from {STATE_JSON.name}")
 
@@ -1132,6 +1178,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         else:
             positions = restored
 
+        position_signal_ids = {
+            sym: restored_signal_ids[sym]
+            for sym in positions
+            if str(restored_signal_ids.get(sym, "")).strip()
+        }
         active_symbols = set(positions.keys())
         for sym in positions:
             log(f"state_restore: tracking {sym} {positions[sym].side} "
@@ -1223,8 +1274,16 @@ def main(argv: Optional[List[str]] = None) -> None:
                     exec_thr = float(new_thr)
                     log(f"ADAPT_THR exec_thr={exec_thr:.6f}")
 
-            write_state_snapshot(mode_name, exec_thr, exec_mode, args.adaptive, positions,
-                                 paused=sv_state.paused, risk_mode=sv_state.risk_mode)
+            write_state_snapshot(
+                mode_name,
+                exec_thr,
+                exec_mode,
+                args.adaptive,
+                positions,
+                paused=sv_state.paused,
+                risk_mode=sv_state.risk_mode,
+                position_signal_ids=position_signal_ids,
+            )
 
             # --- Periodic side-bias monitor ---
             # While locked, re-check every _BIAS_LOCKED_EVERY polls so the lock

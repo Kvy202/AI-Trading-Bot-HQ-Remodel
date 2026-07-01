@@ -116,6 +116,7 @@ $forcedPaperEnv = [ordered]@{
   XGBOOST_SIGNAL_ARTIFACT = $artifactFull
   USE_ISOLATION_FOREST = 'false'
   USE_SURVIVAL_EXIT = 'false'
+  EXEC_RESTORE_STATE = 'false'
 }
 foreach ($name in $forcedPaperEnv.Keys) {
   Set-Item -Path "Env:$name" -Value $forcedPaperEnv[$name]
@@ -165,6 +166,7 @@ os.environ.update({
     "XGBOOST_SIGNAL_ARTIFACT": artifact,
     "USE_ISOLATION_FOREST": "false",
     "USE_SURVIVAL_EXIT": "false",
+    "EXEC_RESTORE_STATE": "false",
     "CONFIRM_LIVE_TRADING": "",
 })
 
@@ -265,7 +267,8 @@ if ($FreshPaperLogs) {
 $shadowRowsBefore = Get-CsvDataRowCount -PathValue $shadowLog
 $signalRowsBefore = Get-CsvDataRowCount -PathValue $signalsLog
 $paperRowsBefore = Get-CsvGlobRowCount -Dir $logsDir -Pattern 'trades_paper_*.csv'
-$closedRowsBefore = Get-CsvDataRowCount -PathValue $closedMaster
+$closedMasterRowsBefore = Get-CsvDataRowCount -PathValue $closedMaster
+$closedDatedRowsBefore = Get-CsvGlobRowCount -Dir $logsDir -Pattern 'trades_closed_*.csv'
 
 $writerOut = Join-Path $logsDir 'xgboost_lineage_paper_writer.out'
 $writerErr = Join-Path $logsDir 'xgboost_lineage_paper_writer.err'
@@ -301,6 +304,7 @@ os.environ["XGBOOST_SIGNAL_BLOCKING"] = "true"
 os.environ["XGBOOST_SIGNAL_ARTIFACT"] = artifact
 os.environ["USE_ISOLATION_FOREST"] = "false"
 os.environ["USE_SURVIVAL_EXIT"] = "false"
+os.environ["EXEC_RESTORE_STATE"] = "false"
 os.environ["CONFIRM_LIVE_TRADING"] = ""
 os.environ.setdefault("HL_TESTNET", "true")
 
@@ -330,6 +334,7 @@ FORCED = {
     "XGBOOST_SIGNAL_BLOCKING": "true",
     "USE_ISOLATION_FOREST": "false",
     "USE_SURVIVAL_EXIT": "false",
+    "EXEC_RESTORE_STATE": "false",
     "CONFIRM_LIVE_TRADING": "",
 }
 
@@ -362,6 +367,7 @@ shadow_before = int(sys.argv[2])
 signals_before = int(sys.argv[3])
 paper_before = int(sys.argv[4])
 closed_before = int(sys.argv[5])
+closed_dated_before = int(sys.argv[6])
 
 def rows(path):
     p = Path(path)
@@ -384,11 +390,13 @@ shadow_header, shadow_rows = rows(logs / "xgboost_signal_shadow.csv")
 signals_header, signal_rows = rows(logs / "live_signals.csv")
 paper_fields, paper_rows = glob_rows("trades_paper_*.csv")
 closed_header, closed_rows = rows(logs / "trades_closed.csv")
+closed_dated_fields, closed_dated_rows = glob_rows("trades_closed_*.csv")
 
 shadow_new = shadow_rows[shadow_before:]
 signals_new = signal_rows[signals_before:]
 paper_new = paper_rows[paper_before:]
 closed_new = closed_rows[closed_before:]
+closed_dated_new = closed_dated_rows[closed_dated_before:]
 
 def count_id(data):
     return sum(1 for row in data if (row.get("signal_id") or row.get("decision_id") or "").strip())
@@ -403,9 +411,14 @@ print(json.dumps({
     "paper_new_rows": len(paper_new),
     "paper_signal_id_count": count_id(paper_new),
     "paper_has_signal_id_column": "signal_id" in paper_fields or "decision_id" in paper_fields,
-    "closed_new_rows": len(closed_new),
-    "closed_signal_id_count": count_id(closed_new),
-    "closed_has_signal_id_column": "signal_id" in closed_header or "decision_id" in closed_header,
+    "closed_new_rows": len(closed_new) + len(closed_dated_new),
+    "closed_signal_id_count": count_id(closed_new) + count_id(closed_dated_new),
+    "closed_master_new_rows": len(closed_new),
+    "closed_master_signal_id_count": count_id(closed_new),
+    "closed_master_has_signal_id_column": "signal_id" in closed_header or "decision_id" in closed_header,
+    "closed_dated_new_rows": len(closed_dated_new),
+    "closed_dated_signal_id_count": count_id(closed_dated_new),
+    "closed_dated_has_signal_id_column": "signal_id" in closed_dated_fields or "decision_id" in closed_dated_fields,
 }))
 '@
 
@@ -425,6 +438,7 @@ Write-Host "  XGBOOST_SIGNAL_BLOCKING=true"
 Write-Host "  XGBOOST_SIGNAL_ARTIFACT=$artifactFull"
 Write-Host "  USE_ISOLATION_FOREST=false"
 Write-Host "  USE_SURVIVAL_EXIT=false"
+Write-Host "  EXEC_RESTORE_STATE=false"
 Write-Host ("[xgboost-lineage] Duration: {0} minutes" -f $Minutes)
 
 $writerArgs = @($writerLauncherPath, $root, $artifactFull) | ForEach-Object { Quote-ProcessArg $_ }
@@ -473,7 +487,7 @@ finally {
   Stop-OwnedProcess -Proc $writer -LockPath $writerLock
 }
 
-$lineageRaw = & $py $lineageCheckPath $root $shadowRowsBefore $signalRowsBefore $paperRowsBefore $closedRowsBefore
+$lineageRaw = & $py $lineageCheckPath $root $shadowRowsBefore $signalRowsBefore $paperRowsBefore $closedMasterRowsBefore $closedDatedRowsBefore
 if ($LASTEXITCODE -ne 0) {
   Write-Host "[xgboost-lineage] FAIL: lineage log inspection failed." -ForegroundColor Red
   exit 1
@@ -509,12 +523,17 @@ if ($lineage.paper_new_rows -gt 0) {
   Write-Host "[xgboost-lineage] No paper trades occurred during this window; this is not a failure." -ForegroundColor Yellow
 }
 if ($lineage.closed_new_rows -gt 0) {
-  if (-not $lineage.closed_has_signal_id_column -or $lineage.closed_signal_id_count -le 0) {
-    Write-Host "[xgboost-lineage] FAIL: closed trade rows occurred but no signal_id was logged." -ForegroundColor Red
+  if ($lineage.closed_master_new_rows -gt 0 -and (-not $lineage.closed_master_has_signal_id_column -or $lineage.closed_master_signal_id_count -le 0)) {
+    Write-Host "[xgboost-lineage] FAIL: aggregate closed trade rows occurred but no signal_id was logged." -ForegroundColor Red
     exit 1
   }
-  Write-Host ("[xgboost-lineage] Closed trades OK: {0} new row(s), {1} with signal_id." -f `
-    $lineage.closed_new_rows, $lineage.closed_signal_id_count) -ForegroundColor Green
+  if ($lineage.closed_dated_new_rows -gt 0 -and (-not $lineage.closed_dated_has_signal_id_column -or $lineage.closed_dated_signal_id_count -le 0)) {
+    Write-Host "[xgboost-lineage] FAIL: dated closed trade rows occurred but no signal_id was logged." -ForegroundColor Red
+    exit 1
+  }
+  Write-Host ("[xgboost-lineage] Closed trades OK: master={0}/{1} with signal_id, dated={2}/{3} with signal_id." -f `
+    $lineage.closed_master_signal_id_count, $lineage.closed_master_new_rows, `
+    $lineage.closed_dated_signal_id_count, $lineage.closed_dated_new_rows) -ForegroundColor Green
 } else {
   Write-Host "[xgboost-lineage] No trades closed during this window; this is not a failure." -ForegroundColor Yellow
 }
