@@ -51,3 +51,7 @@ reports/*_summary.json
 logs/*shadow*.csv
 model_artifacts/*.joblib
 
+
+# Generated experiment reports
+reports/*.json
+
