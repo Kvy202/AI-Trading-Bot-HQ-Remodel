@@ -168,7 +168,44 @@ requires the supervisor approval flow and the checklist in SAFETY_CONTROLS.md.
 
 ---
 
-## 9. Isolation Forest blocking paper test
+## 9. Experimental Mode Manager
+
+`runtime/experiment_modes.py` centralizes read-only experimental flag bundles for
+paper-safe tests. The helper prints or returns environment overrides only; it does
+not edit `.env`, mutate the parent shell, or start writer/executor processes.
+
+Supported modes:
+
+```text
+baseline
+iforest_shadow
+iforest_blocking
+xgboost_shadow
+xgboost_blocking
+xgboost_shadow_outcome
+survival_shadow
+survival_active_placeholder
+advanced_risk_shadow_placeholder
+advanced_risk_active_placeholder
+combined_shadow
+combined_paper
+```
+
+Example inspection commands:
+
+```bash
+.venv/bin/python tools/experiment_mode.py --list
+.venv/bin/python tools/experiment_mode.py --describe xgboost_shadow
+.venv/bin/python tools/experiment_mode.py --print-env combined_shadow
+.venv/bin/python tools/experiment_mode.py --json combined_paper
+```
+
+Do not update service runbooks to consume these modes until the Phase 8.1 wiring
+step.
+
+---
+
+## 10. Isolation Forest blocking paper test
 
 Use this only as a paper/test runbook. It starts `live_writer.py` only, refuses
 if a repo-scoped writer/executor is already running, refuses live/mainnet
