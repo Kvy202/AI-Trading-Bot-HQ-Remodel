@@ -177,6 +177,112 @@ def test_id_based_successful_join_reports_closed_pnl(tmp_path):
     assert join["id_matched_count"] == 1
     assert join["fallback_matched_count"] == 0
     assert join["matched_closed_trade_pnl"]["allowed"]["total_pnl"] == 1.25
+    assert join["would_confirm_matched_count"] == 1
+    assert join["would_confirm_average_pnl"] == 1.25
+    assert join["would_confirm_win_rate"] == 1.0
+    assert join["would_reject_matched_count"] == 0
+    assert join["would_reject_average_pnl"] is None
+    assert join["would_reject_win_rate"] is None
+
+
+def test_shadow_only_would_reject_trade_can_match_closed_pnl(tmp_path):
+    _write_xgb_rows_with_id(
+        tmp_path / XGBOOST_LOG,
+        [
+            ["2026-06-30 10:00:00+0000", "BTCUSDT", "LONG", "0.20", "LONG", "0.55", "0.55", "0", "1", "0", "low_confidence", "low_confidence", "sig-low-confidence"],
+        ],
+    )
+    _write_csv(
+        tmp_path / LIVE_SIGNALS_LOG,
+        ["ts", "symbol", "px", "p_meta", "rv_mean", "allow", "thr", "mode", "kinds_used", "side_hint", "signal_id"],
+        [["2026-06-30 10:00:00+0000", "BTCUSDT", "100.0", "0.20", "0.01", "1", "0.08", "abs", "tcn", "LONG", "sig-low-confidence"]],
+    )
+    _write_csv(
+        tmp_path / "trades_paper_20260630.csv",
+        ["ts", "symbol", "side", "price", "qty", "reason", "mode", "order_id", "signal_id"],
+        [
+            ["2026-06-30 10:00:00+0000", "BTCUSDT", "BUY", "100.0", "1", "ENTRY p=0.2000 rv=0.010000 eff_thr=0.0800", "PAPER", "paper", "sig-low-confidence"],
+            ["2026-06-30 10:05:00+0000", "BTCUSDT", "SELL", "98.75", "1", "EXIT_SL pnl=-1.250000", "PAPER", "paper", "sig-exit-1"],
+        ],
+    )
+    _write_csv(
+        tmp_path / CLOSED_MASTER_LOG,
+        ["ts", "symbol", "closed_side", "qty", "entry_avg", "exit_price", "realized_pnl", "reason", "signal_id"],
+        [["2026-06-30 10:05:00+0000", "BTCUSDT", "SELL", "1", "100.0", "98.75", "-1.25", "EXIT_SL pnl=-1.250000", "sig-low-confidence"]],
+    )
+
+    summary = summarize_audit(tmp_path)
+    join = summary["trade_outcome_join"]
+
+    assert summary["would_reject_count"] == 1
+    assert summary["actually_rejected_count"] == 0
+    assert join["status"] == "ok"
+    assert join["join_method"] == "signal_id"
+    assert join["matched_closed_trade_count"] == 1
+    assert join["would_reject_matched_count"] == 1
+    assert join["would_reject_average_pnl"] == -1.25
+    assert join["would_reject_win_rate"] == 0.0
+    assert join["matched_closed_trade_pnl"]["would_reject"]["total_pnl"] == -1.25
+
+
+def test_audit_separates_would_confirm_and_would_reject_pnl(tmp_path):
+    _write_xgb_rows_with_id(
+        tmp_path / XGBOOST_LOG,
+        [
+            ["2026-06-30 10:00:00+0000", "BTCUSDT", "LONG", "0.20", "LONG", "0.90", "0.90", "1", "0", "0", "confirmed", "", "sig-confirm"],
+            ["2026-06-30 10:01:00+0000", "ETHUSDT", "SHORT", "-0.20", "SHORT", "0.55", "0.55", "0", "1", "0", "low_confidence", "low_confidence", "sig-reject-shadow"],
+        ],
+    )
+    _write_csv(
+        tmp_path / LIVE_SIGNALS_LOG,
+        ["ts", "symbol", "px", "p_meta", "rv_mean", "allow", "thr", "mode", "kinds_used", "side_hint", "signal_id"],
+        [
+            ["2026-06-30 10:00:00+0000", "BTCUSDT", "100.0", "0.20", "0.01", "1", "0.08", "abs", "tcn", "LONG", "sig-confirm"],
+            ["2026-06-30 10:01:00+0000", "ETHUSDT", "50.0", "-0.20", "0.01", "1", "0.08", "abs", "tcn", "SHORT", "sig-reject-shadow"],
+        ],
+    )
+    _write_csv(
+        tmp_path / "trades_paper_20260630.csv",
+        ["ts", "symbol", "side", "price", "qty", "reason", "mode", "order_id", "signal_id"],
+        [
+            ["2026-06-30 10:00:00+0000", "BTCUSDT", "BUY", "100.0", "1", "ENTRY p=0.2000 rv=0.010000 eff_thr=0.0800", "PAPER", "paper", "sig-confirm"],
+            ["2026-06-30 10:01:00+0000", "ETHUSDT", "SELL_SHORT", "50.0", "1", "ENTRY p=-0.2000 rv=0.010000 eff_thr=0.0800", "PAPER", "paper", "sig-reject-shadow"],
+            ["2026-06-30 10:05:00+0000", "BTCUSDT", "SELL", "102.0", "1", "EXIT_TP pnl=2.000000", "PAPER", "paper", "sig-confirm-exit"],
+            ["2026-06-30 10:06:00+0000", "ETHUSDT", "BUY_TO_COVER", "51.0", "1", "EXIT_SL pnl=-1.000000", "PAPER", "paper", "sig-reject-exit"],
+        ],
+    )
+    _write_csv(
+        tmp_path / CLOSED_MASTER_LOG,
+        ["ts", "symbol", "closed_side", "qty", "entry_avg", "exit_price", "realized_pnl", "reason", "signal_id"],
+        [
+            ["2026-06-30 10:05:00+0000", "BTCUSDT", "SELL", "1", "100.0", "102.0", "2.0", "EXIT_TP pnl=2.000000", "sig-confirm"],
+            ["2026-06-30 10:06:00+0000", "ETHUSDT", "BUY_TO_COVER", "1", "50.0", "51.0", "-1.0", "EXIT_SL pnl=-1.000000", "sig-reject-shadow"],
+        ],
+    )
+
+    summary = summarize_audit(tmp_path)
+    join = summary["trade_outcome_join"]
+    text = format_text_summary(summary)
+
+    assert summary["actually_rejected_count"] == 0
+    assert join["status"] == "ok"
+    assert join["matched_closed_trade_count"] == 2
+    assert join["would_confirm_matched_count"] == 1
+    assert join["would_confirm_average_pnl"] == 2.0
+    assert join["would_confirm_win_rate"] == 1.0
+    assert join["would_reject_matched_count"] == 1
+    assert join["would_reject_average_pnl"] == -1.0
+    assert join["would_reject_win_rate"] == 0.0
+    assert join["matched_closed_trade_pnl"]["would_confirm"]["total_pnl"] == 2.0
+    assert join["matched_closed_trade_pnl"]["would_reject"]["total_pnl"] == -1.0
+    assert summary["would_confirm_matched_count"] == 1
+    assert summary["would_confirm_average_pnl"] == 2.0
+    assert summary["would_confirm_win_rate"] == 1.0
+    assert summary["would_reject_matched_count"] == 1
+    assert summary["would_reject_average_pnl"] == -1.0
+    assert summary["would_reject_win_rate"] == 0.0
+    assert "would_confirm_average_pnl: 2.000000" in text
+    assert "would_reject_average_pnl: -1.000000" in text
 
 
 def test_rejected_id_rows_with_no_trade_remain_unmatched(tmp_path):
@@ -214,6 +320,9 @@ def test_rejected_id_rows_with_no_trade_remain_unmatched(tmp_path):
     assert join["unmatched_rejected_signal_count"] == 1
     assert join["unmatched_due_missing_trade"] == 1
     assert join["unmatched_reason_counts"] == {"paper_entry_or_closed_trade_missing": 1}
+    assert join["would_reject_matched_count"] == 0
+    assert join["would_reject_average_pnl"] is None
+    assert join["would_reject_win_rate"] is None
 
 
 def test_unreliable_trade_join_is_reported_without_guessing(tmp_path):
@@ -245,6 +354,9 @@ def test_unreliable_trade_join_is_reported_without_guessing(tmp_path):
     assert join["unmatched_due_missing_trade"] == 1
     assert join["unmatched_rejected_signal_count"] == 1
     assert join["unmatched_reason_counts"] == {"paper_entry_or_closed_trade_missing": 1}
+    assert join["would_reject_matched_count"] == 0
+    assert join["would_reject_average_pnl"] is None
+    assert join["would_reject_win_rate"] is None
     assert "Trade outcome join is not reliable" in text
     assert "join_method: timestamp_symbol_fallback" in text
 
@@ -297,6 +409,12 @@ def test_exact_trade_join_reports_matched_closed_pnl(tmp_path):
     assert join["matched_closed_trade_pnl"]["allowed"]["total_pnl"] == 1.5
     assert join["matched_closed_trade_pnl"]["rejected"]["count"] == 1
     assert join["matched_closed_trade_pnl"]["rejected"]["total_pnl"] == -2.0
+    assert join["would_confirm_matched_count"] == 1
+    assert join["would_confirm_average_pnl"] == 1.5
+    assert join["would_confirm_win_rate"] == 1.0
+    assert join["would_reject_matched_count"] == 1
+    assert join["would_reject_average_pnl"] == -2.0
+    assert join["would_reject_win_rate"] == 0.0
 
 
 def test_json_output_format(tmp_path):

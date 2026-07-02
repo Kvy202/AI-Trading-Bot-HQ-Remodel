@@ -570,6 +570,9 @@ def _summarize_trade_outcomes(
         status = "ok"
         message = "Trade outcome join is reliable for all XGBoost allow/reject decision rows."
 
+    would_confirm_stats = _pnl_stats(matched_pnls["allowed"])
+    would_reject_stats = _pnl_stats(matched_pnls["rejected"])
+
     return {
         "status": status,
         "message": message,
@@ -582,9 +585,17 @@ def _summarize_trade_outcomes(
         "missing_id_count": missing_id_count,
         "unmatched_due_missing_id": unmatched_due_missing_id,
         "unmatched_due_missing_trade": unmatched_due_missing_trade,
+        "would_confirm_matched_count": would_confirm_stats["count"],
+        "would_confirm_average_pnl": would_confirm_stats["average_pnl"],
+        "would_confirm_win_rate": would_confirm_stats["win_rate"],
+        "would_reject_matched_count": would_reject_stats["count"],
+        "would_reject_average_pnl": would_reject_stats["average_pnl"],
+        "would_reject_win_rate": would_reject_stats["win_rate"],
         "matched_closed_trade_pnl": {
-            "allowed": _pnl_stats(matched_pnls["allowed"]),
-            "rejected": _pnl_stats(matched_pnls["rejected"]),
+            "allowed": would_confirm_stats,
+            "rejected": would_reject_stats,
+            "would_confirm": would_confirm_stats,
+            "would_reject": would_reject_stats,
         },
         "unmatched_xgboost_rows": max(0, len(xgboost_rows) - matched_closed_trade_count),
         "unmatched_decision_rows": unmatched_decisions,
@@ -642,6 +653,12 @@ def summarize_audit(logs_dir: Path | str = DEFAULT_LOGS_DIR) -> Dict[str, Any]:
         "average_confidence_rejected": _avg(_confidence(row) for row in would_reject_rows),
         "direction_mismatch_count": reject_reason_counts.get("direction_mismatch", 0),
         "low_confidence_count": reject_reason_counts.get("low_confidence", 0),
+        "would_confirm_matched_count": trade_join["would_confirm_matched_count"],
+        "would_confirm_average_pnl": trade_join["would_confirm_average_pnl"],
+        "would_confirm_win_rate": trade_join["would_confirm_win_rate"],
+        "would_reject_matched_count": trade_join["would_reject_matched_count"],
+        "would_reject_average_pnl": trade_join["would_reject_average_pnl"],
+        "would_reject_win_rate": trade_join["would_reject_win_rate"],
         "trade_outcome_join": trade_join,
     }
 
@@ -693,14 +710,14 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         f"  missing_id_count: {join['missing_id_count']}",
         f"  unmatched_due_missing_id: {join['unmatched_due_missing_id']}",
         f"  unmatched_due_missing_trade: {join['unmatched_due_missing_trade']}",
-        f"  allowed_matched_count: {allowed_pnl['count']}",
-        f"  allowed_total_pnl: {_fmt(allowed_pnl['total_pnl'])}",
-        f"  allowed_average_pnl: {_fmt(allowed_pnl['average_pnl'])}",
-        f"  allowed_win_rate: {_fmt(allowed_pnl['win_rate'])}",
-        f"  rejected_matched_count: {rejected_pnl['count']}",
-        f"  rejected_total_pnl: {_fmt(rejected_pnl['total_pnl'])}",
-        f"  rejected_average_pnl: {_fmt(rejected_pnl['average_pnl'])}",
-        f"  rejected_win_rate: {_fmt(rejected_pnl['win_rate'])}",
+        f"  would_confirm_matched_count: {join['would_confirm_matched_count']}",
+        f"  would_confirm_total_pnl: {_fmt(allowed_pnl['total_pnl'])}",
+        f"  would_confirm_average_pnl: {_fmt(join['would_confirm_average_pnl'])}",
+        f"  would_confirm_win_rate: {_fmt(join['would_confirm_win_rate'])}",
+        f"  would_reject_matched_count: {join['would_reject_matched_count']}",
+        f"  would_reject_total_pnl: {_fmt(rejected_pnl['total_pnl'])}",
+        f"  would_reject_average_pnl: {_fmt(join['would_reject_average_pnl'])}",
+        f"  would_reject_win_rate: {_fmt(join['would_reject_win_rate'])}",
         f"  unmatched_xgboost_rows: {join['unmatched_xgboost_rows']}",
         f"  unmatched_decision_rows: {join['unmatched_decision_rows']}",
         f"  unmatched_allowed_signal_count: {join['unmatched_allowed_signal_count']}",
