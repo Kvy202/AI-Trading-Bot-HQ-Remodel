@@ -143,7 +143,7 @@ EXPERIMENT_MODES: Mapping[str, ExperimentMode] = MappingProxyType(
         ),
         "advanced_risk_active_placeholder": _mode(
             "advanced_risk_active_placeholder",
-            "Advanced Risk active placeholder; real active behavior remains disabled until Phase 10.",
+            "Advanced Risk active placeholder; active behavior remains disabled in Phase 10.",
             {
                 "USE_ADVANCED_RISK": True,
                 "ADVANCED_RISK_ACTIVE": False,
