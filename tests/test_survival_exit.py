@@ -6,7 +6,11 @@ import joblib
 import numpy as np
 
 import ml_optional.survival_exit as surv
-from ml_optional.survival_exit import SURVIVAL_SHADOW_COLS, SurvivalExitModel
+from ml_optional.survival_exit import (
+    SURVIVAL_SHADOW_COLS,
+    SurvivalExitModel,
+    survival_active_exit_decision,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,6 +23,11 @@ class MockSurvivalRiskModel:
     def predict(self, x):
         self.last_shape = getattr(x, "shape", None)
         return np.asarray([self.risk], dtype=float)
+
+
+class ErrorSurvivalRiskModel:
+    def predict(self, x):
+        raise RuntimeError("unit model error")
 
 
 def _confirmer(model, threshold=0.60):
@@ -145,7 +154,14 @@ def test_artifact_save_load_behavior(monkeypatch, tmp_path):
 
 def test_shadow_log_row_format():
     result = _eval(_confirmer(MockSurvivalRiskModel(0.82)))
-    row = result.to_log_row("2026-06-28 00:00:00+0000", "BTCUSDT")
+    row = result.to_log_row(
+        "2026-06-28 00:00:00+0000",
+        "BTCUSDT",
+        actually_exited=True,
+        exit_reason="survival_high_exit_risk",
+        survival_active=True,
+        paper_only_guard="paper_only_ok",
+    )
 
     assert list(row.keys()) == SURVIVAL_SHADOW_COLS
     assert row["timestamp"] == "2026-06-28 00:00:00+0000"
@@ -160,3 +176,80 @@ def test_shadow_log_row_format():
     assert row["would_exit_early"] == 1
     assert row["model_version"] == "unit-test"
     assert row["artifact_path"] == "mock.joblib"
+    assert row["actually_exited"] == 1
+    assert row["exit_reason"] == "survival_high_exit_risk"
+    assert row["survival_active"] == 1
+    assert row["paper_only_guard"] == "paper_only_ok"
+
+
+def test_active_decision_exits_only_when_active_and_paper_safe():
+    result = _eval(_confirmer(MockSurvivalRiskModel(0.82)))
+
+    decision = survival_active_exit_decision(
+        result,
+        survival_active=True,
+        paper_mode=True,
+        place_real_orders=False,
+    )
+
+    assert decision.should_exit is True
+    assert decision.exit_reason == "survival_high_exit_risk"
+    assert decision.paper_only_guard == "paper_only_ok"
+
+
+def test_active_false_never_exits():
+    result = _eval(_confirmer(MockSurvivalRiskModel(0.82)))
+
+    decision = survival_active_exit_decision(
+        result,
+        survival_active=False,
+        paper_mode=True,
+        place_real_orders=False,
+    )
+
+    assert decision.should_exit is False
+    assert decision.paper_only_guard == "inactive"
+
+
+def test_active_true_live_real_mode_never_exits():
+    result = _eval(_confirmer(MockSurvivalRiskModel(0.82)))
+
+    decision = survival_active_exit_decision(
+        result,
+        survival_active=True,
+        paper_mode=False,
+        place_real_orders=True,
+    )
+
+    assert decision.should_exit is False
+    assert decision.paper_only_guard == "blocked_real_orders"
+
+
+def test_missing_artifact_active_decision_never_exits(monkeypatch):
+    monkeypatch.setenv("SURVIVAL_EXIT_ARTIFACT", "model_artifacts/__missing_survival_active__.joblib")
+    model = SurvivalExitModel.from_env(enabled=True, base_dir=ROOT)
+    result = _eval(model)
+
+    decision = survival_active_exit_decision(
+        result,
+        survival_active=True,
+        paper_mode=True,
+        place_real_orders=False,
+    )
+
+    assert result.survival_status == "disabled_missing_artifact"
+    assert decision.should_exit is False
+
+
+def test_model_error_active_decision_never_exits():
+    result = _eval(_confirmer(ErrorSurvivalRiskModel()))
+
+    decision = survival_active_exit_decision(
+        result,
+        survival_active=True,
+        paper_mode=True,
+        place_real_orders=False,
+    )
+
+    assert result.survival_status == "prediction_error"
+    assert decision.should_exit is False

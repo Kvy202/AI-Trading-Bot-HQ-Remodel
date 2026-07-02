@@ -265,6 +265,30 @@ def append_csv_dict(path: Path, header: List[str], row: Dict[str, Any]) -> None:
         csv.writer(f).writerow([row.get(col, "") for col in active_header])
 
 
+def append_survival_shadow_row(
+    result: Any,
+    timestamp: str,
+    symbol: str,
+    header: Optional[List[str]],
+    *,
+    actually_exited: bool = False,
+    exit_reason: str = "",
+    survival_active: bool = False,
+    paper_only_guard: str = "",
+) -> None:
+    if header is None:
+        return
+    row = result.to_log_row(
+        timestamp,
+        symbol,
+        actually_exited=actually_exited,
+        exit_reason=exit_reason,
+        survival_active=survival_active,
+        paper_only_guard=paper_only_guard,
+    )
+    append_csv_dict(SURVIVAL_SHADOW_LOG, list(header), row)
+
+
 def record_trade(path: Path, row: List[Any], signal_id: str = "") -> None:
     data = dict(zip(PAPER_HEADER, row))
     data["signal_id"] = str(signal_id or data.get("signal_id") or "")
@@ -1043,11 +1067,14 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     survival_exit_model = None
     survival_shadow_cols: Optional[List[str]] = None
+    survival_exit_active = bool(exp_flags.use_survival_exit and env_bool("SURVIVAL_EXIT_ACTIVE", False))
+    survival_active_exit_decision_fn = None
     if exp_flags.use_survival_exit:
         try:
             from ml_optional.survival_exit import (
                 SURVIVAL_SHADOW_COLS,
                 SurvivalExitModel,
+                survival_active_exit_decision,
             )
             survival_exit_model = SurvivalExitModel.from_env(
                 enabled=True,
@@ -1055,8 +1082,19 @@ def main(argv: Optional[List[str]] = None) -> None:
                 log_fn=log,
             )
             survival_shadow_cols = SURVIVAL_SHADOW_COLS
+            survival_active_exit_decision_fn = survival_active_exit_decision
+            if not survival_exit_active:
+                survival_guard = "inactive"
+            elif live:
+                survival_guard = "blocked_real_orders"
+            elif mode_name != "PAPER":
+                survival_guard = "blocked_not_paper"
+            else:
+                survival_guard = "paper_only_ok"
             log(
                 "survival_enabled=1 "
+                f"survival_active={int(survival_exit_active)} "
+                f"paper_only_guard={survival_guard} "
                 f"survival_status={survival_exit_model.survival_status} "
                 f"artifact_path={survival_exit_model.artifact_path}"
             )
@@ -1078,8 +1116,18 @@ def main(argv: Optional[List[str]] = None) -> None:
                     current_price=99.0,
                     qty=0.1,
                 )
-                _row = _surv.to_log_row(utc_ts(), "VERIFY")
-                append_csv(SURVIVAL_SHADOW_LOG, survival_shadow_cols, [_row.get(c, "") for c in survival_shadow_cols])
+                append_survival_shadow_row(
+                    _surv,
+                    utc_ts(),
+                    "VERIFY",
+                    survival_shadow_cols,
+                    survival_active=survival_exit_active,
+                    paper_only_guard=(
+                        "paper_only_ok"
+                        if (mode_name == "PAPER" and not live)
+                        else ("blocked_real_orders" if live else "blocked_not_paper")
+                    ),
+                )
                 log(
                     "survival_self_test=shadow_row_written "
                     f"survival_risk_score={_surv.survival_risk_score} "
@@ -1369,8 +1417,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                     continue
 
                 pos = positions.get(sig.symbol)
+                survival_result = None
+                survival_decision = None
+                survival_logged = False
 
-                if pos and survival_exit_model is not None and survival_exit_model.ready:
+                if pos and survival_exit_model is not None:
                     try:
                         entry_epoch = survival_entry_ts.get(sig.symbol)
                         signal_epoch = _parse_signal_ts(sig.ts) or time.time()
@@ -1390,12 +1441,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                             current_price=price,
                             qty=pos.qty,
                         )
-                        if survival_shadow_cols is not None:
-                            _row = _surv.to_log_row(sig.ts, sig.symbol)
-                            append_csv(
-                                SURVIVAL_SHADOW_LOG,
-                                survival_shadow_cols,
-                                [_row.get(c, "") for c in survival_shadow_cols],
+                        survival_result = _surv
+                        if survival_active_exit_decision_fn is not None:
+                            survival_decision = survival_active_exit_decision_fn(
+                                _surv,
+                                survival_active=survival_exit_active,
+                                paper_mode=(mode_name == "PAPER"),
+                                place_real_orders=live,
                             )
                     except Exception as _surv_exc:
                         log_err(
@@ -1407,6 +1459,22 @@ def main(argv: Optional[List[str]] = None) -> None:
                 if pos:
                     hit_tp, hit_sl = check_tp_sl(pos, price, args.tp_pct, args.sl_pct)
                     if hit_tp or hit_sl:
+                        if survival_result is not None and not survival_logged:
+                            append_survival_shadow_row(
+                                survival_result,
+                                sig.ts,
+                                sig.symbol,
+                                survival_shadow_cols,
+                                survival_active=(
+                                    survival_decision.survival_active
+                                    if survival_decision is not None else survival_exit_active
+                                ),
+                                paper_only_guard=(
+                                    survival_decision.paper_only_guard
+                                    if survival_decision is not None else ""
+                                ),
+                            )
+                            survival_logged = True
                         action = "SELL" if pos.side == "long" else "BUY_TO_COVER"
                         order_id = broker.create_market_order(sig.symbol, action, pos.qty, reduce_only=True)
                         pnl, exit_fill = net_pnl_on_close(pos, price, action,
@@ -1443,6 +1511,22 @@ def main(argv: Optional[List[str]] = None) -> None:
                     except Exception:
                         held_min = None
                     if held_min is not None:
+                        if survival_result is not None and not survival_logged:
+                            append_survival_shadow_row(
+                                survival_result,
+                                sig.ts,
+                                sig.symbol,
+                                survival_shadow_cols,
+                                survival_active=(
+                                    survival_decision.survival_active
+                                    if survival_decision is not None else survival_exit_active
+                                ),
+                                paper_only_guard=(
+                                    survival_decision.paper_only_guard
+                                    if survival_decision is not None else ""
+                                ),
+                            )
+                            survival_logged = True
                         action = "SELL" if pos.side == "long" else "BUY_TO_COVER"
                         order_id = broker.create_market_order(sig.symbol, action, pos.qty, reduce_only=True)
                         pnl, exit_fill = net_pnl_on_close(pos, price, action,
@@ -1468,6 +1552,69 @@ def main(argv: Optional[List[str]] = None) -> None:
                         last_fill_time[sig.symbol] = time.time()
                         last_fill_price[sig.symbol] = price
                         continue
+
+                # 1c) Optional Survival active exit. This is paper-only and
+                # runs after TP/SL and V2 time-stop so existing exit priority
+                # stays unchanged.
+                if pos and survival_result is not None and survival_decision is not None:
+                    if survival_decision.should_exit:
+                        action = "SELL" if pos.side == "long" else "BUY_TO_COVER"
+                        order_id = broker.create_market_order(sig.symbol, action, pos.qty, reduce_only=True)
+                        pnl, exit_fill = net_pnl_on_close(pos, price, action,
+                                                          args.fee_bps, args.slippage_bps)
+                        risk = survival_result.survival_risk_score
+                        risk_text = "n/a" if risk is None else f"{risk:.4f}"
+                        reason = (
+                            f"EXIT_SURVIVAL risk={risk_text} "
+                            f"survival_reason={survival_result.reason} pnl={pnl:.6f}"
+                        )
+                        entry_signal_id = position_signal_ids.get(sig.symbol, "")
+                        append_survival_shadow_row(
+                            survival_result,
+                            sig.ts,
+                            sig.symbol,
+                            survival_shadow_cols,
+                            actually_exited=True,
+                            exit_reason=survival_decision.exit_reason,
+                            survival_active=survival_decision.survival_active,
+                            paper_only_guard=survival_decision.paper_only_guard,
+                        )
+                        survival_logged = True
+                        record_trade(
+                            paper_path,
+                            [sig.ts, sig.symbol, action, exit_fill, pos.qty, reason, mode_name, order_id],
+                            signal_id=sig.signal_id,
+                        )
+                        record_closed_trade(
+                            sig.ts, sig.symbol, action, pos.qty, pos.avg, exit_fill, pnl, reason, entry_signal_id
+                        )
+                        log(f"TRADE {mode_name} {action} {sig.symbol} qty={pos.qty} px={exit_fill:.8f} order={order_id} {reason}")
+                        positions.pop(sig.symbol, None)
+                        position_signal_ids.pop(sig.symbol, None)
+                        survival_entry_ts.pop(sig.symbol, None)
+                        survival_trade_ids.pop(sig.symbol, None)
+                        active_symbols.discard(sig.symbol)
+                        _flip_pending.pop(sig.symbol, None)
+                        last_fill_time[sig.symbol] = time.time()
+                        last_fill_price[sig.symbol] = price
+                        continue
+
+                if survival_result is not None and not survival_logged:
+                    append_survival_shadow_row(
+                        survival_result,
+                        sig.ts,
+                        sig.symbol,
+                        survival_shadow_cols,
+                        survival_active=(
+                            survival_decision.survival_active
+                            if survival_decision is not None else survival_exit_active
+                        ),
+                        paper_only_guard=(
+                            survival_decision.paper_only_guard
+                            if survival_decision is not None else ""
+                        ),
+                    )
+                    survival_logged = True
 
                 # Supervisor pause: allow TP/SL exits above; block all new entries.
                 if sv_state.paused:

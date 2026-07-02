@@ -129,6 +129,15 @@ def _top_reject_reasons(rows: List[Dict[str, str]], limit: int = 5) -> Dict[str,
     return dict(counts.most_common(limit))
 
 
+def _top_exit_reasons(rows: List[Dict[str, str]], limit: int = 5) -> Dict[str, int]:
+    counts = Counter(
+        (_first_non_empty(row, "exit_reason", "reason") or "unknown").strip() or "unknown"
+        for row in rows
+        if _truthy(row.get("actually_exited"))
+    )
+    return dict(counts.most_common(limit))
+
+
 def summarize_isolation(logs_dir: Path) -> Dict[str, Any]:
     path = logs_dir / ISOLATION_LOG
     status, rows = _read_csv_rows(path)
@@ -188,12 +197,19 @@ def summarize_xgboost(logs_dir: Path) -> Dict[str, Any]:
 def summarize_survival(logs_dir: Path) -> Dict[str, Any]:
     path = logs_dir / SURVIVAL_LOG
     status, rows = _read_csv_rows(path)
+    total_rows = len(rows)
+    would_exit_early_count = sum(1 for row in rows if _truthy(row.get("would_exit_early")))
+    actually_exited_count = sum(1 for row in rows if _truthy(row.get("actually_exited")))
     return {
         "file": str(path),
         "file_status": status,
-        "total_rows": len(rows),
+        "total_rows": total_rows,
         "would_hold_count": sum(1 for row in rows if _truthy(row.get("would_hold"))),
-        "would_exit_early_count": sum(1 for row in rows if _truthy(row.get("would_exit_early"))),
+        "would_exit_early_count": would_exit_early_count,
+        "actually_exited_count": actually_exited_count,
+        "would_exit_rate": 0.0 if total_rows == 0 else would_exit_early_count / total_rows,
+        "actual_exit_rate": 0.0 if total_rows == 0 else actually_exited_count / total_rows,
+        "exit_reason_counts": _top_exit_reasons(rows),
         "average_survival_risk_score": _avg(row.get("survival_risk_score") for row in rows),
         "latest_risk_score": _latest_float(rows, "survival_risk_score"),
         "latest_reason": _latest(rows, "reason"),
@@ -266,6 +282,10 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         f"  total_rows: {surv['total_rows']}",
         f"  would_hold_count: {surv['would_hold_count']}",
         f"  would_exit_early_count: {surv['would_exit_early_count']}",
+        f"  actually_exited_count: {surv['actually_exited_count']}",
+        f"  would_exit_rate: {_fmt(surv['would_exit_rate'])}",
+        f"  actual_exit_rate: {_fmt(surv['actual_exit_rate'])}",
+        f"  exit_reason_counts: {surv['exit_reason_counts']}",
         f"  average_survival_risk_score: {_fmt(surv['average_survival_risk_score'])}",
         f"  latest_risk_score: {_fmt(surv['latest_risk_score'])}",
         f"  latest_reason: {_fmt(surv['latest_reason'])}",

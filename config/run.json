@@ -52,6 +52,7 @@
     "USE_XGBOOST_SIGNAL": false,
     "XGBOOST_SIGNAL_BLOCKING": false,
     "USE_SURVIVAL_EXIT": false,
+    "SURVIVAL_EXIT_ACTIVE": false,
     "USE_ADVANCED_RISK": false
   },
 

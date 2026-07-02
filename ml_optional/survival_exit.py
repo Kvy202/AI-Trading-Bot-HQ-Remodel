@@ -40,6 +40,10 @@ SURVIVAL_SHADOW_COLS = [
     "reason",
     "model_version",
     "artifact_path",
+    "actually_exited",
+    "exit_reason",
+    "survival_active",
+    "paper_only_guard",
 ]
 
 
@@ -184,7 +188,16 @@ class SurvivalExitResult:
     model_version: str
     artifact_path: str
 
-    def to_log_row(self, timestamp: str, symbol: str) -> Dict[str, Any]:
+    def to_log_row(
+        self,
+        timestamp: str,
+        symbol: str,
+        *,
+        actually_exited: bool = False,
+        exit_reason: str = "",
+        survival_active: bool = False,
+        paper_only_guard: str = "",
+    ) -> Dict[str, Any]:
         return {
             "timestamp": timestamp,
             "symbol": symbol,
@@ -203,7 +216,43 @@ class SurvivalExitResult:
             "reason": self.reason,
             "model_version": self.model_version,
             "artifact_path": self.artifact_path,
+            "actually_exited": int(bool(actually_exited)),
+            "exit_reason": str(exit_reason or ""),
+            "survival_active": int(bool(survival_active)),
+            "paper_only_guard": str(paper_only_guard or ""),
         }
+
+
+@dataclass(frozen=True)
+class SurvivalActiveDecision:
+    should_exit: bool
+    exit_reason: str
+    survival_active: bool
+    paper_only_guard: str
+
+
+def survival_active_exit_decision(
+    result: SurvivalExitResult,
+    *,
+    survival_active: bool,
+    paper_mode: bool,
+    place_real_orders: bool,
+) -> SurvivalActiveDecision:
+    """Decide whether a Survival shadow result may become an active exit.
+
+    Active Survival exits are intentionally paper-only. Any live/testnet/real
+    order mode is blocked even when ``SURVIVAL_EXIT_ACTIVE=true``.
+    """
+    active = bool(survival_active)
+    if not active:
+        return SurvivalActiveDecision(False, "", False, "inactive")
+    if place_real_orders:
+        return SurvivalActiveDecision(False, "", True, "blocked_real_orders")
+    if not paper_mode:
+        return SurvivalActiveDecision(False, "", True, "blocked_not_paper")
+    if result.survival_status != "loaded" or not result.would_exit_early:
+        return SurvivalActiveDecision(False, "", True, "paper_only_ok")
+    return SurvivalActiveDecision(True, "survival_high_exit_risk", True, "paper_only_ok")
 
 
 class SurvivalExitModel:

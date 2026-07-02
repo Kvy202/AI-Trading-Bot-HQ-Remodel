@@ -33,6 +33,9 @@ def test_missing_log_files_do_not_crash(tmp_path):
     assert summary["xgboost_signal"]["actual_reject_rate"] == 0.0
     assert summary["xgboost_signal"]["reject_reasons"] == {}
     assert summary["survival_exit"]["file_status"] == "missing"
+    assert summary["survival_exit"]["actually_exited_count"] == 0
+    assert summary["survival_exit"]["actual_exit_rate"] == 0.0
+    assert summary["survival_exit"]["exit_reason_counts"] == {}
     assert "Experimental Shadow Report" in format_text_summary(summary)
 
 
@@ -67,10 +70,20 @@ def test_valid_log_files_are_summarized(tmp_path):
     )
     _write_csv(
         tmp_path / SURVIVAL_LOG,
-        ["timestamp", "symbol", "survival_risk_score", "would_hold", "would_exit_early", "reason", "model_version"],
         [
-            ["t1", "BTCUSDT", "0.20", "1", "0", "hold_risk_below_threshold", "surv-v1"],
-            ["t2", "BTCUSDT", "0.80", "0", "1", "high_exit_risk", "surv-v2"],
+            "timestamp",
+            "symbol",
+            "survival_risk_score",
+            "would_hold",
+            "would_exit_early",
+            "actually_exited",
+            "exit_reason",
+            "reason",
+            "model_version",
+        ],
+        [
+            ["t1", "BTCUSDT", "0.20", "1", "0", "0", "", "hold_risk_below_threshold", "surv-v1"],
+            ["t2", "BTCUSDT", "0.80", "0", "1", "1", "survival_high_exit_risk", "high_exit_risk", "surv-v2"],
         ],
     )
 
@@ -110,10 +123,17 @@ def test_valid_log_files_are_summarized(tmp_path):
     survival = summary["survival_exit"]
     assert survival["would_hold_count"] == 1
     assert survival["would_exit_early_count"] == 1
+    assert survival["actually_exited_count"] == 1
+    assert survival["would_exit_rate"] == 0.5
+    assert survival["actual_exit_rate"] == 0.5
+    assert survival["exit_reason_counts"] == {"survival_high_exit_risk": 1}
     assert survival["average_survival_risk_score"] == 0.50
     assert survival["latest_risk_score"] == 0.80
     assert survival["latest_reason"] == "high_exit_risk"
     assert survival["latest_model_version"] == "surv-v2"
+    text = format_text_summary(summary)
+    assert "actual_exit_rate" in text
+    assert "exit_reason_counts" in text
 
 
 def test_isolation_report_distinguishes_would_and_actual_block_rates(tmp_path):
@@ -178,6 +198,7 @@ def test_empty_log_files_are_handled(tmp_path):
     assert summary["xgboost_signal"]["file_status"] == "empty"
     assert summary["survival_exit"]["file_status"] == "empty"
     assert summary["survival_exit"]["average_survival_risk_score"] is None
+    assert summary["survival_exit"]["actual_exit_rate"] == 0.0
     assert summary["isolation_forest"]["min_anomaly_score"] is None
     assert summary["isolation_forest"]["p50_anomaly_score"] is None
     assert summary["xgboost_signal"]["actually_rejected_count"] == 0
@@ -195,3 +216,4 @@ def test_json_output_format(tmp_path):
     assert data["xgboost_signal"]["file_status"] == "missing"
     assert data["xgboost_signal"]["actually_rejected_count"] == 0
     assert data["survival_exit"]["would_exit_early_count"] == 0
+    assert data["survival_exit"]["actually_exited_count"] == 0
