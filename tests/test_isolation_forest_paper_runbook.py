@@ -1,4 +1,4 @@
-"""Tests for the XGBoost paper-test PowerShell runbook."""
+"""Tests for the Isolation Forest blocking paper-test PowerShell runbook."""
 
 import shutil
 import subprocess
@@ -9,61 +9,54 @@ import pytest
 from runtime.experiment_modes import get_experiment_mode
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "tools" / "run_xgboost_blocking_paper_test.ps1"
-HELPER = ROOT / "tools" / "apply_experiment_mode.ps1"
+SCRIPT = ROOT / "tools" / "run_isolation_forest_blocking_paper_test.ps1"
+RUNBOOKS = [
+    ROOT / "tools" / "run_xgboost_blocking_paper_test.ps1",
+    ROOT / "tools" / "run_xgboost_lineage_paper_test.ps1",
+    ROOT / "tools" / "run_xgboost_shadow_outcome_paper_test.ps1",
+    SCRIPT,
+]
 
 
 def _script_text() -> str:
     return SCRIPT.read_text(encoding="utf-8")
 
 
-def test_apply_experiment_mode_helper_uses_read_only_cli():
-    text = HELPER.read_text(encoding="utf-8")
-
-    assert "tools\\experiment_mode.py" in text
-    assert "--print-env" in text
-    assert "Set-ExperimentModeEnvironment" in text
-
-
-def test_xgboost_paper_runbook_uses_xgboost_blocking_mode():
+def test_isolation_runbook_uses_iforest_blocking_mode():
     text = _script_text()
 
     for snippet in (
         "apply_experiment_mode.ps1",
-        "$experimentMode = 'xgboost_blocking'",
+        "$experimentMode = 'iforest_blocking'",
         "Get-ExperimentModeOverrides -Python $py -Root $root -Mode $experimentMode",
-        "$forcedPaperEnv['XGBOOST_SIGNAL_ARTIFACT'] = $artifactFull",
-        "xgboost_blocking_mode_env.json",
+        "$forcedPaperEnv['ISOLATION_FOREST_ARTIFACT'] = $artifactFull",
+        "isolation_forest_blocking_mode_env.json",
         "os.environ.update(mode_env)",
         "os.environ.update(forced_env)",
+        "tools\\verify_isolation_forest.py",
     ):
         assert snippet in text
 
-    assert "combined_paper" not in text
 
-
-def test_xgboost_blocking_mode_keeps_paper_safe_flags_and_blocking():
-    env = get_experiment_mode("xgboost_blocking").overrides
+def test_isolation_mode_keeps_paper_safe_flags_and_iforest_blocking():
+    env = get_experiment_mode("iforest_blocking").overrides
 
     assert env["LIVE_TRADING"] == "false"
     assert env["PAPER_TRADING"] == "true"
     assert env["LIVE_MODE"] == "false"
     assert env["EXEC_PAPER"] == "true"
     assert env["PLACE_REAL_ORDERS"] == "false"
-    assert env["USE_XGBOOST_SIGNAL"] == "true"
-    assert env["XGBOOST_SIGNAL_BLOCKING"] == "true"
-    assert env["USE_ISOLATION_FOREST"] == "false"
-    assert env["ISOLATION_FOREST_BLOCKING"] == "false"
+    assert env["USE_ISOLATION_FOREST"] == "true"
+    assert env["ISOLATION_FOREST_BLOCKING"] == "true"
+    assert env["USE_XGBOOST_SIGNAL"] == "false"
+    assert env["XGBOOST_SIGNAL_BLOCKING"] == "false"
     assert env["USE_SURVIVAL_EXIT"] == "false"
-    assert env["USE_ADVANCED_RISK"] == "false"
 
 
-def test_xgboost_paper_runbook_preserves_writer_only_safety_checks():
+def test_isolation_runbook_refuses_live_or_real_order_mode():
     text = _script_text()
 
     for snippet in (
-        "Starting live_writer only; executor is not started.",
-        "tools\\verify_xgboost_signal.py",
         "resolve_trading_mode",
         "live_requested",
         "d.place_real_orders",
@@ -74,11 +67,21 @@ def test_xgboost_paper_runbook_preserves_writer_only_safety_checks():
     ):
         assert snippet in text
 
+
+def test_isolation_runbook_starts_writer_only():
+    text = _script_text()
+
+    assert "Starting live_writer only; executor is not started." in text
     assert 'sys.argv = ["tools/live_writer.py"]' in text
     assert 'sys.argv = ["tools/live_executor.py"]' not in text
 
 
-def test_xgboost_paper_runbook_parses_when_powershell_available():
+def test_no_paper_runbook_uses_combined_paper_yet():
+    for runbook in RUNBOOKS:
+        assert "combined_paper" not in runbook.read_text(encoding="utf-8")
+
+
+def test_isolation_runbook_parses_when_powershell_available():
     exe = shutil.which("pwsh") or shutil.which("powershell")
     if exe is None:
         pytest.skip("PowerShell is not available")

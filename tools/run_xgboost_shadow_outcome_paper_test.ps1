@@ -97,6 +97,7 @@ $py = Join-Path $root '.venv\Scripts\python.exe'
 if (-not (Test-Path $py)) {
   $py = "python"
 }
+. (Join-Path $scriptDir 'apply_experiment_mode.ps1')
 
 $artifactFull = Resolve-FullPath -PathValue $Artifact -BaseDir $root
 if (-not (Test-Path $artifactFull)) {
@@ -104,23 +105,14 @@ if (-not (Test-Path $artifactFull)) {
   exit 1
 }
 
-$forcedPaperEnv = [ordered]@{
-  LIVE_TRADING = 'false'
-  PAPER_TRADING = 'true'
-  LIVE_MODE = 'false'
-  EXEC_PAPER = 'true'
-  PLACE_REAL_ORDERS = 'false'
-  USE_XGBOOST_SIGNAL = 'true'
-  XGBOOST_SIGNAL_BLOCKING = 'false'
-  XGBOOST_SIGNAL_ARTIFACT = $artifactFull
-  USE_ISOLATION_FOREST = 'false'
-  USE_SURVIVAL_EXIT = 'false'
-  EXEC_RESTORE_STATE = 'false'
-}
-foreach ($name in $forcedPaperEnv.Keys) {
-  Set-Item -Path "Env:$name" -Value $forcedPaperEnv[$name]
-}
+$experimentMode = 'xgboost_shadow_outcome'
+$forcedPaperEnv = Get-ExperimentModeOverrides -Python $py -Root $root -Mode $experimentMode
+$forcedPaperEnv['XGBOOST_SIGNAL_ARTIFACT'] = $artifactFull
+$forcedPaperEnv['EXEC_RESTORE_STATE'] = 'false'
+Set-ExperimentModeEnvironment -Overrides $forcedPaperEnv
 Set-Item -Path "Env:CONFIRM_LIVE_TRADING" -Value ""
+$forcedEnvPath = Join-Path $logsDir 'xgboost_shadow_outcome_mode_env.json'
+Set-Content -Path $forcedEnvPath -Value ($forcedPaperEnv | ConvertTo-Json -Depth 3) -Encoding UTF8
 
 $existing = Get-ScopedLiveProcess -RootDir $root
 if ($existing) {
@@ -138,7 +130,7 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-artifact = sys.argv[2]
+mode_env = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8-sig"))
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
@@ -154,20 +146,8 @@ try:
 except Exception:
     pass
 
-os.environ.update({
-    "LIVE_TRADING": "false",
-    "PAPER_TRADING": "true",
-    "LIVE_MODE": "false",
-    "EXEC_PAPER": "true",
-    "PLACE_REAL_ORDERS": "false",
-    "USE_XGBOOST_SIGNAL": "true",
-    "XGBOOST_SIGNAL_BLOCKING": "false",
-    "XGBOOST_SIGNAL_ARTIFACT": artifact,
-    "USE_ISOLATION_FOREST": "false",
-    "USE_SURVIVAL_EXIT": "false",
-    "EXEC_RESTORE_STATE": "false",
-    "CONFIRM_LIVE_TRADING": "",
-})
+os.environ.update(mode_env)
+os.environ["CONFIRM_LIVE_TRADING"] = ""
 
 from runtime.guardrails import resolve_trading_mode
 from runtime.settings import Settings
@@ -208,7 +188,7 @@ print(json.dumps({
 
 $preflightPath = Join-Path $logsDir 'xgboost_shadow_outcome_preflight.py'
 Set-Content -Path $preflightPath -Value $preflightCode -Encoding UTF8
-$preflightRaw = & $py $preflightPath $root $artifactFull
+$preflightRaw = & $py $preflightPath $root $forcedEnvPath
 if ($LASTEXITCODE -ne 0) {
   Write-Host "[xgboost-shadow-outcome] REFUSING: mode preflight failed." -ForegroundColor Red
   exit 1
@@ -283,27 +263,18 @@ $auditJson = Join-Path $reportsDir 'xgboost_shadow_outcome_paper_audit.json'
 $writerLauncherCode = @'
 import os
 import sys
+import json
 from pathlib import Path
 
 root = Path(sys.argv[1])
-artifact = sys.argv[2]
+forced_env = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8-sig"))
 os.chdir(root)
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
 import tools.live_writer as live_writer
 
-os.environ["LIVE_TRADING"] = "false"
-os.environ["PAPER_TRADING"] = "true"
-os.environ["LIVE_MODE"] = "false"
-os.environ["EXEC_PAPER"] = "true"
-os.environ["PLACE_REAL_ORDERS"] = "false"
-os.environ["USE_XGBOOST_SIGNAL"] = "true"
-os.environ["XGBOOST_SIGNAL_BLOCKING"] = "false"
-os.environ["XGBOOST_SIGNAL_ARTIFACT"] = artifact
-os.environ["USE_ISOLATION_FOREST"] = "false"
-os.environ["USE_SURVIVAL_EXIT"] = "false"
-os.environ["EXEC_RESTORE_STATE"] = "false"
+os.environ.update(forced_env)
 os.environ["CONFIRM_LIVE_TRADING"] = ""
 os.environ.setdefault("HL_TESTNET", "true")
 
@@ -314,28 +285,18 @@ live_writer.main()
 $executorLauncherCode = @'
 import os
 import sys
+import json
 from pathlib import Path
 
 root = Path(sys.argv[1])
+FORCED = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8-sig"))
 os.chdir(root)
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
 import tools.live_executor as live_executor
 
-FORCED = {
-    "LIVE_TRADING": "false",
-    "PAPER_TRADING": "true",
-    "LIVE_MODE": "false",
-    "EXEC_PAPER": "true",
-    "PLACE_REAL_ORDERS": "false",
-    "USE_XGBOOST_SIGNAL": "true",
-    "XGBOOST_SIGNAL_BLOCKING": "false",
-    "USE_ISOLATION_FOREST": "false",
-    "USE_SURVIVAL_EXIT": "false",
-    "EXEC_RESTORE_STATE": "false",
-    "CONFIRM_LIVE_TRADING": "",
-}
+FORCED["CONFIRM_LIVE_TRADING"] = ""
 
 def force_env():
     os.environ.update(FORCED)
@@ -432,22 +393,15 @@ Set-Content -Path $executorLauncherPath -Value $executorLauncherCode -Encoding U
 Set-Content -Path $lineageCheckPath -Value $lineageCheckCode -Encoding UTF8
 
 Write-Host "[xgboost-shadow-outcome] Starting live_writer and live_executor in paper mode."
+Write-Host "[xgboost-shadow-outcome] Experiment mode: $experimentMode"
 Write-Host "[xgboost-shadow-outcome] Forced flags:"
-Write-Host "  LIVE_TRADING=false"
-Write-Host "  PAPER_TRADING=true"
-Write-Host "  LIVE_MODE=false"
-Write-Host "  EXEC_PAPER=true"
-Write-Host "  PLACE_REAL_ORDERS=false"
-Write-Host "  USE_XGBOOST_SIGNAL=true"
-Write-Host "  XGBOOST_SIGNAL_BLOCKING=false"
-Write-Host "  XGBOOST_SIGNAL_ARTIFACT=$artifactFull"
-Write-Host "  USE_ISOLATION_FOREST=false"
-Write-Host "  USE_SURVIVAL_EXIT=false"
-Write-Host "  EXEC_RESTORE_STATE=false"
+foreach ($name in $forcedPaperEnv.Keys) {
+  Write-Host ("  {0}={1}" -f $name, $forcedPaperEnv[$name])
+}
 Write-Host ("[xgboost-shadow-outcome] Duration: {0} minutes" -f $Minutes)
 
-$writerArgs = @($writerLauncherPath, $root, $artifactFull) | ForEach-Object { Quote-ProcessArg $_ }
-$executorArgs = @($executorLauncherPath, $root) | ForEach-Object { Quote-ProcessArg $_ }
+$writerArgs = @($writerLauncherPath, $root, $forcedEnvPath) | ForEach-Object { Quote-ProcessArg $_ }
+$executorArgs = @($executorLauncherPath, $root, $forcedEnvPath) | ForEach-Object { Quote-ProcessArg $_ }
 
 $writer = $null
 $executor = $null
