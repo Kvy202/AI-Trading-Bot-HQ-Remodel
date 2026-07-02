@@ -287,6 +287,7 @@ $writerLauncherPath = Join-Path $logsDir 'combined_shadow_writer_launcher.py'
 $executorLauncherPath = Join-Path $logsDir 'combined_shadow_executor_launcher.py'
 $reportJson = Join-Path $reportsDir 'combined_shadow_paper_summary.json'
 $auditJson = Join-Path $reportsDir 'combined_shadow_xgboost_audit.json'
+$unifiedJson = Join-Path $reportsDir 'unified_experimental_report.json'
 
 $writerLauncherCode = @'
 import os
@@ -413,8 +414,16 @@ if ($LASTEXITCODE -ne 0) {
   exit 1
 }
 
+Write-Host "[combined-shadow] Generating unified experimental report..."
+& $py "tools\unified_experimental_report.py" --logs-dir $logsDir --json --json-out $unifiedJson
+if ($LASTEXITCODE -ne 0) {
+  Write-Host "[combined-shadow] FAIL: unified experimental report generation failed." -ForegroundColor Red
+  exit 1
+}
+
 Assert-ReportWritten -PathValue $reportJson
 Assert-ReportWritten -PathValue $auditJson
+Assert-ReportWritten -PathValue $unifiedJson
 
 Write-Host "[combined-shadow] Validating shadow logs..."
 foreach ($name in $shadowLogNames) {
@@ -488,6 +497,7 @@ Write-Host "[combined-shadow] Done."
 Write-Host "  experiment_mode: $experimentMode"
 Write-Host "  report_json: $reportJson"
 Write-Host "  xgboost_audit_json: $auditJson"
+Write-Host "  unified_report_json: $unifiedJson"
 Write-Host "  writer_stdout: $writerOut"
 Write-Host "  writer_stderr: $writerErr"
 Write-Host "  executor_stdout: $executorOut"

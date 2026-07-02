@@ -119,7 +119,7 @@ def test_combined_shadow_runbook_runs_all_verifiers():
         assert snippet in text
 
 
-def test_combined_shadow_runbook_generates_both_reports():
+def test_combined_shadow_runbook_generates_existing_and_unified_reports():
     text = _script_text()
 
     assert "tools\\experimental_shadow_report.py" in text
@@ -128,8 +128,12 @@ def test_combined_shadow_runbook_generates_both_reports():
     assert "tools\\audit_xgboost_rejections.py" in text
     assert "--json --json-out $auditJson" in text
     assert "combined_shadow_xgboost_audit.json" in text
+    assert "tools\\unified_experimental_report.py" in text
+    assert "--logs-dir $logsDir --json --json-out $unifiedJson" in text
+    assert "unified_experimental_report.json" in text
     assert "Assert-ReportWritten -PathValue $reportJson" in text
     assert "Assert-ReportWritten -PathValue $auditJson" in text
+    assert "Assert-ReportWritten -PathValue $unifiedJson" in text
 
 
 def test_fresh_shadow_logs_include_all_four_shadow_logs():
