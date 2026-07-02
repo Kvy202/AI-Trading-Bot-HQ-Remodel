@@ -19,10 +19,9 @@ def _script_text() -> str:
 def test_shadow_outcome_runbook_parser_accepts_required_minutes():
     text = _script_text()
 
-    assert "[ValidateSet(30, 60)] [int]$Minutes = 30" in text
+    assert "[ValidateSet(5, 30, 60)] [int]$Minutes = 30" in text
     assert "-Minutes" in text
     assert "Duration: {0} minutes" in text
-    assert "[ValidateSet(5, 30, 60)]" not in text
 
 
 def test_shadow_outcome_runbook_uses_shadow_outcome_mode():

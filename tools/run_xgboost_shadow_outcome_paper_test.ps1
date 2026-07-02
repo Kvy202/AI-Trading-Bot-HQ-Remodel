@@ -1,11 +1,12 @@
 <# 
 Usage:
+  .\tools\run_xgboost_shadow_outcome_paper_test.ps1 -Minutes 5
   .\tools\run_xgboost_shadow_outcome_paper_test.ps1 -Minutes 30
   .\tools\run_xgboost_shadow_outcome_paper_test.ps1 -Minutes 60 -FreshShadowLog -FreshPaperLogs
 #>
 
 param(
-  [ValidateSet(30, 60)] [int]$Minutes = 30,
+  [ValidateSet(5, 30, 60)] [int]$Minutes = 30,
   [string]$Artifact = "model_artifacts/xgboost_signal.joblib",
   [switch]$FreshShadowLog,
   [switch]$FreshPaperLogs,

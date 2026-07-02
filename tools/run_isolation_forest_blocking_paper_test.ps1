@@ -1,5 +1,5 @@
 param(
-  [ValidateScript({ $_ -eq 1 -or ($_ -ge 30 -and $_ -le 60) })] [int]$Minutes = 45,
+  [ValidateSet(5, 30, 60)] [int]$Minutes = 30,
   [string]$Artifact = "model_artifacts/isolation_forest.joblib",
   [switch]$FreshShadowLog,
   [switch]$SkipVerifier

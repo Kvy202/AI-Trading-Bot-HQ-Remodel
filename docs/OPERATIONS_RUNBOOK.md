@@ -236,3 +236,21 @@ Expected outputs:
 - `reports/isolation_forest_blocking_paper_summary.json` is written.
 - The text report includes `total_rows`, `would_block_count`,
   `actually_blocked_count`, `block_rate`, and `top_reasons`.
+
+---
+
+## 11. Controlled Experiment Matrix
+
+Use the matrix runner for repeatable paper-only experimental tests with
+consistent duration, fresh logs, and standardized reports. It requires either
+one `-Mode` or `-All`; it does not run every mode by default.
+
+```powershell
+.\tools\run_experiment_matrix.ps1 -Mode combined_shadow -Minutes 30 -FreshLogs
+.\tools\run_experiment_matrix.ps1 -All -Minutes 30 -FreshLogs
+.\tools\run_experiment_matrix.ps1 -Mode xgboost_shadow_outcome -Minutes 5 -DryRun
+```
+
+Each run writes a `reports/matrix_index_<timestamp>.json` plus per-mode
+`matrix_<mode>_<timestamp>_*` reports. `-DryRun` prints the commands and report
+paths without starting writer or executor processes.
