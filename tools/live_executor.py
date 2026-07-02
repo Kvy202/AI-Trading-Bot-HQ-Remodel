@@ -91,6 +91,7 @@ SUPERVISOR_CMD_FILE = LOGS_DIR / "supervisor_cmd.json"
 SUPERVISOR_ACK_FILE = LOGS_DIR / "supervisor_ack.json"
 CLOSED_MASTER_CSV   = LOGS_DIR / "trades_closed.csv"
 SURVIVAL_SHADOW_LOG = LOGS_DIR / "survival_exit_shadow.csv"
+ADVANCED_RISK_SHADOW_LOG = LOGS_DIR / "advanced_risk_shadow.csv"
 
 # V2 optional risk controls (v2/risk_controls.py). Stays None unless main()
 # initializes it; every use is None-guarded + try/except so a V2 failure can
@@ -287,6 +288,16 @@ def append_survival_shadow_row(
         paper_only_guard=paper_only_guard,
     )
     append_csv_dict(SURVIVAL_SHADOW_LOG, list(header), row)
+
+
+def append_advanced_risk_shadow_row(
+    decision: Any,
+    context: Any,
+    header: Optional[List[str]],
+) -> None:
+    if header is None:
+        return
+    append_csv_dict(ADVANCED_RISK_SHADOW_LOG, list(header), decision.to_log_row(context))
 
 
 def record_trade(path: Path, row: List[Any], signal_id: str = "") -> None:
@@ -951,6 +962,65 @@ def check_tp_sl(pos: Position, price: float, tp_pct: float, sl_pct: float) -> Tu
 def portfolio_exposure(positions: Dict[str, Position]) -> float:
     return sum(p.qty * p.avg for p in positions.values())
 
+
+def read_daily_closed_trade_metrics(path: Path) -> Dict[str, Any]:
+    if not path.exists() or path.stat().st_size == 0:
+        return {
+            "daily_realized_pnl": 0.0,
+            "consecutive_losses": 0,
+            "recent_trade_count": 0,
+        }
+
+    realized: List[float] = []
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    pnl = float(row.get("realized_pnl", ""))
+                except Exception:
+                    continue
+                if math.isfinite(pnl):
+                    realized.append(pnl)
+    except Exception:
+        return {
+            "daily_realized_pnl": 0.0,
+            "consecutive_losses": 0,
+            "recent_trade_count": 0,
+        }
+
+    consecutive_losses = 0
+    for pnl in reversed(realized):
+        if pnl < 0.0:
+            consecutive_losses += 1
+        else:
+            break
+
+    return {
+        "daily_realized_pnl": sum(realized),
+        "consecutive_losses": consecutive_losses,
+        "recent_trade_count": len(realized),
+    }
+
+
+def daily_loss_pct_from_pnl(realized_pnl: float, exposure_base: float) -> float:
+    if exposure_base <= 0.0 or realized_pnl >= 0.0:
+        return 0.0
+    return abs(realized_pnl) / exposure_base * 100.0
+
+
+def symbol_exposure_pct(
+    positions: Dict[str, Position],
+    symbol: str,
+    candidate_notional: float,
+    exposure_base: float,
+) -> float:
+    if exposure_base <= 0.0:
+        return 0.0
+    pos = positions.get(symbol)
+    current = 0.0 if pos is None else max(0.0, pos.qty * pos.avg)
+    projected = current + max(0.0, candidate_notional)
+    return projected / exposure_base * 100.0
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1101,6 +1171,42 @@ def main(argv: Optional[List[str]] = None) -> None:
         except Exception as e:
             log_err(f"survival_status=disabled_init_error reason={type(e).__name__}: {e}")
             survival_exit_model = None
+
+    advanced_risk_settings = None
+    advanced_risk_shadow_cols: Optional[List[str]] = None
+    evaluate_advanced_risk_fn = None
+    if exp_flags.use_advanced_risk:
+        try:
+            from ml_optional.advanced_risk import (
+                ADVANCED_RISK_SHADOW_COLS,
+                AdvancedRiskSettings,
+                evaluate_advanced_risk,
+            )
+
+            advanced_risk_settings = AdvancedRiskSettings.from_env(
+                enabled=True,
+                paper_mode=(mode_name == "PAPER"),
+                place_real_orders=live,
+            )
+            advanced_risk_shadow_cols = ADVANCED_RISK_SHADOW_COLS
+            evaluate_advanced_risk_fn = evaluate_advanced_risk
+            if not advanced_risk_settings.advanced_risk_active:
+                advanced_risk_guard = "inactive"
+            elif live:
+                advanced_risk_guard = "blocked_real_orders"
+            elif mode_name != "PAPER":
+                advanced_risk_guard = "blocked_not_paper"
+            else:
+                advanced_risk_guard = "phase10_shadow_only"
+            log(
+                "advanced_risk_enabled=1 "
+                f"advanced_risk_active={int(advanced_risk_settings.advanced_risk_active)} "
+                f"paper_only_guard={advanced_risk_guard} "
+                "advanced_risk_status=shadow_only"
+            )
+        except Exception as e:
+            log_err(f"advanced_risk_status=disabled_init_error reason={type(e).__name__}: {e}")
+            advanced_risk_settings = None
 
     if args.survival_self_test:
         try:
@@ -1420,6 +1526,46 @@ def main(argv: Optional[List[str]] = None) -> None:
                 survival_result = None
                 survival_decision = None
                 survival_logged = False
+
+                if advanced_risk_settings is not None and evaluate_advanced_risk_fn is not None:
+                    try:
+                        daily_metrics = read_daily_closed_trade_metrics(closed_path_for_day(current_day))
+                        exposure_base = max(float(args.max_portfolio_usdt), 1e-9)
+                        daily_realized_pnl = float(daily_metrics["daily_realized_pnl"])
+                        advanced_context = {
+                            "timestamp": sig.ts,
+                            "symbol": sig.symbol,
+                            "side": "long" if sig.p_meta >= 0 else "short",
+                            "p_meta": sig.p_meta,
+                            "price": price,
+                            "rv_mean": sig.rv_mean,
+                            "volatility": args.rv_max if math.isfinite(float(args.rv_max)) else None,
+                            "open_positions_count": len(active_symbols),
+                            "symbol_exposure": symbol_exposure_pct(
+                                positions,
+                                sig.symbol,
+                                eff_notional,
+                                exposure_base,
+                            ),
+                            "daily_realized_pnl": daily_realized_pnl,
+                            "daily_loss_pct": daily_loss_pct_from_pnl(daily_realized_pnl, exposure_base),
+                            "consecutive_losses": daily_metrics["consecutive_losses"],
+                            "recent_trade_count": daily_metrics["recent_trade_count"],
+                        }
+                        advanced_decision = evaluate_advanced_risk_fn(
+                            advanced_context,
+                            advanced_risk_settings,
+                        )
+                        append_advanced_risk_shadow_row(
+                            advanced_decision,
+                            advanced_context,
+                            advanced_risk_shadow_cols,
+                        )
+                    except Exception as _risk_exc:
+                        log_err(
+                            "advanced_risk_status=shadow_log_error "
+                            f"symbol={sig.symbol} reason={type(_risk_exc).__name__}: {_risk_exc}"
+                        )
 
                 if pos and survival_exit_model is not None:
                     try:

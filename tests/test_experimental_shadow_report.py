@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from tools.experimental_shadow_report import (
+    ADVANCED_RISK_LOG,
     ISOLATION_LOG,
     SURVIVAL_LOG,
     XGBOOST_LOG,
@@ -36,6 +37,10 @@ def test_missing_log_files_do_not_crash(tmp_path):
     assert summary["survival_exit"]["actually_exited_count"] == 0
     assert summary["survival_exit"]["actual_exit_rate"] == 0.0
     assert summary["survival_exit"]["exit_reason_counts"] == {}
+    assert summary["advanced_risk"]["file_status"] == "missing"
+    assert summary["advanced_risk"]["would_block_count"] == 0
+    assert summary["advanced_risk"]["actual_block_rate"] == 0.0
+    assert summary["advanced_risk"]["top_reasons"] == {}
     assert "Experimental Shadow Report" in format_text_summary(summary)
 
 
@@ -86,6 +91,29 @@ def test_valid_log_files_are_summarized(tmp_path):
             ["t2", "BTCUSDT", "0.80", "0", "1", "1", "survival_high_exit_risk", "high_exit_risk", "surv-v2"],
         ],
     )
+    _write_csv(
+        tmp_path / ADVANCED_RISK_LOG,
+        [
+            "timestamp",
+            "symbol",
+            "side",
+            "p_meta",
+            "price",
+            "risk_score",
+            "would_block",
+            "actually_blocked",
+            "would_reduce_size",
+            "actually_reduced",
+            "would_pause",
+            "actually_paused",
+            "top_reason",
+        ],
+        [
+            ["t1", "BTCUSDT", "long", "0.70", "100", "0.00", "0", "0", "0", "0", "0", "0", "normal"],
+            ["t2", "BTCUSDT", "long", "0.80", "100", "1.00", "1", "0", "0", "0", "1", "0", "daily_loss_pct_limit"],
+            ["t3", "ETHUSDT", "short", "-0.75", "200", "0.75", "1", "0", "1", "0", "0", "0", "volatility_guard"],
+        ],
+    )
 
     summary = summarize_all(tmp_path)
 
@@ -131,9 +159,28 @@ def test_valid_log_files_are_summarized(tmp_path):
     assert survival["latest_risk_score"] == 0.80
     assert survival["latest_reason"] == "high_exit_risk"
     assert survival["latest_model_version"] == "surv-v2"
+
+    risk = summary["advanced_risk"]
+    assert risk["total_rows"] == 3
+    assert risk["would_block_count"] == 2
+    assert risk["actually_blocked_count"] == 0
+    assert risk["would_block_rate"] == 2 / 3
+    assert risk["actual_block_rate"] == 0.0
+    assert risk["would_pause_count"] == 1
+    assert risk["actually_paused_count"] == 0
+    assert risk["would_reduce_size_count"] == 1
+    assert risk["actually_reduced_count"] == 0
+    assert round(risk["average_risk_score"], 6) == 0.583333
+    assert risk["latest_risk_score"] == 0.75
+    assert risk["top_reasons"]["daily_loss_pct_limit"] == 1
+    assert risk["top_reasons"]["volatility_guard"] == 1
+
     text = format_text_summary(summary)
     assert "actual_exit_rate" in text
     assert "exit_reason_counts" in text
+    assert "Advanced Risk" in text
+    assert "would_reduce_size_count" in text
+    assert "average_risk_score" in text
 
 
 def test_isolation_report_distinguishes_would_and_actual_block_rates(tmp_path):
@@ -189,7 +236,7 @@ def test_isolation_report_includes_score_distribution(tmp_path):
 
 
 def test_empty_log_files_are_handled(tmp_path):
-    for name in (ISOLATION_LOG, XGBOOST_LOG, SURVIVAL_LOG):
+    for name in (ISOLATION_LOG, XGBOOST_LOG, SURVIVAL_LOG, ADVANCED_RISK_LOG):
         (tmp_path / name).write_text("", encoding="utf-8")
 
     summary = summarize_all(tmp_path)
@@ -199,6 +246,9 @@ def test_empty_log_files_are_handled(tmp_path):
     assert summary["survival_exit"]["file_status"] == "empty"
     assert summary["survival_exit"]["average_survival_risk_score"] is None
     assert summary["survival_exit"]["actual_exit_rate"] == 0.0
+    assert summary["advanced_risk"]["file_status"] == "empty"
+    assert summary["advanced_risk"]["average_risk_score"] is None
+    assert summary["advanced_risk"]["actual_block_rate"] == 0.0
     assert summary["isolation_forest"]["min_anomaly_score"] is None
     assert summary["isolation_forest"]["p50_anomaly_score"] is None
     assert summary["xgboost_signal"]["actually_rejected_count"] == 0
@@ -211,9 +261,10 @@ def test_json_output_format(tmp_path):
     out = write_json_summary(summary, tmp_path / "reports" / "experimental_shadow_summary.json")
 
     data = json.loads(out.read_text(encoding="utf-8"))
-    assert set(data) == {"logs_dir", "isolation_forest", "xgboost_signal", "survival_exit"}
+    assert set(data) == {"logs_dir", "isolation_forest", "xgboost_signal", "survival_exit", "advanced_risk"}
     assert data["isolation_forest"]["total_rows"] == 0
     assert data["xgboost_signal"]["file_status"] == "missing"
     assert data["xgboost_signal"]["actually_rejected_count"] == 0
     assert data["survival_exit"]["would_exit_early_count"] == 0
     assert data["survival_exit"]["actually_exited_count"] == 0
+    assert data["advanced_risk"]["would_block_count"] == 0

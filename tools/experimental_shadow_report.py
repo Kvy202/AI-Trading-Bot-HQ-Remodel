@@ -20,6 +20,7 @@ DEFAULT_JSON_OUT = BASE_DIR / "reports" / "experimental_shadow_summary.json"
 ISOLATION_LOG = "isolation_forest_shadow.csv"
 XGBOOST_LOG = "xgboost_signal_shadow.csv"
 SURVIVAL_LOG = "survival_exit_shadow.csv"
+ADVANCED_RISK_LOG = "advanced_risk_shadow.csv"
 
 
 def _read_csv_rows(path: Path) -> tuple[str, List[Dict[str, str]]]:
@@ -138,6 +139,19 @@ def _top_exit_reasons(rows: List[Dict[str, str]], limit: int = 5) -> Dict[str, i
     return dict(counts.most_common(limit))
 
 
+def _top_risk_reasons(rows: List[Dict[str, str]], limit: int = 5) -> Dict[str, int]:
+    counts = Counter()
+    for row in rows:
+        top = (row.get("top_reason") or "").strip()
+        if top:
+            counts[top] += 1
+            continue
+        reasons = (row.get("reasons") or "").strip()
+        first = reasons.split("|", 1)[0].strip() if reasons else ""
+        counts[first or "unknown"] += 1
+    return dict(counts.most_common(limit))
+
+
 def summarize_isolation(logs_dir: Path) -> Dict[str, Any]:
     path = logs_dir / ISOLATION_LOG
     status, rows = _read_csv_rows(path)
@@ -217,6 +231,34 @@ def summarize_survival(logs_dir: Path) -> Dict[str, Any]:
     }
 
 
+def summarize_advanced_risk(logs_dir: Path) -> Dict[str, Any]:
+    path = logs_dir / ADVANCED_RISK_LOG
+    status, rows = _read_csv_rows(path)
+    total_rows = len(rows)
+    would_block_count = sum(1 for row in rows if _truthy(row.get("would_block")))
+    actually_blocked_count = sum(1 for row in rows if _truthy(row.get("actually_blocked")))
+    would_pause_count = sum(1 for row in rows if _truthy(row.get("would_pause")))
+    actually_paused_count = sum(1 for row in rows if _truthy(row.get("actually_paused")))
+    would_reduce_size_count = sum(1 for row in rows if _truthy(row.get("would_reduce_size")))
+    actually_reduced_count = sum(1 for row in rows if _truthy(row.get("actually_reduced")))
+    return {
+        "file": str(path),
+        "file_status": status,
+        "total_rows": total_rows,
+        "would_block_count": would_block_count,
+        "actually_blocked_count": actually_blocked_count,
+        "would_block_rate": 0.0 if total_rows == 0 else would_block_count / total_rows,
+        "actual_block_rate": 0.0 if total_rows == 0 else actually_blocked_count / total_rows,
+        "would_pause_count": would_pause_count,
+        "actually_paused_count": actually_paused_count,
+        "would_reduce_size_count": would_reduce_size_count,
+        "actually_reduced_count": actually_reduced_count,
+        "average_risk_score": _avg(row.get("risk_score") for row in rows),
+        "latest_risk_score": _latest_float(rows, "risk_score"),
+        "top_reasons": _top_risk_reasons(rows),
+    }
+
+
 def summarize_all(logs_dir: Path | str = DEFAULT_LOGS_DIR) -> Dict[str, Any]:
     root = Path(logs_dir)
     return {
@@ -224,6 +266,7 @@ def summarize_all(logs_dir: Path | str = DEFAULT_LOGS_DIR) -> Dict[str, Any]:
         "isolation_forest": summarize_isolation(root),
         "xgboost_signal": summarize_xgboost(root),
         "survival_exit": summarize_survival(root),
+        "advanced_risk": summarize_advanced_risk(root),
     }
 
 
@@ -239,6 +282,7 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
     iso = summary["isolation_forest"]
     xgb = summary["xgboost_signal"]
     surv = summary["survival_exit"]
+    risk = summary["advanced_risk"]
     lines = [
         "Experimental Shadow Report",
         f"Logs: {summary['logs_dir']}",
@@ -290,6 +334,21 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         f"  latest_risk_score: {_fmt(surv['latest_risk_score'])}",
         f"  latest_reason: {_fmt(surv['latest_reason'])}",
         f"  latest_model_version: {_fmt(surv['latest_model_version'])}",
+        "",
+        "Advanced Risk",
+        f"  file_status: {risk['file_status']}",
+        f"  total_rows: {risk['total_rows']}",
+        f"  would_block_count: {risk['would_block_count']}",
+        f"  actually_blocked_count: {risk['actually_blocked_count']}",
+        f"  would_block_rate: {_fmt(risk['would_block_rate'])}",
+        f"  actual_block_rate: {_fmt(risk['actual_block_rate'])}",
+        f"  would_pause_count: {risk['would_pause_count']}",
+        f"  actually_paused_count: {risk['actually_paused_count']}",
+        f"  would_reduce_size_count: {risk['would_reduce_size_count']}",
+        f"  actually_reduced_count: {risk['actually_reduced_count']}",
+        f"  average_risk_score: {_fmt(risk['average_risk_score'])}",
+        f"  latest_risk_score: {_fmt(risk['latest_risk_score'])}",
+        f"  top_reasons: {risk['top_reasons']}",
     ]
     return "\n".join(lines)
 
