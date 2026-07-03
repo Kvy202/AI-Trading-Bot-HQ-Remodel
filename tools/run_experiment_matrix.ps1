@@ -464,7 +464,6 @@ function Invoke-ChildRunbook {
   $childArgs += @('-File', $ScriptPath)
   $childArgs += $Arguments
   & $PowerShellExe @childArgs
-  return [int]$LASTEXITCODE
 }
 
 function Write-MatrixReports {
@@ -546,14 +545,18 @@ foreach ($plan in $plans) {
       if ($FreshLogs) {
         $notes.Add('fresh logs delegated to mode runbook where supported')
       }
-      $code = Invoke-ChildRunbook -PowerShellExe $psExe -ScriptPath $plan.script -Arguments $plan.args -Root $root
+      Invoke-ChildRunbook -PowerShellExe $psExe -ScriptPath $plan.script -Arguments $plan.args -Root $root
+      $code = [int]$LASTEXITCODE
       if ($code -ne 0) {
+        $exitStatus = $code
         throw "child runbook exited with status $code"
       }
     }
     Write-MatrixReports -Python $py -LogsDir $logsDir -ReportPaths $plan.report_paths
   } catch {
-    $exitStatus = 1
+    if ($exitStatus -eq 0) {
+      $exitStatus = 1
+    }
     $notes.Add([string]$_.Exception.Message)
     Write-Host ("[matrix] FAIL: {0}: {1}" -f $modeName, $_.Exception.Message) -ForegroundColor Red
   }
