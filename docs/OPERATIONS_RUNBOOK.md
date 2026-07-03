@@ -254,3 +254,18 @@ one `-Mode` or `-All`; it does not run every mode by default.
 Each run writes a `reports/matrix_index_<timestamp>.json` plus per-mode
 `matrix_<mode>_<timestamp>_*` reports. `-DryRun` prints the commands and report
 paths without starting writer or executor processes.
+
+---
+
+## 12. Final Experiment Comparison
+
+After the matrix paper tests are complete, generate the read-only final
+comparison report from the saved `reports/matrix_*` JSON files:
+
+```powershell
+python tools\final_experiment_comparison.py --reports-dir reports
+python tools\final_experiment_comparison.py --reports-dir reports --json --json-out reports\final_experiment_comparison.json
+```
+
+The report is for comparison and signoff only. It does not enable any live,
+testnet, or real-order behavior.
