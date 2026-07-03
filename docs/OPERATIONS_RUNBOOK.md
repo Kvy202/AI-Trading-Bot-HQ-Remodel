@@ -269,3 +269,18 @@ python tools\final_experiment_comparison.py --reports-dir reports --json --json-
 
 The report is for comparison and signoff only. It does not enable any live,
 testnet, or real-order behavior.
+
+---
+
+## 13. Phase 16: Calibration Recommendation Report
+
+Use this read-only report after the final experiment comparison to plan the
+next paper-only calibration pass:
+
+```powershell
+python tools\calibration_recommendation_report.py --reports-dir reports --logs-dir logs
+python tools\calibration_recommendation_report.py --reports-dir reports --logs-dir logs --json --json-out reports\calibration_recommendation_report.json
+```
+
+The report recommends calibration steps only. It must not be used to enable
+live trading, testnet real orders, or `PLACE_REAL_ORDERS`.
