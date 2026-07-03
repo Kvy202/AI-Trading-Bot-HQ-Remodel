@@ -318,10 +318,6 @@ function Invoke-GenericPaperMode {
     throw 'REFUSING: live writer/executor process is already running under this repo.'
   }
 
-  if ($FreshLogs) {
-    Archive-MatrixLogs -LogsDir $LogsDir -ModeName $ModeName -Stamp $Stamp
-  }
-
   $forcedPaperEnv = Get-ForcedPaperEnv -Python $Python -Root $Root -ModeName $ExperimentMode
   $envPath = Join-Path $LogsDir "matrix_${ModeName}_mode_env.json"
   Set-Content -Path $envPath -Value ($forcedPaperEnv | ConvertTo-Json -Depth 4) -Encoding UTF8
@@ -532,6 +528,11 @@ foreach ($plan in $plans) {
   Write-Host ""
   Write-Host "[matrix] ===== Mode: $modeName ====="
   try {
+    if ($FreshLogs) {
+      Archive-MatrixLogs -LogsDir $logsDir -ModeName $modeName -Stamp $matrixStamp
+      $notes.Add('fresh logs archived at matrix level')
+    }
+
     if ($plan.kind -eq 'generic') {
       Invoke-GenericPaperMode `
         -ModeName $modeName `
@@ -542,9 +543,6 @@ foreach ($plan in $plans) {
         -Python $py `
         -Stamp $matrixStamp
     } else {
-      if ($FreshLogs) {
-        $notes.Add('fresh logs delegated to mode runbook where supported')
-      }
       Invoke-ChildRunbook -PowerShellExe $psExe -ScriptPath $plan.script -Arguments $plan.args -Root $root
       $code = [int]$LASTEXITCODE
       if ($code -ne 0) {

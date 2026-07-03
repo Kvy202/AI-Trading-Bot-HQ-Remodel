@@ -24,6 +24,13 @@ EXPECTED_MODES = [
     "combined_shadow",
 ]
 
+SHADOW_LOGS = [
+    "isolation_forest_shadow.csv",
+    "xgboost_signal_shadow.csv",
+    "survival_exit_shadow.csv",
+    "advanced_risk_shadow.csv",
+]
+
 
 def _script_text() -> str:
     return SCRIPT.read_text(encoding="utf-8")
@@ -69,19 +76,62 @@ def _write_fake_report_tool(path: Path) -> None:
                 "import sys",
                 "from pathlib import Path",
                 "",
+                "shadow_names = [",
+                "    'isolation_forest_shadow.csv',",
+                "    'xgboost_signal_shadow.csv',",
+                "    'survival_exit_shadow.csv',",
+                "    'advanced_risk_shadow.csv',",
+                "]",
+                "logs_dir = Path('logs')",
                 "out = None",
                 "for idx, arg in enumerate(sys.argv):",
                 "    if arg == '--json-out' and idx + 1 < len(sys.argv):",
                 "        out = Path(sys.argv[idx + 1])",
-                "        break",
+                "    if arg == '--logs-dir' and idx + 1 < len(sys.argv):",
+                "        logs_dir = Path(sys.argv[idx + 1])",
                 "if out is None:",
                 "    raise SystemExit('missing --json-out')",
                 "out.parent.mkdir(parents=True, exist_ok=True)",
-                "out.write_text(json.dumps({'ok': True}), encoding='utf-8')",
+                "rows = {}",
+                "for name in shadow_names:",
+                "    log = logs_dir / name",
+                "    if not log.exists():",
+                "        rows[name] = 0",
+                "        continue",
+                "    lines = [line for line in log.read_text(encoding='utf-8').splitlines() if line.strip()]",
+                "    rows[name] = max(0, len(lines) - 1)",
+                "out.write_text(json.dumps({'ok': True, 'shadow_rows': rows}), encoding='utf-8')",
             ]
         ),
         encoding="utf-8",
     )
+
+
+def _fake_child_runbook(log_names: list[str], child_exit: int) -> str:
+    lines = [
+        "param(",
+        "  [ValidateSet(5, 30, 60)] [int]$Minutes = 30,",
+        "  [switch]$FreshShadowLog,",
+        "  [switch]$FreshShadowLogs,",
+        "  [switch]$FreshPaperLogs",
+        ")",
+        "$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path",
+        "$root = (Resolve-Path (Join-Path $scriptDir '..')).Path",
+        "$logsDir = Join-Path $root 'logs'",
+        "New-Item -ItemType Directory -Path $logsDir -Force | Out-Null",
+        'Write-Output "[fake-child] normal output"',
+        '[Console]::Error.WriteLine("[fake-child] stderr output")',
+        'Write-Output "0"',
+    ]
+    for name in log_names:
+        lines.extend(
+            [
+                f"$path = Join-Path $logsDir '{name}'",
+                f"Set-Content -Path $path -Value \"header`n{Path(name).stem}_new_row\" -Encoding UTF8",
+            ]
+        )
+    lines.append(f"exit {child_exit}")
+    return "\n".join(lines)
 
 
 def _make_fake_matrix_repo(tmp_path: Path, child_exit: int) -> Path:
@@ -106,22 +156,23 @@ def _make_fake_matrix_repo(tmp_path: Path, child_exit: int) -> Path:
         ),
         encoding="utf-8",
     )
-    (tools / "run_combined_shadow_paper_test.ps1").write_text(
-        "\n".join(
-            [
-                "param(",
-                "  [ValidateSet(5, 30, 60)] [int]$Minutes = 30,",
-                "  [switch]$FreshShadowLogs,",
-                "  [switch]$FreshPaperLogs",
-                ")",
-                'Write-Output "[fake-child] normal output"',
-                '[Console]::Error.WriteLine("[fake-child] stderr output")',
-                'Write-Output "0"',
-                f"exit {child_exit}",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    child_logs = {
+        "run_isolation_forest_blocking_paper_test.ps1": ["isolation_forest_shadow.csv"],
+        "run_xgboost_shadow_outcome_paper_test.ps1": ["xgboost_signal_shadow.csv"],
+        "run_survival_active_paper_test.ps1": ["survival_exit_shadow.csv"],
+        "run_advanced_risk_shadow_paper_test.ps1": ["advanced_risk_shadow.csv"],
+        "run_combined_shadow_paper_test.ps1": [
+            "isolation_forest_shadow.csv",
+            "xgboost_signal_shadow.csv",
+            "survival_exit_shadow.csv",
+            "advanced_risk_shadow.csv",
+        ],
+    }
+    for script_name, log_names in child_logs.items():
+        (tools / script_name).write_text(
+            _fake_child_runbook(log_names=log_names, child_exit=child_exit),
+            encoding="utf-8",
+        )
     for name in (
         "experimental_shadow_report.py",
         "unified_experimental_report.py",
@@ -129,6 +180,27 @@ def _make_fake_matrix_repo(tmp_path: Path, child_exit: int) -> Path:
     ):
         _write_fake_report_tool(tools / name)
     return tools / "run_experiment_matrix.ps1"
+
+
+def _write_stale_log(path: Path) -> None:
+    path.write_text(
+        "header\nstale_row\n",
+        encoding="utf-8",
+    )
+
+
+def _single_archive_dir(script: Path, mode: str) -> Path:
+    logs = script.parents[1] / "logs"
+    matches = sorted(logs.glob(f"matrix_{mode}_archive_*"))
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _latest_report(script: Path, mode: str, report_type: str) -> dict:
+    reports = script.parents[1] / "reports"
+    matches = sorted(reports.glob(f"matrix_{mode}_*_{report_type}.json"))
+    assert matches
+    return json.loads(matches[-1].read_text(encoding="utf-8-sig"))
 
 
 def _latest_matrix_index(script: Path) -> dict:
@@ -313,3 +385,122 @@ def test_matrix_nonzero_child_exit_fails_and_records_numeric_status(tmp_path):
     assert "child runbook exited with status [fake-child]" not in result.stdout
     assert index["runs"][0]["exit_status"] == 7
     assert isinstance(index["runs"][0]["exit_status"], int)
+
+
+def test_matrix_fresh_logs_cleans_all_shadow_logs_before_child_runbook_modes(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+    logs = script.parents[1] / "logs"
+    for name in SHADOW_LOGS:
+        _write_stale_log(logs / name)
+
+    result = _run_matrix_script(
+        script,
+        "-Mode",
+        "xgboost_shadow_outcome",
+        "-Minutes",
+        "5",
+        "-FreshLogs",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    archive = _single_archive_dir(script, "xgboost_shadow_outcome")
+    for name in SHADOW_LOGS:
+        archived = archive / name
+        assert archived.exists()
+        assert "stale_row" in archived.read_text(encoding="utf-8-sig")
+
+    assert not (logs / "isolation_forest_shadow.csv").exists()
+    assert not (logs / "survival_exit_shadow.csv").exists()
+    assert not (logs / "advanced_risk_shadow.csv").exists()
+    xgboost_log = logs / "xgboost_signal_shadow.csv"
+    assert xgboost_log.exists()
+    assert "xgboost_signal_shadow_new_row" in xgboost_log.read_text(encoding="utf-8-sig")
+    assert "stale_row" not in xgboost_log.read_text(encoding="utf-8-sig")
+
+
+def test_matrix_xgboost_fresh_logs_does_not_retain_isolation_shadow_rows(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+    logs = script.parents[1] / "logs"
+    _write_stale_log(logs / "isolation_forest_shadow.csv")
+
+    result = _run_matrix_script(
+        script,
+        "-Mode",
+        "xgboost_shadow_outcome",
+        "-Minutes",
+        "5",
+        "-FreshLogs",
+    )
+    unified = _latest_report(script, "xgboost_shadow_outcome", "unified")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (logs / "isolation_forest_shadow.csv").exists()
+    assert unified["shadow_rows"]["isolation_forest_shadow.csv"] == 0
+    assert unified["shadow_rows"]["xgboost_signal_shadow.csv"] == 1
+
+
+def test_matrix_combined_shadow_fresh_logs_still_writes_all_shadow_logs(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+    logs = script.parents[1] / "logs"
+    for name in SHADOW_LOGS:
+        _write_stale_log(logs / name)
+
+    result = _run_matrix_script(
+        script,
+        "-Mode",
+        "combined_shadow",
+        "-Minutes",
+        "5",
+        "-FreshLogs",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name in SHADOW_LOGS:
+        log_text = (logs / name).read_text(encoding="utf-8-sig")
+        assert f"{Path(name).stem}_new_row" in log_text
+        assert "stale_row" not in log_text
+
+
+def test_matrix_fresh_logs_missing_logs_do_not_fail_child_runbook_modes(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+
+    result = _run_matrix_script(
+        script,
+        "-Mode",
+        "xgboost_shadow_outcome",
+        "-Minutes",
+        "5",
+        "-FreshLogs",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Completed successfully" in result.stdout
+
+
+def test_matrix_fresh_logs_archives_trade_logs_before_child_runbook_modes(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+    logs = script.parents[1] / "logs"
+    trade_logs = [
+        "trades_paper_BTC.csv",
+        "trades_closed.csv",
+        "trades_closed_ETH.csv",
+    ]
+    for name in trade_logs:
+        _write_stale_log(logs / name)
+
+    result = _run_matrix_script(
+        script,
+        "-Mode",
+        "xgboost_shadow_outcome",
+        "-Minutes",
+        "5",
+        "-FreshLogs",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    archive = _single_archive_dir(script, "xgboost_shadow_outcome")
+    for name in trade_logs:
+        assert not (logs / name).exists()
+        archived = archive / name
+        assert archived.exists()
+        assert "stale_row" in archived.read_text(encoding="utf-8-sig")
