@@ -310,3 +310,37 @@ This phase is read-only. It must not:
 - Modify `.env`.
 - Enable blocking, active exits, Advanced Risk active mode, or XGBoost blocking.
 - Enable testnet real orders, mainnet, or `PLACE_REAL_ORDERS`.
+
+---
+
+## Phase 18: Offline Calibration Proposals
+
+Use this read-only tool after Phase 17 to turn the accumulated evidence into
+explicit calibration specifications, review gates, and the next paper-only
+experiment plan:
+
+```powershell
+python tools\offline_calibration_proposals.py --reports-dir reports --logs-dir logs
+python tools\offline_calibration_proposals.py --reports-dir reports --logs-dir logs --json --json-out reports\offline_calibration_proposals.json
+```
+
+Phase 17 JSON is the preferred input. If it is absent or malformed, the tool
+reconstructs the required evidence from current matrix reports and current
+row-level shadow logs. It does not aggregate archived CSV files without a
+safely verified run identity.
+
+The generated `reports/offline_calibration_proposals.json` is local analysis
+output and must remain ignored, untracked, and uncommitted. Do not commit logs,
+archives, generated reports, or model artifacts.
+
+This phase is read-only. It does not retrain, overwrite artifacts, change
+trading behavior, or enable any active, blocking, live, or real-order mode.
+Specifically:
+
+- Do not change `live_writer.py`, `live_executor.py`, or `features.py`.
+- Do not change `FEATURE_COLS` or model/scaler feature columns.
+- Do not retrain in this phase or overwrite model/scaler artifacts.
+- Do not modify `.env`.
+- Do not enable Isolation Forest blocking or XGBoost blocking.
+- Do not enable Survival active mode or Advanced Risk active mode.
+- Do not enable mainnet, testnet real orders, or `PLACE_REAL_ORDERS`.
