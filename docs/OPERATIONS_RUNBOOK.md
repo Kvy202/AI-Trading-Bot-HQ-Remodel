@@ -284,3 +284,29 @@ python tools\calibration_recommendation_report.py --reports-dir reports --logs-d
 
 The report recommends calibration steps only. It must not be used to enable
 live trading, testnet real orders, or `PLACE_REAL_ORDERS`.
+
+---
+
+## Phase 17: Offline Calibration Sweep
+
+Use this read-only tool to aggregate completed matrix runs, measure cross-run
+stability, and simulate offline calibration thresholds from current row-level
+shadow logs:
+
+```powershell
+python tools\offline_calibration_sweep.py --reports-dir reports --logs-dir logs
+python tools\offline_calibration_sweep.py --reports-dir reports --logs-dir logs --json --json-out reports\offline_calibration_sweep.json
+```
+
+The generated `reports/offline_calibration_sweep.json` is local analysis output
+and must remain untracked and uncommitted. Do not commit logs, archives,
+generated reports, or model artifacts.
+
+This phase is read-only. It must not:
+
+- Change trading logic, `live_writer.py`, `live_executor.py`, or `features.py`.
+- Change `FEATURE_COLS` or model/scaler feature columns.
+- Retrain or overwrite model or scaler artifacts.
+- Modify `.env`.
+- Enable blocking, active exits, Advanced Risk active mode, or XGBoost blocking.
+- Enable testnet real orders, mainnet, or `PLACE_REAL_ORDERS`.
