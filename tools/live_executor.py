@@ -465,8 +465,17 @@ def symbol_allowed(symbol: str, whitelist: List[str]) -> bool:
     return not whitelist or symbol in whitelist
 
 
+def _is_strictly_newer_signal_timestamp(candidate: str, previous: str) -> bool:
+    """Compare signal timestamps, preferring UTC instants over raw text."""
+    candidate_epoch = _parse_signal_ts(candidate)
+    previous_epoch = _parse_signal_ts(previous)
+    if candidate_epoch is not None and previous_epoch is not None:
+        return candidate_epoch > previous_epoch
+    return candidate.strip() > previous.strip()
+
+
 def read_recent_signals(path: Path, last_ts: Dict[str, str], window: int) -> List[SignalRow]:
-    """Return at most one most-recent signal per symbol from the last `window` lines."""
+    """Return each symbol's newest signal strictly above its high-water mark."""
     lines = tail_lines(path, window)
     if not lines:
         return []
@@ -475,13 +484,24 @@ def read_recent_signals(path: Path, last_ts: Dict[str, str], window: int) -> Lis
         sig = parse_signal_line(raw)
         if not sig:
             continue
-        
-        if last_ts.get(sig.symbol) == sig.ts:
+
+        previous = last_ts.get(sig.symbol)
+        if previous is not None and not _is_strictly_newer_signal_timestamp(sig.ts, previous):
             continue
-        newest.setdefault(sig.symbol, sig)
+        current = newest.get(sig.symbol)
+        if current is None or _is_strictly_newer_signal_timestamp(sig.ts, current.ts):
+            newest[sig.symbol] = sig
     out = list(newest.values())
     out.sort(key=lambda s: s.ts)
     return out
+
+
+def initialize_signal_high_water_marks(path: Path, window: int) -> Dict[str, str]:
+    """Capture the newest existing signal timestamp for each visible symbol."""
+    return {
+        sig.symbol: sig.ts
+        for sig in read_recent_signals(path, {}, window)
+    }
 
 
 def tail_lines(path: Path, n: int) -> List[str]:
@@ -533,6 +553,10 @@ def _parse_signal_ts(ts_str: str) -> Optional[float]:
     try:
         s = ts_str.strip().replace("+0000", "+00:00")
         dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
         return dt.timestamp()
     except Exception:
         try:
@@ -1404,9 +1428,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                     open_positions=len(positions))
 
     # Drain pre-start signals so a restart never replays stale rows as fresh entries.
-    if signals_path.exists():
-        for _s in read_recent_signals(signals_path, {}, args.tail):
-            last_signal_ts[_s.symbol] = _s.ts
+    last_signal_ts.update(initialize_signal_high_water_marks(signals_path, args.tail))
+    log(f"signal_drain: initialized high-water marks for {len(last_signal_ts)} symbol(s)")
 
     while True:
         try:

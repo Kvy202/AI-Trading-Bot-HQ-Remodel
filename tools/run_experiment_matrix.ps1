@@ -10,7 +10,8 @@ param(
   [string]$Mode,
   [switch]$All,
   [switch]$FreshLogs,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [ValidateRange(0, 300)] [int]$StaleEntryToleranceSeconds = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -146,6 +147,81 @@ function Archive-MatrixLogs([string]$LogsDir, [string]$ModeName, [string]$Stamp)
     Archive-FileIfExists -PathValue $file.FullName -ArchiveDir $archiveDir
   }
   Archive-FileIfExists -PathValue (Join-Path $LogsDir 'trades_closed.csv') -ArchiveDir $archiveDir
+}
+
+function ConvertTo-UtcDateTimeOffset([string]$Value) {
+  if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+  $parsed = [DateTimeOffset]::MinValue
+  $styles = [Globalization.DateTimeStyles]::AllowWhiteSpaces -bor `
+    [Globalization.DateTimeStyles]::AssumeUniversal -bor `
+    [Globalization.DateTimeStyles]::AdjustToUniversal
+  if ([DateTimeOffset]::TryParse(
+      $Value,
+      [Globalization.CultureInfo]::InvariantCulture,
+      $styles,
+      [ref]$parsed
+    )) {
+    return $parsed.ToUniversalTime()
+  }
+  return $null
+}
+
+function Test-MatrixStalePaperEntries {
+  param(
+    [string]$LogsDir,
+    [DateTimeOffset]$RunStartedUtc,
+    [int]$ToleranceSeconds = 5
+  )
+
+  $entryActions = @('BUY', 'SELL_SHORT')
+  $cutoff = $RunStartedUtc.AddSeconds(-[double]$ToleranceSeconds)
+  $contaminated = New-Object System.Collections.Generic.List[object]
+
+  foreach ($file in Get-ChildItem -Path $LogsDir -Filter 'trades_paper_*.csv' -File -ErrorAction SilentlyContinue) {
+    try {
+      $rows = @(Import-Csv -LiteralPath $file.FullName)
+    } catch {
+      Write-Warning ("Could not inspect paper trade file {0}: {1}" -f $file.FullName, $_.Exception.Message)
+      continue
+    }
+
+    foreach ($row in $rows) {
+      $action = [string]$row.side
+      if ([string]::IsNullOrWhiteSpace($action)) {
+        $action = [string]$row.action
+      }
+      $action = $action.Trim().ToUpperInvariant()
+      if ($entryActions -notcontains $action) { continue }
+
+      $timestamp = [string]$row.ts
+      if ([string]::IsNullOrWhiteSpace($timestamp)) {
+        $timestamp = [string]$row.timestamp
+      }
+      $entryUtc = ConvertTo-UtcDateTimeOffset -Value $timestamp
+      if ($null -eq $entryUtc) {
+        Write-Warning ("Could not parse paper entry timestamp as UTC: file={0} timestamp={1}" -f $file.Name, $timestamp)
+        continue
+      }
+
+      if ($entryUtc -lt $cutoff) {
+        $contaminated.Add([pscustomobject]@{
+          signal_id = [string]$row.signal_id
+          timestamp = $timestamp
+          timestamp_utc = $entryUtc.ToString('o')
+          action = $action
+          file = $file.FullName
+        })
+      }
+    }
+  }
+
+  return [pscustomobject]@{
+    checked = $true
+    count = [int]$contaminated.Count
+    signal_ids = @($contaminated | ForEach-Object { $_.signal_id })
+    entries = @($contaminated | ForEach-Object { $_ })
+  }
 }
 
 function Assert-MatrixSelection {
@@ -508,6 +584,7 @@ if ($DryRun) {
     Write-Host "  command: $($plan.command)"
     Write-Host "  forced paper flags: LIVE_TRADING=false PAPER_TRADING=true LIVE_MODE=false EXEC_PAPER=true PLACE_REAL_ORDERS=false"
     Write-Host "  refuses real-order/live mode: true"
+    Write-Host "  stale paper entry guard: enabled (tolerance=$StaleEntryToleranceSeconds second(s))"
     Write-Host "  reports:"
     foreach ($key in $plan.report_paths.Keys) {
       Write-Host ("    {0}: {1}" -f $key, $plan.report_paths[$key])
@@ -522,9 +599,13 @@ New-Item -ItemType Directory -Path $reportsDir -Force | Out-Null
 $results = @()
 foreach ($plan in $plans) {
   $modeName = [string]$plan.mode
-  $started = (Get-Date).ToUniversalTime().ToString('o')
+  $runStartedUtc = [DateTimeOffset]::UtcNow
+  $started = $runStartedUtc.ToString('o')
   $notes = New-Object System.Collections.Generic.List[string]
   $exitStatus = 0
+  $staleEntryGuardChecked = $false
+  $staleEntryCount = 0
+  $staleEntrySignalIds = @()
   Write-Host ""
   Write-Host "[matrix] ===== Mode: $modeName ====="
   try {
@@ -550,7 +631,30 @@ foreach ($plan in $plans) {
         throw "child runbook exited with status $code"
       }
     }
+
+    $staleGuard = Test-MatrixStalePaperEntries `
+      -LogsDir $logsDir `
+      -RunStartedUtc $runStartedUtc `
+      -ToleranceSeconds $StaleEntryToleranceSeconds
+    $staleEntryGuardChecked = [bool]$staleGuard.checked
+    $staleEntryCount = [int]$staleGuard.count
+    $staleEntrySignalIds = @($staleGuard.signal_ids)
+    Write-Host ("[matrix] stale_entry_guard_checked=true stale_entry_count={0}" -f $staleEntryCount)
+
+    if ($staleEntryCount -gt 0) {
+      foreach ($entry in $staleGuard.entries) {
+        $signalId = if ([string]::IsNullOrWhiteSpace([string]$entry.signal_id)) { '<missing>' } else { [string]$entry.signal_id }
+        Write-Host ("[matrix] CONTAMINATED signal_id={0} timestamp={1} file={2}" -f `
+          $signalId, $entry.timestamp, $entry.file) -ForegroundColor Red
+      }
+      $notes.Add('stale_signal_replay_or_prestart_entry_detected')
+      $exitStatus = 1
+    }
+
     Write-MatrixReports -Python $py -LogsDir $logsDir -ReportPaths $plan.report_paths
+    if ($staleEntryCount -gt 0) {
+      throw "stale paper entries detected before mode run start: $staleEntryCount"
+    }
   } catch {
     if ($exitStatus -eq 0) {
       $exitStatus = 1
@@ -559,14 +663,26 @@ foreach ($plan in $plans) {
     Write-Host ("[matrix] FAIL: {0}: {1}" -f $modeName, $_.Exception.Message) -ForegroundColor Red
   }
   $finished = (Get-Date).ToUniversalTime().ToString('o')
+  $evidenceValid = [bool](
+    ($exitStatus -eq 0) -and
+    $staleEntryGuardChecked -and
+    ($staleEntryCount -eq 0)
+  )
+  Write-Host ("[matrix] {0}: run_started_utc={1} stale_entry_count={2} evidence_valid={3}" -f `
+    $modeName, $started, $staleEntryCount, $evidenceValid.ToString().ToLowerInvariant())
   $results += [ordered]@{
     run_timestamp = $started
+    run_started_utc = $started
     finished_at = $finished
     mode = $modeName
     duration_minutes = $Minutes
     command_run = $plan.command
     report_paths = $plan.report_paths
     exit_status = $exitStatus
+    stale_entry_guard_checked = [bool]$staleEntryGuardChecked
+    stale_entry_count = [int]$staleEntryCount
+    stale_entry_signal_ids = @($staleEntrySignalIds)
+    evidence_valid = $evidenceValid
     notes = @($notes)
   }
 }
@@ -579,6 +695,7 @@ $index = [ordered]@{
   duration_minutes = $Minutes
   fresh_logs = [bool]$FreshLogs
   dry_run = [bool]$DryRun
+  stale_entry_tolerance_seconds = $StaleEntryToleranceSeconds
   runs = $results
 }
 $indexPath = Join-Path $reportsDir "matrix_index_${matrixStamp}.json"

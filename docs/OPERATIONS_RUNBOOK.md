@@ -344,3 +344,30 @@ Specifically:
 - Do not enable Isolation Forest blocking or XGBoost blocking.
 - Do not enable Survival active mode or Advanced Risk active mode.
 - Do not enable mainnet, testnet real orders, or `PLACE_REAL_ORDERS`.
+
+---
+
+## Phase 18.1: Stale Signal Replay Protection
+
+The paper executor maintains a monotonic signal high-water mark for each
+symbol. At startup it initializes those marks from the newest visible rows in
+`logs/live_signals.csv`; existing history is drained but is never replayed as
+new trading input. A later row is eligible only when its timestamp is strictly
+newer than that symbol's high-water mark.
+
+The matrix runner records `run_started_utc` for each mode and checks current
+`trades_paper_*.csv` entry rows before accepting reports. A `BUY` or
+`SELL_SHORT` timestamp earlier than the mode start, less the configured clock
+tolerance, fails the mode with the note
+`stale_signal_replay_or_prestart_entry_detected`. The matrix index records
+`stale_entry_guard_checked`, `stale_entry_count`,
+`stale_entry_signal_ids`, and `evidence_valid`; contaminated evidence always
+has `evidence_valid=false`.
+
+Contaminated paper reports and logs are retained unchanged for audit. The
+`-FreshLogs` option archives the matrix trade and shadow logs; it does not mean
+that `logs/live_signals.csv` is deleted or reset.
+
+This protection is paper-only. It does not enable active or blocking modules,
+testnet or mainnet orders, real-order mode, or `PLACE_REAL_ORDERS`; those modes
+remain disabled.
