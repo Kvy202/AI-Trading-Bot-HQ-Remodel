@@ -55,6 +55,9 @@ model_artifacts/*.joblib
 # Generated experiment reports
 reports/*.json
 
+# Generated deterministic replay bundles (Phase 20)
+reports/replay_bundles/
+
 
 # Generated experiment reports
 reports/*.json

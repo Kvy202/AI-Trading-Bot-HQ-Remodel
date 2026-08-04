@@ -250,6 +250,99 @@ function Get-MatrixReportPaths([string]$ReportsDir, [string]$ModeName, [string]$
   return $paths
 }
 
+function Get-ReplayPaths([string]$ReportsDir, [string]$ModeName, [string]$Stamp) {
+  return [ordered]@{
+    contract = Join-Path $ReportsDir "matrix_${ModeName}_${Stamp}_replay_contract.json"
+    bundle = Join-Path (Join-Path $ReportsDir 'replay_bundles') "${ModeName}_${Stamp}"
+  }
+}
+
+function Get-ReplayExperimentMode([string]$ModeName) {
+  switch ($ModeName) {
+    'advanced_risk_shadow' { return 'advanced_risk_shadow_placeholder' }
+    'survival_active' { return 'survival_shadow' }
+    default { return $ModeName }
+  }
+}
+
+function Get-ReplayForcedEnv([string]$Python, [string]$Root, [string]$ModeName) {
+  $contractMode = Get-ReplayExperimentMode -ModeName $ModeName
+  $overrides = Get-ForcedPaperEnv -Python $Python -Root $Root -ModeName $contractMode
+  if ($ModeName -eq 'survival_active') {
+    $overrides['SURVIVAL_EXIT_ACTIVE'] = 'true'
+  }
+  if ($ModeName -eq 'advanced_risk_shadow') {
+    $overrides['USE_ADVANCED_RISK'] = 'true'
+    $overrides['ADVANCED_RISK_ACTIVE'] = 'false'
+  }
+  return ,$overrides
+}
+
+function Invoke-ReplayContractCapture {
+  param(
+    [string]$Python,
+    [string]$Root,
+    [string]$LogsDir,
+    [string]$Identity,
+    [string]$ModeName,
+    [DateTimeOffset]$RunStartedUtc,
+    [DateTimeOffset]$ExpectedFinishedUtc,
+    [string]$ContractPath
+  )
+
+  $forced = Get-ReplayForcedEnv -Python $Python -Root $Root -ModeName $ModeName
+  $forcedPath = Join-Path $LogsDir "matrix_${ModeName}_replay_forced_env.json"
+  Set-Content -Path $forcedPath -Value ($forced | ConvertTo-Json -Depth 4) -Encoding UTF8
+  $raw = & $Python "tools\replay_contract.py" capture `
+    --identity $Identity `
+    --mode $ModeName `
+    --forced-env-json $forcedPath `
+    --base-dir $Root `
+    --run-started-utc $RunStartedUtc.ToString('o') `
+    --expected-finished-at $ExpectedFinishedUtc.ToString('o') `
+    --json-out $ContractPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "replay contract safety validation failed: $raw"
+  }
+  $contract = Get-Content -LiteralPath $ContractPath -Raw | ConvertFrom-Json
+  return [pscustomobject]@{
+    path = $ContractPath
+    digest = [string]$contract.contract_digest
+    status = 'exact_matrix_snapshot'
+  }
+}
+
+function Invoke-ReplayBundleCapture {
+  param(
+    [string]$Python,
+    [string]$Identity,
+    [string]$RunStartedUtc,
+    [string]$FinishedAt,
+    [string]$ContractPath,
+    [string]$ReportsDir,
+    [string]$LogsDir,
+    [string]$BundleRoot
+  )
+
+  $raw = & $Python "tools\replay_bundle.py" build `
+    --identity $Identity `
+    --run-started-utc $RunStartedUtc `
+    --finished-at $FinishedAt `
+    --contract $ContractPath `
+    --reports-dir $ReportsDir `
+    --logs-dir $LogsDir `
+    --bundle-root $BundleRoot
+  if ($LASTEXITCODE -ne 0) {
+    throw "replay bundle capture failed: $raw"
+  }
+  $bundle = $raw | Select-Object -Last 1 | ConvertFrom-Json
+  return [pscustomobject]@{
+    path = [string]$bundle.bundle_path
+    digest = [string]$bundle.bundle_digest
+    status = 'exact_bundle'
+  }
+}
+
 function Get-ModePlan([string]$ModeName, [int]$Duration, [string]$ScriptDir, [string]$ReportsDir, [string]$Stamp) {
   $hasAudit = $false
   if ($RunbookModes.ContainsKey($ModeName)) {
@@ -269,6 +362,7 @@ function Get-ModePlan([string]$ModeName, [int]$Duration, [string]$ScriptDir, [st
       args = $args
       command = $command
       report_paths = Get-MatrixReportPaths -ReportsDir $ReportsDir -ModeName $ModeName -Stamp $Stamp -HasAudit $hasAudit
+      replay_paths = Get-ReplayPaths -ReportsDir $ReportsDir -ModeName $ModeName -Stamp $Stamp
     }
   }
 
@@ -282,6 +376,7 @@ function Get-ModePlan([string]$ModeName, [int]$Duration, [string]$ScriptDir, [st
     args = @()
     command = $command
     report_paths = Get-MatrixReportPaths -ReportsDir $ReportsDir -ModeName $ModeName -Stamp $Stamp -HasAudit $false
+    replay_paths = Get-ReplayPaths -ReportsDir $ReportsDir -ModeName $ModeName -Stamp $Stamp
   }
 }
 
@@ -585,6 +680,9 @@ if ($DryRun) {
     Write-Host "  forced paper flags: LIVE_TRADING=false PAPER_TRADING=true LIVE_MODE=false EXEC_PAPER=true PLACE_REAL_ORDERS=false"
     Write-Host "  refuses real-order/live mode: true"
     Write-Host "  stale paper entry guard: enabled (tolerance=$StaleEntryToleranceSeconds second(s))"
+    Write-Host "  replay contract: $($plan.replay_paths.contract)"
+    Write-Host "  replay bundle: $($plan.replay_paths.bundle)"
+    Write-Host "  replay capture creates files in non-dry-run mode only: true"
     Write-Host "  reports:"
     foreach ($key in $plan.report_paths.Keys) {
       Write-Host ("    {0}: {1}" -f $key, $plan.report_paths[$key])
@@ -601,6 +699,15 @@ foreach ($plan in $plans) {
   $modeName = [string]$plan.mode
   $runStartedUtc = [DateTimeOffset]::UtcNow
   $started = $runStartedUtc.ToString('o')
+  $expectedFinishedUtc = $runStartedUtc.AddMinutes([double]$Minutes)
+  $finished = $null
+  $replayIdentity = "${modeName}:${matrixStamp}"
+  $replayContractPath = [string]$plan.replay_paths.contract
+  $replayContractDigest = $null
+  $replayContractStatus = 'not_captured'
+  $replayBundlePath = [string]$plan.replay_paths.bundle
+  $replayBundleDigest = $null
+  $replayBundleStatus = 'not_captured'
   $notes = New-Object System.Collections.Generic.List[string]
   $exitStatus = 0
   $staleEntryGuardChecked = $false
@@ -609,6 +716,26 @@ foreach ($plan in $plans) {
   Write-Host ""
   Write-Host "[matrix] ===== Mode: $modeName ====="
   try {
+    try {
+      $contractCapture = Invoke-ReplayContractCapture `
+        -Python $py `
+        -Root $root `
+        -LogsDir $logsDir `
+        -Identity $replayIdentity `
+        -ModeName $modeName `
+        -RunStartedUtc $runStartedUtc `
+        -ExpectedFinishedUtc $expectedFinishedUtc `
+        -ContractPath $replayContractPath
+      $replayContractPath = [string]$contractCapture.path
+      $replayContractDigest = [string]$contractCapture.digest
+      $replayContractStatus = [string]$contractCapture.status
+      Write-Host ("[matrix] replay_contract_status={0} digest={1}" -f `
+        $replayContractStatus, $replayContractDigest)
+    } catch {
+      $replayContractStatus = 'failed'
+      throw
+    }
+
     if ($FreshLogs) {
       Archive-MatrixLogs -LogsDir $logsDir -ModeName $modeName -Stamp $matrixStamp
       $notes.Add('fresh logs archived at matrix level')
@@ -652,6 +779,30 @@ foreach ($plan in $plans) {
     }
 
     Write-MatrixReports -Python $py -LogsDir $logsDir -ReportPaths $plan.report_paths
+    $finished = (Get-Date).ToUniversalTime().ToString('o')
+
+    try {
+      $bundleCapture = Invoke-ReplayBundleCapture `
+        -Python $py `
+        -Identity $replayIdentity `
+        -RunStartedUtc $started `
+        -FinishedAt $finished `
+        -ContractPath $replayContractPath `
+        -ReportsDir $reportsDir `
+        -LogsDir $logsDir `
+        -BundleRoot (Join-Path $reportsDir 'replay_bundles')
+      $replayBundlePath = [string]$bundleCapture.path
+      $replayBundleDigest = [string]$bundleCapture.digest
+      $replayBundleStatus = [string]$bundleCapture.status
+      Write-Host ("[matrix] replay_bundle_status={0} digest={1}" -f `
+        $replayBundleStatus, $replayBundleDigest)
+    } catch {
+      $replayBundleStatus = 'failed'
+      $notes.Add('replay_bundle_capture_failed')
+      $exitStatus = 1
+      throw
+    }
+
     if ($staleEntryCount -gt 0) {
       throw "stale paper entries detected before mode run start: $staleEntryCount"
     }
@@ -662,7 +813,9 @@ foreach ($plan in $plans) {
     $notes.Add([string]$_.Exception.Message)
     Write-Host ("[matrix] FAIL: {0}: {1}" -f $modeName, $_.Exception.Message) -ForegroundColor Red
   }
-  $finished = (Get-Date).ToUniversalTime().ToString('o')
+  if ([string]::IsNullOrWhiteSpace([string]$finished)) {
+    $finished = (Get-Date).ToUniversalTime().ToString('o')
+  }
   $evidenceValid = [bool](
     ($exitStatus -eq 0) -and
     $staleEntryGuardChecked -and
@@ -683,6 +836,12 @@ foreach ($plan in $plans) {
     stale_entry_count = [int]$staleEntryCount
     stale_entry_signal_ids = @($staleEntrySignalIds)
     evidence_valid = $evidenceValid
+    replay_contract_path = $replayContractPath
+    replay_contract_digest = $replayContractDigest
+    replay_contract_status = $replayContractStatus
+    replay_bundle_path = $replayBundlePath
+    replay_bundle_digest = $replayBundleDigest
+    replay_bundle_status = $replayBundleStatus
     notes = @($notes)
   }
 }

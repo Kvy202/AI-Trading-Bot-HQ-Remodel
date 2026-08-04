@@ -140,8 +140,19 @@ def _make_fake_matrix_repo(tmp_path: Path, child_exit: int) -> Path:
     tools.mkdir(parents=True)
     (root / "logs").mkdir()
     (root / "reports").mkdir()
+    (root / "config").mkdir()
+    (root / "v2").mkdir()
+    (root / "research").mkdir()
 
     shutil.copy2(SCRIPT, tools / "run_experiment_matrix.ps1")
+    for helper in ("replay_contract.py", "replay_bundle.py", "evidence_manifest.py"):
+        shutil.copy2(ROOT / "tools" / helper, tools / helper)
+    (tools / "live_executor.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "v2" / "risk_controls.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "config" / "run.json").write_text("{}", encoding="utf-8")
+    (root / "research" / "evidence_overrides.json").write_text(
+        '{"schema_version":1,"overrides":{}}', encoding="utf-8"
+    )
     (tools / "apply_experiment_mode.ps1").write_text(
         "\n".join(
             [
@@ -358,6 +369,10 @@ def test_matrix_combined_shadow_success_records_zero_child_exit(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert index["runs"][0]["mode"] == "combined_shadow"
     assert index["runs"][0]["exit_status"] == 0
+    assert index["runs"][0]["replay_contract_status"] == "exact_matrix_snapshot"
+    assert index["runs"][0]["replay_bundle_status"] == "exact_bundle"
+    assert index["runs"][0]["replay_contract_digest"]
+    assert index["runs"][0]["replay_bundle_digest"]
 
 
 def test_matrix_index_exit_status_is_numeric_not_child_output(tmp_path):

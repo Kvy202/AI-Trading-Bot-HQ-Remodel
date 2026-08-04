@@ -436,3 +436,66 @@ Phase 19 changes no trading behavior, model/scaler artifact, feature columns,
 runtime configuration, fee/slippage assumption, threshold, risk rule, or
 position sizing. It does not activate blocking modules, start writers or
 executors, run counterfactual replay, or enable testnet/mainnet real orders.
+
+---
+
+## Phase 20 — Deterministic Counterfactual Replay
+
+Phase 20 reconstructs completed Phase 19 experiment windows offline and
+replays the paper executor against the recorded signal ticks. It uses each
+signal row's recorded price; candle high/low data and future rows are never
+used for a current decision. The tool does not initialize an exchange adapter,
+load a trading model, start a writer or executor, or place paper, testnet, or
+mainnet orders.
+
+Inventory the Phase 19 strategy identities without executing trade lifecycles:
+
+```powershell
+python tools\counterfactual_replay.py --all-strategy-runs --inventory-only --json-out reports\counterfactual_replay_inventory.json
+```
+
+Run one eligible identity or every strategy identity:
+
+```powershell
+python tools\counterfactual_replay.py --identity xgboost_shadow_outcome:20260803161821 --json-out reports\counterfactual_replay_20260803161821.json
+python tools\counterfactual_replay.py --all-strategy-runs --json-out reports\counterfactual_replay.json
+```
+
+The replay contract captures only effective, non-secret executor settings. Its
+priority is `config/run.json`, then `.env` loaded in memory, then the explicit
+matrix-mode overrides. Credentials, wallet data, environment dumps, local
+paths, and executable commands are not contract fields. A historical `.env`
+is never inferred from the current `.env`: historical runs remain
+`contract_missing` unless an exact matrix snapshot exists or a complete,
+independently verified contract is added to
+`research/replay_contract_overrides.json` with `reviewed: true`.
+
+Future accepted matrix modes capture the contract before processes start and
+copy only their in-window evidence into
+`reports/replay_bundles/<mode>_<timestamp>/` after processes stop. Source rows
+remain untouched. Archive directory names are inventory hints only, not run
+identities; historical resolution uses the Phase 19 window, exact `signal_id`,
+symbol, timestamp, reported counts, and canonical row digests. XGBoost joins
+are by `signal_id` only. Missing IDs are recorded and excluded, timestamp
+fallback is prohibited, and conflicting decisions fail closed.
+
+Baseline replay must match recorded paper entries, closes, and final open
+state before counterfactual output can become evidence-grade. Open positions
+at the end of the window are censored and receive no realized PnL; they are
+never force-closed. Zero closes are not testable, and one exact closed-trade
+match is only a mechanical check. Promotion-grade parity requires at least ten
+exact matched closes plus complete source coverage and a parity-grade contract.
+
+The portfolio output includes the shadow baseline, XGBoost-confirm-only, and
+research-only XGBoost-reject-only policies. Independent confirmed/rejected
+decision cohorts overlap by design and are explicitly non-additive; their
+outcomes must not be summed into a portfolio PnL claim. A positive cohort
+difference is not a significance claim.
+
+Generated contracts, bundles, inventories, and counterfactual reports remain
+ignored analysis artifacts. Counterfactual results do not enter the Phase 17
+or Phase 18 promotion gates. Isolation Forest blocking, XGBoost blocking,
+Survival active exits, Advanced Risk active actions, position restoration,
+and live or real-order modes remain disabled. Missing configuration, failed
+coverage, unresolved adaptive/bias state, unsupported active behavior, or
+failed parity leaves the result exploratory or excluded.
