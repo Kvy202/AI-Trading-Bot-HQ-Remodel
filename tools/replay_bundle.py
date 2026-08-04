@@ -27,6 +27,10 @@ try:
         load_replay_contract,
         replay_contract_digest,
     )
+    from tools.model_serving_snapshot import (
+        ModelServingSnapshotError,
+        load_model_serving_snapshot,
+    )
 except ModuleNotFoundError:
     from evidence_manifest import build_evidence_manifest, evidence_manifest_digest  # type: ignore
     from replay_contract import (  # type: ignore
@@ -35,6 +39,10 @@ except ModuleNotFoundError:
         ReplayContractError,
         load_replay_contract,
         replay_contract_digest,
+    )
+    from model_serving_snapshot import (  # type: ignore
+        ModelServingSnapshotError,
+        load_model_serving_snapshot,
     )
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -49,6 +57,7 @@ CSV_NAMES = {
     "paper": "trades_paper.csv",
     "closed": "trades_closed.csv",
 }
+MODEL_OUTPUT_NAMES = ("live_models_by_symbol.csv", "live_meta_log.csv")
 TIMESTAMP_COLUMNS = {
     "signals": ("ts", "timestamp"),
     "xgboost": ("timestamp", "ts"),
@@ -324,6 +333,103 @@ def collect_source_rows(
     }
 
 
+def _collect_model_output_file(path: Path, start: datetime, finish: datetime) -> dict[str, Any]:
+    """Filter one model-output CSV and enforce timestamp+symbol consistency."""
+
+    rows: list[tuple[dict[str, str], int]] = []
+    seen_exact: set[str] = set()
+    logical: dict[tuple[str, str], str] = {}
+    duplicate_count = 0
+    conflicts: list[dict[str, Any]] = []
+    malformed = 0
+    columns: list[str] = []
+    if not path.is_file():
+        return {"rows": [], "duplicate_count": 0, "conflicts": [], "malformed": 0,
+                "columns": [], "source_digest": None}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        columns = list(reader.fieldnames or [])
+        if not columns:
+            raise ReplayBundleError(f"CSV header missing: {path}")
+        for order, raw in enumerate(reader):
+            row = _normalized_row(raw)
+            timestamp_text = str(row.get("ts", row.get("timestamp", "")) or "").strip()
+            timestamp = parse_timestamp(timestamp_text)
+            if timestamp is None:
+                malformed += 1
+                continue
+            if not (start <= timestamp <= finish):
+                continue
+            digest = canonical_row_digest(row)
+            if digest in seen_exact:
+                duplicate_count += 1
+                continue
+            seen_exact.add(digest)
+            symbol = str(row.get("symbol", "__pooled__") or "__pooled__").strip()
+            key = (canonical_timestamp(timestamp_text) or timestamp_text, symbol)
+            previous = logical.get(key)
+            if previous is not None and previous != digest:
+                conflicts.append({"file": path.name, "timestamp": key[0], "symbol": symbol,
+                                  "first_digest": previous, "conflicting_digest": digest})
+                continue
+            logical[key] = digest
+            rows.append((row, order))
+    rows.sort(key=lambda item: (
+        parse_timestamp(item[0].get("ts", item[0].get("timestamp", "")))
+        or datetime.min.replace(tzinfo=timezone.utc), item[1]))
+    return {
+        "rows": [row for row, _ in rows],
+        "duplicate_count": duplicate_count,
+        "conflicts": conflicts,
+        "malformed": malformed,
+        "columns": columns,
+        "source_digest": _sha256_source_text_file(path),
+    }
+
+
+def collect_model_output_rows(
+    logs_dir: Path | str, run_started_utc: str, finished_at: str
+) -> dict[str, Any]:
+    logs = Path(logs_dir)
+    start = parse_timestamp(run_started_utc)
+    finish = parse_timestamp(finished_at)
+    if start is None or finish is None or finish < start:
+        raise ReplayBundleError("invalid model-output filtering window")
+    files = {
+        name: _collect_model_output_file(logs / name, start, finish)
+        for name in MODEL_OUTPUT_NAMES
+    }
+    rows = [row for item in files.values() for row in item["rows"]]
+    timestamps = sorted(
+        value for row in rows
+        if (value := parse_timestamp(row.get("ts", row.get("timestamp", "")))) is not None
+    )
+    rows_by_symbol = Counter(
+        str(row.get("symbol", "__pooled__") or "__pooled__") for row in rows
+    )
+    columns = sorted({column for item in files.values() for column in item["columns"]})
+    normalized = {
+        name: [canonical_row_digest(row) for row in item["rows"]]
+        for name, item in files.items()
+    }
+    return {
+        "files": files,
+        "model_output_row_count": len(rows),
+        "model_output_rows_by_symbol": dict(sorted(rows_by_symbol.items())),
+        "model_output_first_timestamp": None if not timestamps else timestamps[0].isoformat().replace("+00:00", "Z"),
+        "model_output_last_timestamp": None if not timestamps else timestamps[-1].isoformat().replace("+00:00", "Z"),
+        "model_output_columns": columns,
+        "model_output_digest": _json_digest(normalized),
+        "model_output_duplicate_count": sum(item["duplicate_count"] for item in files.values()),
+        "model_output_conflict_count": sum(len(item["conflicts"]) for item in files.values()),
+        "conflicts": [conflict for item in files.values() for conflict in item["conflicts"]],
+        "source_file_digests": {
+            f"model_output/{name}": item["source_digest"]
+            for name, item in files.items() if item["source_digest"] is not None
+        },
+    }
+
+
 def calculate_coverage(
     rows_by_kind: Mapping[str, Sequence[Mapping[str, Any]]],
     run_started_utc: str,
@@ -510,7 +616,17 @@ def bundle_digest(manifest: Mapping[str, Any]) -> str:
             "duplicate_rows_removed",
             "conflicting_rows",
             "coverage_checks",
+            "model_serving_snapshot_digest",
+            "model_output_row_count",
+            "model_output_rows_by_symbol",
+            "model_output_first_timestamp",
+            "model_output_last_timestamp",
+            "model_output_columns",
+            "model_output_digest",
+            "model_output_duplicate_count",
+            "model_output_conflict_count",
         )
+        if key in manifest
     }
     return _json_digest(relevant)
 
@@ -524,6 +640,7 @@ def build_replay_bundle(
     reports_dir: Path | str = DEFAULT_REPORTS_DIR,
     logs_dir: Path | str = DEFAULT_LOGS_DIR,
     bundle_root: Path | str = DEFAULT_BUNDLE_ROOT,
+    model_serving_snapshot_path: Path | str | None = None,
     manifest_digest_value: Optional[str] = None,
     max_start_delay_seconds: float = 120.0,
     max_end_delay_seconds: float = 120.0,
@@ -547,8 +664,11 @@ def build_replay_bundle(
 
     try:
         sources = collect_source_rows(logs, run_started_utc, finished_at)
+        model_outputs = collect_model_output_rows(logs, run_started_utc, finished_at)
         if sources["conflicting_rows"]:
             raise ReplayBundleError("conflicting logical source rows prevent bundle capture")
+        if model_outputs["conflicts"]:
+            raise ReplayBundleError("conflicting timestamp/symbol model output rows prevent bundle capture")
         rows_by_kind = {
             kind: item["rows"] for kind, item in sources["kinds"].items()
         }
@@ -570,10 +690,22 @@ def build_replay_bundle(
             rows = rows_by_kind[kind]
             if rows:
                 filtered_digests[output_name] = _write_rows(stage / output_name, rows)
+        for output_name, item in model_outputs["files"].items():
+            if item["rows"]:
+                filtered_digests[output_name] = _write_rows(stage / output_name, item["rows"])
         contract_copy = dict(contract)
         contract_copy_path = stage / "replay_contract.json"
         contract_copy_path.write_text(json.dumps(contract_copy, indent=2), encoding="utf-8")
         filtered_digests["replay_contract.json"] = _sha256_file(contract_copy_path)
+        snapshot_digest_value: Optional[str] = None
+        if model_serving_snapshot_path is not None:
+            snapshot = load_model_serving_snapshot(model_serving_snapshot_path)
+            if snapshot.get("identity") != identity:
+                raise ReplayBundleError("model-serving snapshot identity does not match bundle identity")
+            snapshot_copy = stage / "model_serving_snapshot.json"
+            snapshot_copy.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            filtered_digests["model_serving_snapshot.json"] = _sha256_file(snapshot_copy)
+            snapshot_digest_value = str(snapshot["snapshot_digest"])
         filtered_digests.update(_copy_relevant_logs(logs, stage, mode))
 
         if manifest_digest_value is None:
@@ -597,7 +729,10 @@ def build_replay_bundle(
             "finished_at": canonical_timestamp(finished_at),
             "manifest_digest": manifest_digest_value,
             "replay_contract_digest": replay_contract_digest(contract),
-            "source_file_digests": sources["source_file_digests"],
+            "source_file_digests": dict(sorted({
+                **sources["source_file_digests"],
+                **model_outputs["source_file_digests"],
+            }.items())),
             "filtered_file_digests": dict(sorted(filtered_digests.items())),
             "row_counts": {kind: len(rows) for kind, rows in rows_by_kind.items()},
             "first_timestamp": first_timestamp,
@@ -605,6 +740,15 @@ def build_replay_bundle(
             "duplicate_rows_removed": sources["duplicate_rows_removed"],
             "conflicting_rows": [],
             "coverage_checks": coverage,
+            "model_serving_snapshot_digest": snapshot_digest_value,
+            "model_output_row_count": model_outputs["model_output_row_count"],
+            "model_output_rows_by_symbol": model_outputs["model_output_rows_by_symbol"],
+            "model_output_first_timestamp": model_outputs["model_output_first_timestamp"],
+            "model_output_last_timestamp": model_outputs["model_output_last_timestamp"],
+            "model_output_columns": model_outputs["model_output_columns"],
+            "model_output_digest": model_outputs["model_output_digest"],
+            "model_output_duplicate_count": model_outputs["model_output_duplicate_count"],
+            "model_output_conflict_count": model_outputs["model_output_conflict_count"],
         }
         manifest["bundle_digest"] = bundle_digest(manifest)
         (stage / "bundle_manifest.json").write_text(
@@ -635,6 +779,18 @@ def _read_bundle_rows(bundle_dir: Path) -> dict[str, list[dict[str, str]]]:
     return result
 
 
+def _read_bundle_model_rows(bundle_dir: Path) -> dict[str, list[dict[str, str]]]:
+    result: dict[str, list[dict[str, str]]] = {}
+    for name in MODEL_OUTPUT_NAMES:
+        path = bundle_dir / name
+        if not path.is_file() or path.stat().st_size == 0:
+            result[name] = []
+            continue
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            result[name] = [_normalized_row(row) for row in csv.DictReader(handle)]
+    return result
+
+
 def validate_replay_bundle(bundle_dir: Path | str) -> dict[str, Any]:
     root = Path(bundle_dir)
     manifest_path = root / "bundle_manifest.json"
@@ -661,8 +817,19 @@ def validate_replay_bundle(bundle_dir: Path | str) -> dict[str, Any]:
         "coverage_checks",
         "bundle_digest",
     }
+    optional_fields = {
+        "model_serving_snapshot_digest",
+        "model_output_row_count",
+        "model_output_rows_by_symbol",
+        "model_output_first_timestamp",
+        "model_output_last_timestamp",
+        "model_output_columns",
+        "model_output_digest",
+        "model_output_duplicate_count",
+        "model_output_conflict_count",
+    }
     missing = required_fields - set(manifest)
-    unknown = set(manifest) - required_fields
+    unknown = set(manifest) - required_fields - optional_fields
     if missing or unknown:
         raise ReplayBundleError(
             f"bundle manifest fields invalid; missing={sorted(missing)} unknown={sorted(unknown)}"
@@ -679,6 +846,8 @@ def validate_replay_bundle(bundle_dir: Path | str) -> dict[str, Any]:
         raise ReplayBundleError("bundle filtered_file_digests are invalid")
     allowed_files = set(CSV_NAMES.values()) | {
         "replay_contract.json",
+        "model_serving_snapshot.json",
+        *MODEL_OUTPUT_NAMES,
         "executor_stdout.log",
         "executor_stderr.log",
         "writer_stdout.log",
@@ -704,6 +873,13 @@ def validate_replay_bundle(bundle_dir: Path | str) -> dict[str, Any]:
         manifest.get("run_started_utc")
     ):
         raise ReplayBundleError("bundle replay contract start time mismatch")
+    snapshot_path = root / "model_serving_snapshot.json"
+    if snapshot_path.is_file():
+        snapshot = load_model_serving_snapshot(snapshot_path)
+        if snapshot.get("identity") != manifest.get("identity"):
+            raise ReplayBundleError("bundle model-serving snapshot identity mismatch")
+        if snapshot.get("snapshot_digest") != manifest.get("model_serving_snapshot_digest"):
+            raise ReplayBundleError("bundle model-serving snapshot digest mismatch")
     rows = _read_bundle_rows(root)
     row_counts = manifest.get("row_counts")
     first_timestamps = manifest.get("first_timestamp")
@@ -735,10 +911,47 @@ def validate_replay_bundle(bundle_dir: Path | str) -> dict[str, Any]:
         actual_last = None if not ordered else ordered[-1].isoformat().replace("+00:00", "Z")
         if first_timestamps.get(kind) != actual_first or last_timestamps.get(kind) != actual_last:
             raise ReplayBundleError(f"bundle timestamp inventory mismatch: {kind}")
+    model_rows = _read_bundle_model_rows(root)
+    if any(name in filtered for name in MODEL_OUTPUT_NAMES):
+        total = sum(len(values) for values in model_rows.values())
+        if manifest.get("model_output_row_count") != total:
+            raise ReplayBundleError("bundle model-output row count mismatch")
+        seen_by_file: dict[str, dict[tuple[str, str], str]] = {}
+        timestamps: list[datetime] = []
+        normalized: dict[str, list[str]] = {}
+        rows_by_symbol: Counter[str] = Counter()
+        for name, values in model_rows.items():
+            seen: dict[tuple[str, str], str] = {}
+            normalized[name] = []
+            for row in values:
+                timestamp_text = row.get("ts", row.get("timestamp", ""))
+                timestamp = parse_timestamp(timestamp_text)
+                if timestamp is None or not (start <= timestamp <= finish):
+                    raise ReplayBundleError("bundle model-output row outside filtering window")
+                symbol = str(row.get("symbol", "__pooled__") or "__pooled__")
+                digest = canonical_row_digest(row)
+                key = (canonical_timestamp(timestamp_text) or str(timestamp_text), symbol)
+                if key in seen:
+                    raise ReplayBundleError("duplicate or conflicting model-output logical row retained")
+                seen[key] = digest
+                normalized[name].append(digest)
+                rows_by_symbol[symbol] += 1
+                timestamps.append(timestamp)
+            seen_by_file[name] = seen
+        ordered = sorted(timestamps)
+        first_model = None if not ordered else ordered[0].isoformat().replace("+00:00", "Z")
+        last_model = None if not ordered else ordered[-1].isoformat().replace("+00:00", "Z")
+        if manifest.get("model_output_first_timestamp") != first_model or manifest.get("model_output_last_timestamp") != last_model:
+            raise ReplayBundleError("bundle model-output timestamp inventory mismatch")
+        if manifest.get("model_output_rows_by_symbol") != dict(sorted(rows_by_symbol.items())):
+            raise ReplayBundleError("bundle model-output symbol inventory mismatch")
+        if manifest.get("model_output_digest") != _json_digest(normalized):
+            raise ReplayBundleError("bundle model-output digest mismatch")
     return {
         "status": "exact_bundle",
         "manifest": manifest,
         "rows": rows,
+        "model_output_rows": model_rows,
         "bundle_digest": expected_bundle,
     }
 
@@ -870,6 +1083,7 @@ def _build_parser() -> argparse.ArgumentParser:
     build.add_argument("--logs-dir", default=str(DEFAULT_LOGS_DIR))
     build.add_argument("--bundle-root", default=str(DEFAULT_BUNDLE_ROOT))
     build.add_argument("--manifest-digest")
+    build.add_argument("--model-serving-snapshot")
     validate = sub.add_parser("validate")
     validate.add_argument("--bundle", required=True)
     return parser
@@ -888,6 +1102,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 logs_dir=args.logs_dir,
                 bundle_root=args.bundle_root,
                 manifest_digest_value=args.manifest_digest,
+                model_serving_snapshot_path=args.model_serving_snapshot,
             )
         else:
             result = validate_replay_bundle(args.bundle)
@@ -897,7 +1112,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
         print(json.dumps(result, default=str))
         return 0
-    except (ReplayBundleError, ReplayContractError, OSError) as exc:
+    except (ReplayBundleError, ReplayContractError, ModelServingSnapshotError, OSError) as exc:
         print(f"replay_bundle_error: {exc}")
         return 1
 

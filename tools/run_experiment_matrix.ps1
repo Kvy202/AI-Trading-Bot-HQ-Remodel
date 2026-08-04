@@ -253,6 +253,7 @@ function Get-MatrixReportPaths([string]$ReportsDir, [string]$ModeName, [string]$
 function Get-ReplayPaths([string]$ReportsDir, [string]$ModeName, [string]$Stamp) {
   return [ordered]@{
     contract = Join-Path $ReportsDir "matrix_${ModeName}_${Stamp}_replay_contract.json"
+    model_snapshot = Join-Path $ReportsDir "matrix_${ModeName}_${Stamp}_model_serving_snapshot.json"
     bundle = Join-Path (Join-Path $ReportsDir 'replay_bundles') "${ModeName}_${Stamp}"
   }
 }
@@ -319,6 +320,7 @@ function Invoke-ReplayBundleCapture {
     [string]$RunStartedUtc,
     [string]$FinishedAt,
     [string]$ContractPath,
+    [string]$ModelServingSnapshotPath,
     [string]$ReportsDir,
     [string]$LogsDir,
     [string]$BundleRoot
@@ -329,6 +331,7 @@ function Invoke-ReplayBundleCapture {
     --run-started-utc $RunStartedUtc `
     --finished-at $FinishedAt `
     --contract $ContractPath `
+    --model-serving-snapshot $ModelServingSnapshotPath `
     --reports-dir $ReportsDir `
     --logs-dir $LogsDir `
     --bundle-root $BundleRoot
@@ -340,6 +343,36 @@ function Invoke-ReplayBundleCapture {
     path = [string]$bundle.bundle_path
     digest = [string]$bundle.bundle_digest
     status = 'exact_bundle'
+  }
+}
+
+function Invoke-ModelServingSnapshotCapture {
+  param(
+    [string]$Python,
+    [string]$Root,
+    [string]$LogsDir,
+    [string]$Identity,
+    [string]$ModeName,
+    [string]$SnapshotPath
+  )
+
+  $forced = Get-ReplayForcedEnv -Python $Python -Root $Root -ModeName $ModeName
+  $forcedPath = Join-Path $LogsDir "matrix_${ModeName}_model_serving_forced_env.json"
+  Set-Content -Path $forcedPath -Value ($forced | ConvertTo-Json -Depth 4) -Encoding UTF8
+  $raw = & $Python "tools\model_serving_snapshot.py" `
+    --identity $Identity `
+    --mode $ModeName `
+    --forced-env-json $forcedPath `
+    --base-dir $Root `
+    --json-out $SnapshotPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "model-serving snapshot safety validation failed: $raw"
+  }
+  $snapshot = Get-Content -LiteralPath $SnapshotPath -Raw | ConvertFrom-Json
+  return [pscustomobject]@{
+    path = $SnapshotPath
+    digest = [string]$snapshot.snapshot_digest
+    status = 'exact_matrix_snapshot'
   }
 }
 
@@ -681,6 +714,7 @@ if ($DryRun) {
     Write-Host "  refuses real-order/live mode: true"
     Write-Host "  stale paper entry guard: enabled (tolerance=$StaleEntryToleranceSeconds second(s))"
     Write-Host "  replay contract: $($plan.replay_paths.contract)"
+    Write-Host "  model-serving snapshot: $($plan.replay_paths.model_snapshot)"
     Write-Host "  replay bundle: $($plan.replay_paths.bundle)"
     Write-Host "  replay capture creates files in non-dry-run mode only: true"
     Write-Host "  reports:"
@@ -705,6 +739,9 @@ foreach ($plan in $plans) {
   $replayContractPath = [string]$plan.replay_paths.contract
   $replayContractDigest = $null
   $replayContractStatus = 'not_captured'
+  $modelServingSnapshotPath = [string]$plan.replay_paths.model_snapshot
+  $modelServingSnapshotDigest = $null
+  $modelServingSnapshotStatus = 'not_captured'
   $replayBundlePath = [string]$plan.replay_paths.bundle
   $replayBundleDigest = $null
   $replayBundleStatus = 'not_captured'
@@ -733,6 +770,25 @@ foreach ($plan in $plans) {
         $replayContractStatus, $replayContractDigest)
     } catch {
       $replayContractStatus = 'failed'
+      throw
+    }
+
+    try {
+      $snapshotCapture = Invoke-ModelServingSnapshotCapture `
+        -Python $py `
+        -Root $root `
+        -LogsDir $logsDir `
+        -Identity $replayIdentity `
+        -ModeName $modeName `
+        -SnapshotPath $modelServingSnapshotPath
+      $modelServingSnapshotPath = [string]$snapshotCapture.path
+      $modelServingSnapshotDigest = [string]$snapshotCapture.digest
+      $modelServingSnapshotStatus = [string]$snapshotCapture.status
+      Write-Host ("[matrix] model_serving_snapshot_status={0} digest={1}" -f `
+        $modelServingSnapshotStatus, $modelServingSnapshotDigest)
+    } catch {
+      $modelServingSnapshotStatus = 'failed'
+      $notes.Add('model_serving_snapshot_capture_failed')
       throw
     }
 
@@ -788,6 +844,7 @@ foreach ($plan in $plans) {
         -RunStartedUtc $started `
         -FinishedAt $finished `
         -ContractPath $replayContractPath `
+        -ModelServingSnapshotPath $modelServingSnapshotPath `
         -ReportsDir $reportsDir `
         -LogsDir $logsDir `
         -BundleRoot (Join-Path $reportsDir 'replay_bundles')
@@ -819,7 +876,10 @@ foreach ($plan in $plans) {
   $evidenceValid = [bool](
     ($exitStatus -eq 0) -and
     $staleEntryGuardChecked -and
-    ($staleEntryCount -eq 0)
+    ($staleEntryCount -eq 0) -and
+    ($replayContractStatus -eq 'exact_matrix_snapshot') -and
+    ($modelServingSnapshotStatus -eq 'exact_matrix_snapshot') -and
+    ($replayBundleStatus -eq 'exact_bundle')
   )
   Write-Host ("[matrix] {0}: run_started_utc={1} stale_entry_count={2} evidence_valid={3}" -f `
     $modeName, $started, $staleEntryCount, $evidenceValid.ToString().ToLowerInvariant())
@@ -839,6 +899,9 @@ foreach ($plan in $plans) {
     replay_contract_path = $replayContractPath
     replay_contract_digest = $replayContractDigest
     replay_contract_status = $replayContractStatus
+    model_serving_snapshot_path = $modelServingSnapshotPath
+    model_serving_snapshot_digest = $modelServingSnapshotDigest
+    model_serving_snapshot_status = $modelServingSnapshotStatus
     replay_bundle_path = $replayBundlePath
     replay_bundle_digest = $replayBundleDigest
     replay_bundle_status = $replayBundleStatus

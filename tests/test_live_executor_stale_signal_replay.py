@@ -228,9 +228,14 @@ def _make_fake_matrix_repo(tmp_path: Path, trade_rows: list[str]) -> Path:
     (root / "v2").mkdir()
     (root / "research").mkdir()
     shutil.copy2(MATRIX_SCRIPT, tools / MATRIX_SCRIPT.name)
-    for helper in ("replay_contract.py", "replay_bundle.py", "evidence_manifest.py"):
+    for helper in ("replay_contract.py", "replay_bundle.py", "evidence_manifest.py", "model_serving_snapshot.py"):
         shutil.copy2(ROOT / "tools" / helper, tools / helper)
     (tools / "live_executor.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (tools / "live_writer.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "ml_dl").mkdir()
+    for name in ("dl_ensemble.py", "dl_infer.py", "dl_models.py"):
+        (root / "ml_dl" / name).write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "features.py").write_text("FEATURE_COLS = ['fixture']\n", encoding="utf-8")
     (root / "v2" / "risk_controls.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (root / "config" / "run.json").write_text("{}", encoding="utf-8")
     (root / "research" / "evidence_overrides.json").write_text(

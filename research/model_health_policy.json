@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "minimum_rows_for_decision": 100,
+  "minimum_rows_for_warning": 30,
+  "flat_output_std_threshold": 0.002,
+  "flat_output_window": 30,
+  "minimum_rounded_unique_values": 10,
+  "maximum_missing_rate": 0.05,
+  "maximum_extreme_rate": 0.95,
+  "minimum_probe_std": 0.002,
+  "low_auc_warning_threshold": 0.55,
+  "critical_contract_fields": [
+    "timeframe",
+    "seq_len",
+    "feature_count",
+    "scaler_width"
+  ]
+}

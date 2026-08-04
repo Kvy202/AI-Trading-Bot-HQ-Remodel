@@ -145,9 +145,14 @@ def _make_fake_matrix_repo(tmp_path: Path, child_exit: int) -> Path:
     (root / "research").mkdir()
 
     shutil.copy2(SCRIPT, tools / "run_experiment_matrix.ps1")
-    for helper in ("replay_contract.py", "replay_bundle.py", "evidence_manifest.py"):
+    for helper in ("replay_contract.py", "replay_bundle.py", "evidence_manifest.py", "model_serving_snapshot.py"):
         shutil.copy2(ROOT / "tools" / helper, tools / helper)
     (tools / "live_executor.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (tools / "live_writer.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "ml_dl").mkdir()
+    for name in ("dl_ensemble.py", "dl_infer.py", "dl_models.py"):
+        (root / "ml_dl" / name).write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "features.py").write_text("FEATURE_COLS = ['fixture']\n", encoding="utf-8")
     (root / "v2" / "risk_controls.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (root / "config" / "run.json").write_text("{}", encoding="utf-8")
     (root / "research" / "evidence_overrides.json").write_text(
@@ -371,8 +376,10 @@ def test_matrix_combined_shadow_success_records_zero_child_exit(tmp_path):
     assert index["runs"][0]["exit_status"] == 0
     assert index["runs"][0]["replay_contract_status"] == "exact_matrix_snapshot"
     assert index["runs"][0]["replay_bundle_status"] == "exact_bundle"
+    assert index["runs"][0]["model_serving_snapshot_status"] == "exact_matrix_snapshot"
     assert index["runs"][0]["replay_contract_digest"]
     assert index["runs"][0]["replay_bundle_digest"]
+    assert index["runs"][0]["model_serving_snapshot_digest"]
 
 
 def test_matrix_index_exit_status_is_numeric_not_child_output(tmp_path):
@@ -519,3 +526,29 @@ def test_matrix_fresh_logs_archives_trade_logs_before_child_runbook_modes(tmp_pa
         archived = archive / name
         assert archived.exists()
         assert "stale_row" in archived.read_text(encoding="utf-8-sig")
+
+
+def test_matrix_snapshot_failure_marks_evidence_invalid(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+    snapshot_tool = script.parent / "model_serving_snapshot.py"
+    snapshot_tool.write_text("raise SystemExit(1)\n", encoding="utf-8")
+
+    result = _run_matrix_script(script, "-Mode", "combined_shadow", "-Minutes", "5")
+    index = _latest_matrix_index(script)
+    run = index["runs"][0]
+
+    assert result.returncode == 1
+    assert run["model_serving_snapshot_status"] == "failed"
+    assert run["evidence_valid"] is False
+    assert "model_serving_snapshot_capture_failed" in run["notes"]
+
+
+def test_matrix_dry_run_lists_snapshot_path_without_creating_files(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+    reports = script.parents[1] / "reports"
+
+    result = _run_matrix_script(script, "-Mode", "combined_shadow", "-Minutes", "5", "-DryRun")
+
+    assert result.returncode == 0
+    assert re.search(r"model-serving snapshot: .*matrix_combined_shadow_\d{14}_model_serving_snapshot\.json", result.stdout)
+    assert list(reports.iterdir()) == []

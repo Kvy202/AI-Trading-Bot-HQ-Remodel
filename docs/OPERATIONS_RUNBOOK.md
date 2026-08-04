@@ -499,3 +499,72 @@ Survival active exits, Advanced Risk active actions, position restoration,
 and live or real-order modes remain disabled. Missing configuration, failed
 coverage, unresolved adaptive/bias state, unsupported active behavior, or
 failed parity leaves the result exploratory or excluded.
+
+---
+
+## Phase 21 — Ensemble Model Health Audit
+
+Phase 21 is a deterministic, CPU-only diagnostic of the deployed deep-learning
+ensemble. It reads model, scaler, metadata, and recorded probability artifacts;
+it does not fetch candles or exchange data, initialize an exchange adapter,
+start a writer or executor, or place paper, testnet, or real orders. It never
+changes model weights, scalers, `FEATURE_COLS`, thresholds, ensemble weights, or
+trading configuration.
+
+Capture a paper-safe serving snapshot for a future matrix run with the exact
+forced environment used by that run:
+
+```powershell
+python tools\model_serving_snapshot.py --identity xgboost_shadow_outcome:20260804160153 --mode xgboost_shadow_outcome --forced-env-json <temporary-safe-mode-json> --json-out reports\model_serving_snapshot.json
+```
+
+Run the historical audit and deterministic artifact probes offline:
+
+```powershell
+python tools\model_health_audit.py --identity xgboost_shadow_outcome:20260804160153 --json-out reports\model_health_audit_20260804160153.json
+python tools\model_health_probe.py --json-out reports\model_health_probe.json
+```
+
+The serving snapshot contains only allowlisted, non-secret settings, normalized
+artifact filenames, SHA-256 digests, metadata, scaler health, and read-only CPU
+load status. It is accepted only with `paper_mode=true` and
+`place_real_orders=false`. A current local environment is never promoted to an
+exact historical snapshot. Missing historical snapshots remain explicitly
+unverified.
+
+For future matrix runs, the runner captures this snapshot before starting the
+selected paper mode and includes it in the completed replay bundle. The bundle
+also filters `live_models_by_symbol.csv` and `live_meta_log.csv` strictly to the
+run window. Exact duplicate rows may collapse; different probabilities for the
+same timestamp and symbol fail reproducibility. Existing completed Phase 20
+bundles are not rewritten.
+
+The audit compares training metadata with the effective serving timeframe,
+sequence length, feature count, symbol-id setting, symbol universe, and paired
+scaler width. A `1m` serving value against `5m` training metadata is a critical
+contract mismatch even when dimensions happen to match. Artifact-load success
+alone is not a health verdict.
+
+Historical probability analysis is exact CSV parsing, not OCR or approximate
+log interpretation. TCN flatness uses the deployed `0.002` standard-deviation
+threshold. Thirty rows can support a warning but not a final flat-output
+decision; the default decision gate is 100 rows. One-sided but varying output
+is a warning, not proof of failure.
+
+Offline probes are created in standardized scaler space, inverse-transformed to
+raw feature space, and passed through the paired scaler/model twice on CPU.
+The TCN architecture diagnostic reuses the trained weights without saving or
+mutating them and compares the deployed symmetric-padding final endpoint with
+right-cropped and causal-left-padding endpoints. Any padding diagnosis is an
+advisory hypothesis only; Phase 21 does not patch `dl_models.py` or change the
+production forward path.
+
+Ensemble variants (`current_config`, equal/AUC weighted, LSTM+Transformer-only,
+no-TCN, and TCN-only) reproduce positive-weight voting, `DL_MIN_AGREE`, neutral
+suppression, centered probability, and the configured threshold. LSTM+TX and
+no-TCN are shadow-configuration candidates only. Phase 21 reports no strategy
+PnL and does not write a candidate into `.env` or `config/run.json`.
+
+Generated snapshots and health reports remain ignored and untracked. Health
+diagnostics do not enter Phase 17 or Phase 18 promotion evidence. Active or
+blocking experimental modes, live mode, and real-order mode remain disabled.

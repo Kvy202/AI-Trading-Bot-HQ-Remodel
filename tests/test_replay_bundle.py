@@ -18,6 +18,7 @@ from tools.replay_bundle import (
     validate_replay_bundle,
 )
 from tools.replay_contract import capture_replay_contract, write_replay_contract
+from tools.model_serving_snapshot import capture_model_serving_snapshot, write_model_serving_snapshot
 
 
 START = "2026-08-03T16:00:00Z"
@@ -101,7 +102,38 @@ def _logs(tmp_path: Path) -> Path:
     )
     (logs / "executor_state.json").write_text("secret state", encoding="utf-8")
     (logs / "matrix_xgboost_shadow_outcome_mode_env.json").write_text("env", encoding="utf-8")
+    model_fields = ["ts", "symbol", "lstm_p", "tcn_p", "tx_p"]
+    inside_model = ["2026-08-03T16:00:30Z", "BTC", 0.4, 0.5, 0.6]
+    _csv(
+        logs / "live_models_by_symbol.csv",
+        model_fields,
+        [["2026-08-03T15:59:30Z", "BTC", 0.1, 0.2, 0.3], inside_model,
+         inside_model, ["2026-08-03T16:04:30Z", "BTC", 0.45, 0.55, 0.65],
+         ["2026-08-03T16:06:00Z", "BTC", 0.7, 0.8, 0.9]],
+    )
+    _csv(
+        logs / "live_meta_log.csv",
+        ["ts", "p_meta", "lstm_p", "tcn_p", "tx_p"],
+        [["2026-08-03T16:00:30Z", 0.5, 0.4, 0.5, 0.6]],
+    )
     return logs
+
+
+def _model_snapshot(tmp_path: Path) -> Path:
+    root = tmp_path / "snapshot_repo"
+    for directory in ("tools", "ml_dl", "config", "model_artifacts"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    for relative in ("tools/live_writer.py", "ml_dl/dl_ensemble.py", "ml_dl/dl_infer.py", "ml_dl/dl_models.py"):
+        (root / relative).write_text("# fixture\n", encoding="utf-8")
+    (root / "features.py").write_text("FEATURE_COLS = ['a', 'b']\n", encoding="utf-8")
+    (root / "config" / "run.json").write_text("{}", encoding="utf-8")
+    snapshot = capture_model_serving_snapshot(
+        IDENTITY, "xgboost_shadow_outcome", base_dir=root,
+        forced_env_overrides={"LIVE_TRADING": False, "PAPER_TRADING": True,
+                              "LIVE_MODE": False, "EXEC_PAPER": True,
+                              "PLACE_REAL_ORDERS": False},
+    )
+    return write_model_serving_snapshot(snapshot, tmp_path / "snapshot.json")
 
 
 def test_bundle_filters_window_deduplicates_and_preserves_sources(tmp_path):
@@ -244,3 +276,44 @@ def test_bundle_validation_rejects_self_consistent_wrong_row_inventory(tmp_path)
 
     with pytest.raises(ReplayBundleError):
         validate_replay_bundle(path.parent)
+
+
+def test_bundle_filters_model_logs_and_records_model_inventory(tmp_path):
+    result = build_replay_bundle(
+        IDENTITY, START, FINISH, _contract(tmp_path), reports_dir=tmp_path / "reports",
+        logs_dir=_logs(tmp_path), bundle_root=tmp_path / "bundles", manifest_digest_value="manifest",
+    )
+    bundle = Path(result["bundle_path"])
+    rows = list(csv.DictReader((bundle / "live_models_by_symbol.csv").open(encoding="utf-8")))
+
+    assert [row["ts"] for row in rows] == ["2026-08-03T16:00:30Z", "2026-08-03T16:04:30Z"]
+    assert result["manifest"]["model_output_duplicate_count"] == 1
+    assert result["manifest"]["model_output_conflict_count"] == 0
+    assert result["manifest"]["model_output_rows_by_symbol"] == {"BTC": 2, "__pooled__": 1}
+    assert result["manifest"]["model_output_first_timestamp"] == "2026-08-03T16:00:30Z"
+    assert result["manifest"]["model_output_last_timestamp"] == "2026-08-03T16:04:30Z"
+
+
+def test_bundle_includes_validated_model_snapshot(tmp_path):
+    result = build_replay_bundle(
+        IDENTITY, START, FINISH, _contract(tmp_path), reports_dir=tmp_path / "reports",
+        logs_dir=_logs(tmp_path), bundle_root=tmp_path / "bundles", manifest_digest_value="manifest",
+        model_serving_snapshot_path=_model_snapshot(tmp_path),
+    )
+    bundle = Path(result["bundle_path"])
+
+    assert (bundle / "model_serving_snapshot.json").is_file()
+    validated = validate_replay_bundle(bundle)
+    assert validated["manifest"]["model_serving_snapshot_digest"]
+
+
+def test_conflicting_model_probabilities_fail_bundle_capture(tmp_path):
+    logs = _logs(tmp_path)
+    with (logs / "live_models_by_symbol.csv").open("a", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerow(["2026-08-03T16:00:30Z", "BTC", 0.9, 0.5, 0.6])
+
+    with pytest.raises(ReplayBundleError, match="conflicting timestamp/symbol"):
+        build_replay_bundle(
+            IDENTITY, START, FINISH, _contract(tmp_path), reports_dir=tmp_path / "reports",
+            logs_dir=logs, bundle_root=tmp_path / "bundles", manifest_digest_value="manifest",
+        )
