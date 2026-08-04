@@ -126,10 +126,26 @@ def _write_unified(
 ) -> Path:
     payload = _base_unified()
     payload.update(sections)
-    return _write_json(
+    path = _write_json(
         reports_dir / f"matrix_{mode}_{timestamp}_unified.json",
         payload,
     )
+    closed = int(payload.get("paper_pnl", {}).get("closed_trade_count") or 0)
+    matched = int(
+        payload.get("xgboost_outcome", {}).get("matched_closed_trade_count") or 0
+    )
+    strategy_outcome = (
+        (mode in {"baseline", "combined_shadow"} and closed > 0)
+        or (mode == "xgboost_shadow_outcome" and matched > 0)
+    )
+    _write_index(
+        reports_dir,
+        mode,
+        timestamp,
+        duration_minutes=60 if strategy_outcome else 5,
+        report_kinds=("unified",),
+    )
+    return path
 
 
 def _write_shadow_summary(
@@ -157,18 +173,36 @@ def _write_index(
     timestamp: str,
     *,
     exit_status: int = 0,
+    duration_minutes: int = 60,
+    evidence_valid: bool = True,
+    stale_entry_count: int = 0,
+    report_kinds: tuple[str, ...] = ("unified",),
 ) -> Path:
     return _write_json(
         reports_dir / f"matrix_index_{timestamp}.json",
         {
             "matrix_timestamp": timestamp,
             "dry_run": False,
+            "duration_minutes": duration_minutes,
             "runs": [
                 {
                     "mode": mode,
                     "run_timestamp": timestamp,
+                    "run_started_utc": "2026-07-01T00:00:00Z",
+                    "finished_at": "2026-07-01T01:00:00Z",
+                    "duration_minutes": duration_minutes,
                     "exit_status": exit_status,
-                    "report_paths": {},
+                    "stale_entry_guard_checked": True,
+                    "stale_entry_count": stale_entry_count,
+                    "stale_entry_signal_ids": [],
+                    "evidence_valid": evidence_valid,
+                    "report_paths": {
+                        kind: str(
+                            reports_dir
+                            / f"matrix_{mode}_{timestamp}_{kind}.json"
+                        )
+                        for kind in report_kinds
+                    },
                 }
             ],
         },
@@ -230,6 +264,28 @@ def _write_xgb_run(
         timestamp,
         xgboost=xgboost,
         xgboost_outcome=outcome,
+        **(
+            {
+                "paper_pnl": {
+                    "closed_trade_count": matched_count,
+                    "total_pnl": confirmed[1] + rejected[1],
+                    "average_pnl": (
+                        None
+                        if matched_count == 0
+                        else (confirmed[1] + rejected[1]) / matched_count
+                    ),
+                    "win_rate": None,
+                },
+                "trade_lineage": {
+                    "paper_trade_rows": matched_count,
+                    "paper_trade_rows_with_signal_id": matched_count,
+                    "closed_trade_rows": matched_count,
+                    "closed_trade_rows_with_signal_id": matched_count,
+                },
+            }
+            if mode == "combined_shadow"
+            else {}
+        ),
     )
     audit = _write_json(
         reports_dir / f"matrix_{mode}_{timestamp}_xgboost_audit.json",
@@ -361,7 +417,8 @@ def test_reports_group_by_mode_and_timestamp_without_double_counting(tmp_path):
     assert grouped["baseline"] == [timestamp, "20260702020202"]
     assert grouped["iforest_shadow"] == ["20260702030303"]
     baseline = summary["baseline_cross_run_summary"]
-    assert baseline["number_of_runs"] == 2
+    # The zero-outcome baseline is retained for safety, not PnL aggregation.
+    assert baseline["number_of_runs"] == 1
     assert baseline["total_closed_trades"] == 3
     assert summary["input_inventory"]["duplicate_reports_skipped"]
 
@@ -460,6 +517,13 @@ def test_audit_only_actual_rejections_fail_shadow_safety(tmp_path):
             "would_reject_count": 5,
             "actually_rejected_count": 5,
         },
+    )
+    _write_index(
+        reports,
+        "xgboost_shadow_outcome",
+        "20260703040404",
+        duration_minutes=5,
+        report_kinds=("xgboost_audit",),
     )
 
     classification = summarize_offline_calibration(reports, logs)["run_classification"]
@@ -833,12 +897,13 @@ def test_xgboost_missing_pnl_support_cannot_become_blocking_candidate(tmp_path):
         min_xgb_matched_per_group=5,
     )["xgboost_outcome_aggregation"]["combined_aggregate"]
 
-    assert aggregate["minimum_evidence_threshold"]["satisfied"] is True
-    assert aggregate["confirmed"]["pnl_coverage_rate"] == pytest.approx(0.1)
-    assert aggregate["rejected"]["pnl_coverage_rate"] == pytest.approx(0.1)
-    assert aggregate["confirmed"]["weighted_average_pnl"] is None
-    assert aggregate["rejected"]["weighted_average_pnl"] is None
-    assert aggregate["pnl_support_warning"] is True
+    # Audit-only counts from an incomplete run cannot inflate strategy evidence.
+    assert aggregate["minimum_evidence_threshold"]["satisfied"] is False
+    assert aggregate["confirmed"]["pnl_coverage_rate"] == pytest.approx(1.0)
+    assert aggregate["rejected"]["pnl_coverage_rate"] == pytest.approx(1.0)
+    assert aggregate["confirmed"]["weighted_average_pnl"] == pytest.approx(0.1)
+    assert aggregate["rejected"]["weighted_average_pnl"] == pytest.approx(-0.1)
+    assert aggregate["pnl_support_warning"] is False
     assert aggregate["blocking_candidate_status"] == "not_approved_for_blocking"
 
 
@@ -1310,6 +1375,14 @@ def test_json_writer_produces_valid_complete_report(tmp_path):
     payload = json.loads(out.read_text(encoding="utf-8"))
 
     assert set(payload) == {
+        "evidence_manifest_schema_version",
+        "evidence_manifest_generated_at",
+        "evidence_manifest_digest",
+        "evidence_runs_total",
+        "evidence_runs_strategy_included",
+        "evidence_runs_safety_included",
+        "evidence_runs_excluded",
+        "evidence_exclusions",
         "input_inventory",
         "run_classification",
         "baseline_cross_run_summary",

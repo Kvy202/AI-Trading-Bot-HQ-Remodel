@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "overrides": {
+    "baseline:20260730122136": {
+      "classification": "contaminated_stale_signal",
+      "reason": "restored/carry-over evidence included a signal originating before the independent experiment window",
+      "reviewed": true
+    },
+    "baseline:20260730162028": {
+      "classification": "unverified_legacy",
+      "reason": "run occurred before the monotonic signal high-water-mark fix; absence of an obvious stale row does not prove independence",
+      "reviewed": true
+    },
+    "xgboost_shadow_outcome:20260801173114": {
+      "classification": "contaminated_stale_signal",
+      "reason": "paper log contained entry sig_20260730T192418Z_BTCUSDT_00000398 before the August 1 run start",
+      "reviewed": true
+    },
+    "baseline:20260801192203": {
+      "classification": "valid_safety_only",
+      "reason": "five-minute Phase 18.1 paper validation passed with restore_state false, open_positions zero, stale_entry_count zero and evidence_valid true",
+      "reviewed": true
+    },
+    "baseline:20260802112352": {
+      "classification": "incomplete_no_outcomes",
+      "reason": "clean 60-minute baseline run with stale_entry_count zero but zero closed trades",
+      "reviewed": true
+    },
+    "xgboost_shadow_outcome:20260802124342": {
+      "classification": "network_interrupted",
+      "reason": "internet connection was unavailable for approximately the final 30 minutes of the intended 60-minute window",
+      "reviewed": true
+    },
+    "xgboost_shadow_outcome:20260803161821": {
+      "classification": "valid_strategy_evidence",
+      "reason": "clean paper-only run, stale_entry_count zero, evidence_valid true, one uniquely matched rejected closed-trade outcome",
+      "reviewed": true
+    }
+  }
+}

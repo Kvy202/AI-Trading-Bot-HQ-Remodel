@@ -371,3 +371,68 @@ that `logs/live_signals.csv` is deleted or reset.
 This protection is paper-only. It does not enable active or blocking modules,
 testnet or mainnet orders, real-order mode, or `PLACE_REAL_ORDERS`; those modes
 remain disabled.
+
+---
+
+## Phase 19 — Evidence Manifest and Contaminated-Run Exclusion
+
+Build the authoritative, paper-only matrix evidence registry before reviewing
+Phase 17 or Phase 18 results:
+
+```powershell
+python tools\evidence_manifest.py
+python tools\evidence_manifest.py --reports-dir reports --overrides research\evidence_overrides.json --json-out reports\evidence_manifest.json
+```
+
+The registry groups the unified report, shadow summary, and XGBoost audit under
+one canonical `mode:matrix_timestamp` identity. It retains every historical
+report and log for audit; it never deletes, rewrites, or moves historical
+evidence. `reports/evidence_manifest.json` is generated analysis and remains
+ignored and untracked. `research/evidence_overrides.json` is the tracked,
+reviewed source registry.
+
+Pre-Phase-18.1 strategy evidence fails closed because those indexes do not
+contain the `evidence_valid` and stale-entry guard metadata needed to prove an
+independent experiment window. A report's existence, a zero process exit, or
+the absence of an obvious stale row is not proof that the run is valid.
+
+Each identity receives exactly one classification:
+
+- `valid_strategy_evidence`: clean completed evidence with the mode-specific
+  realized outcome needed for strategy aggregation.
+- `valid_safety_only`: a clean, deliberately short safety validation; strategy
+  outcomes are not required.
+- `incomplete_no_outcomes`: a safe completed strategy-evidence window with no
+  usable closed or matched outcomes.
+- `contaminated_stale_signal`: confirmed stale or pre-start signal replay.
+- `network_interrupted`: a connectivity interruption confirmed by reviewed
+  override; connectivity is never inferred from exit status alone.
+- `invalid_matrix_failure`: a failed matrix process or missing/malformed
+  required generated evidence.
+- `unverified_legacy`: legacy or report-only evidence without reliable
+  verification or explicit reviewed approval.
+
+`include_in_strategy_aggregate` and `include_in_safety_summary` are separate.
+Only `valid_strategy_evidence` enters PnL, win rate, matched-outcome separation,
+and promotion evidence. Safety-only and incomplete runs may enter safety
+summaries but never strategy calculations. Contaminated, interrupted, failed,
+and unverified runs enter neither. XGBoost shadow decision-row volume is not
+closed-trade evidence: `xgboost_shadow_outcome` requires uniquely matched closed
+trades.
+
+Manual classifications require a non-empty reason, `reviewed: true`, a valid
+classification, and a canonical identity in the tracked override registry.
+Overrides take precedence over automatic classification. Do not add commands,
+environment values, runtime settings, thresholds, risk settings, fees,
+slippage, or position-sizing changes to the registry.
+
+Phase 17 rebuilds the current manifest directly and records its deterministic
+SHA-256 evidence digest plus every excluded identity and reason. Phase 18 only
+reuses a Phase 17 JSON report when its required sections, manifest schema, and
+digest match current evidence; otherwise it marks that report stale and
+reconstructs Phase 17 using the current manifest.
+
+Phase 19 changes no trading behavior, model/scaler artifact, feature columns,
+runtime configuration, fee/slippage assumption, threshold, risk rule, or
+position sizing. It does not activate blocking modules, start writers or
+executors, run counterfactual replay, or enable testnet/mainnet real orders.

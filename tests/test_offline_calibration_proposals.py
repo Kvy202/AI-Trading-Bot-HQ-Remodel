@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from tools.evidence_manifest import build_evidence_manifest, evidence_manifest_digest
 from tools.offline_calibration_proposals import (
     SAFE_EXPERIMENT_COMMANDS,
     format_text_summary,
@@ -141,9 +142,43 @@ def _phase17_payload() -> dict[str, Any]:
 
 
 def _write_phase17(reports: Path, payload: dict[str, Any] | None = None) -> Path:
+    value = dict(payload or _phase17_payload())
+    manifest = build_evidence_manifest(reports)
+    value["evidence_manifest_schema_version"] = manifest["schema_version"]
+    value["evidence_manifest_generated_at"] = manifest["generated_at"]
+    value["evidence_manifest_digest"] = evidence_manifest_digest(manifest)
     return _write_json(
         reports / "offline_calibration_sweep.json",
-        payload or _phase17_payload(),
+        value,
+    )
+
+
+def _write_verified_index(reports: Path, mode: str, timestamp: str) -> Path:
+    return _write_json(
+        reports / f"matrix_index_{timestamp}.json",
+        {
+            "matrix_timestamp": timestamp,
+            "requested_mode": mode,
+            "duration_minutes": 60,
+            "runs": [
+                {
+                    "mode": mode,
+                    "run_started_utc": "2026-07-01T00:00:00Z",
+                    "finished_at": "2026-07-01T01:00:00Z",
+                    "duration_minutes": 60,
+                    "exit_status": 0,
+                    "stale_entry_guard_checked": True,
+                    "stale_entry_count": 0,
+                    "stale_entry_signal_ids": [],
+                    "evidence_valid": True,
+                    "report_paths": {
+                        "unified": str(
+                            reports / f"matrix_{mode}_{timestamp}_unified.json"
+                        )
+                    },
+                }
+            ],
+        },
     )
 
 
@@ -224,6 +259,7 @@ def test_missing_phase17_reconstructs_fallback_reports(tmp_path):
         reports / "matrix_baseline_20260701010101_unified.json",
         _baseline_unified(),
     )
+    _write_verified_index(reports, "baseline", "20260701010101")
 
     summary = summarize_offline_calibration_proposals(reports, tmp_path / "logs")
 
@@ -257,6 +293,7 @@ def test_duplicate_report_representations_are_not_double_counted(tmp_path):
         reports / "matrix_baseline_20260701010101_shadow_summary.json",
         payload,
     )
+    _write_verified_index(reports, "baseline", "20260701010101")
 
     summary = summarize_offline_calibration_proposals(reports, tmp_path / "logs")
 
@@ -304,11 +341,12 @@ def test_baseline_evidence_gap_and_consistency(tmp_path):
 
 def test_baseline_outlier_warning_uses_available_trade_extrema(tmp_path):
     reports = tmp_path / "reports"
-    _write_phase17(reports)
     _write_json(
         reports / "matrix_baseline_20260701010101_unified.json",
         _baseline_unified(best_trade=0.2),
     )
+    _write_verified_index(reports, "baseline", "20260701010101")
+    _write_phase17(reports)
 
     proposal = summarize_offline_calibration_proposals(
         reports,
@@ -542,6 +580,10 @@ def test_json_writer_produces_valid_complete_report(tmp_path):
     payload = json.loads(out.read_text(encoding="utf-8"))
 
     assert list(payload) == [
+        "evidence_manifest_status",
+        "phase17_manifest_digest_match",
+        "excluded_run_count",
+        "excluded_run_identities",
         "input_evidence_inventory",
         "global_safety_gate",
         "baseline_evidence_proposal",

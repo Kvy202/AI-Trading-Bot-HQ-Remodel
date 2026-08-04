@@ -15,6 +15,19 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from tools.evidence_manifest import (
+        DEFAULT_OVERRIDES_PATH,
+        build_evidence_manifest,
+        evidence_manifest_digest,
+    )
+except ModuleNotFoundError:  # Direct execution adds tools/, rather than repo root, to sys.path.
+    from evidence_manifest import (  # type: ignore
+        DEFAULT_OVERRIDES_PATH,
+        build_evidence_manifest,
+        evidence_manifest_digest,
+    )
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_REPORTS_DIR = BASE_DIR / "reports"
 DEFAULT_LOGS_DIR = BASE_DIR / "logs"
@@ -262,7 +275,11 @@ def _legacy_audit_mode(path: Path) -> Optional[str]:
     return None
 
 
-def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+def _load_inputs(
+    reports_dir: Path,
+    logs_dir: Path,
+    evidence_manifest: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     report_paths: set[Path] = set()
     for pattern in (
         "matrix_*_unified.json",
@@ -311,20 +328,37 @@ def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], Lis
     duplicate_reports: List[Dict[str, str]] = []
     incomplete_reports: List[Dict[str, str]] = []
     aggregation_files: List[str] = []
+    safety_files: List[str] = []
     runs: List[Dict[str, Any]] = []
     matrix_audit_payloads: Dict[str, List[Tuple[str, str, str]]] = {}
+    manifest_runs = {
+        str(item.get("identity")): item
+        for item in evidence_manifest.get("runs", [])
+        if isinstance(item, dict) and item.get("identity")
+    }
     for (mode, timestamp), parts in sorted(groups.items(), key=lambda item: (item[0][1], item[0][0])):
-        exit_status = index_statuses.get((mode, timestamp))
-        if exit_status is not None and exit_status != 0:
+        identity = f"{mode}:{timestamp}"
+        evidence = manifest_runs.get(identity)
+        strategy_included = bool(
+            evidence and evidence.get("include_in_strategy_aggregate") is True
+        )
+        safety_included = bool(
+            evidence and evidence.get("include_in_safety_summary") is True
+        )
+        if not strategy_included and not safety_included:
+            reason = (
+                "no matching evidence identity"
+                if evidence is None
+                else f"{evidence.get('classification')}: {evidence.get('classification_reason')}"
+            )
             for path, _payload in parts.values():
                 incomplete_reports.append(
                     {
                         "path": str(path),
-                        "identity": f"{mode}:{timestamp}",
-                        "reason": f"skipped because matrix index exit_status={exit_status}",
+                        "identity": identity,
+                        "reason": f"excluded by evidence manifest: {reason}",
                     }
                 )
-            continue
 
         primary_kind: Optional[str] = None
         primary: Optional[Tuple[Path, Dict[str, Any]]] = None
@@ -347,7 +381,10 @@ def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], Lis
         audit_payload: Dict[str, Any] = {}
         if "xgboost_audit" in parts:
             audit_path, audit_payload = parts["xgboost_audit"]
-            aggregation_files.append(str(audit_path))
+            if strategy_included:
+                aggregation_files.append(str(audit_path))
+            if safety_included:
+                safety_files.append(str(audit_path))
             matrix_audit_payloads.setdefault(_canonical_payload(audit_payload), []).append(
                 (mode, timestamp, str(audit_path))
             )
@@ -355,7 +392,10 @@ def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], Lis
         if primary is None and not audit_payload:
             continue
         if primary is not None:
-            aggregation_files.append(str(primary[0]))
+            if strategy_included:
+                aggregation_files.append(str(primary[0]))
+            if safety_included:
+                safety_files.append(str(primary[0]))
         runs.append(
             {
                 "mode": mode,
@@ -366,7 +406,21 @@ def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], Lis
                 "data": {} if primary is None else primary[1],
                 "audit_path": None if audit_path is None else str(audit_path),
                 "audit": audit_payload,
-                "completion_status": "completed_index" if exit_status == 0 else "report_present_no_index",
+                "completion_status": (
+                    "evidence_manifest_included"
+                    if strategy_included or safety_included
+                    else "evidence_manifest_excluded"
+                ),
+                "evidence_classification": (
+                    None if evidence is None else evidence.get("classification")
+                ),
+                "evidence_classification_reason": (
+                    "no matching evidence identity"
+                    if evidence is None
+                    else evidence.get("classification_reason")
+                ),
+                "include_in_strategy_aggregate": strategy_included,
+                "include_in_safety_summary": safety_included,
             }
         )
 
@@ -441,7 +495,9 @@ def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], Lis
         if item["status"] != "ok":
             missing_inputs.append(ROW_LEVEL_LOGS[key])
 
-    used_files = sorted(set(aggregation_files + index_files_used + supplemental_files))
+    used_files = sorted(
+        set(aggregation_files + safety_files + index_files_used + supplemental_files)
+    )
     found_logs = [item["path"] for item in logs.values() if item["status"] == "ok"]
     inventory = {
         "reports_dir": str(reports_dir),
@@ -451,6 +507,7 @@ def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], Lis
         "report_files_used": used_files,
         "report_file_count_used": len(used_files),
         "aggregation_report_files_used": sorted(set(aggregation_files)),
+        "safety_report_files_used": sorted(set(safety_files)),
         "row_level_logs_found": found_logs,
         "row_level_logs": {
             key: {
@@ -478,6 +535,23 @@ def _load_inputs(reports_dir: Path, logs_dir: Path) -> Tuple[Dict[str, Any], Lis
         "trade_csv_policy": (
             "master and dated trade CSVs are not read; matrix audits provide deduplicated outcomes"
         ),
+        "evidence_manifest_schema_version": evidence_manifest.get("schema_version"),
+        "evidence_manifest_generated_at": evidence_manifest.get("generated_at"),
+        "evidence_manifest_digest": evidence_manifest_digest(evidence_manifest),
+        "evidence_runs": [
+            {
+                "identity": item.get("identity"),
+                "classification": item.get("classification"),
+                "classification_reason": item.get("classification_reason"),
+                "include_in_strategy_aggregate": item.get(
+                    "include_in_strategy_aggregate"
+                ),
+                "include_in_safety_summary": item.get("include_in_safety_summary"),
+                "report_paths": item.get("report_paths", {}),
+            }
+            for item in evidence_manifest.get("runs", [])
+            if isinstance(item, dict)
+        ],
     }
     return inventory, runs, logs
 
@@ -2056,6 +2130,8 @@ def summarize_offline_calibration(
     min_xgb_matched_per_group: int = 30,
     target_if_block_rates: Sequence[float] = (0.01, 0.05, 0.10, 0.15),
     target_survival_exit_rates: Sequence[float] = (0.05, 0.10, 0.20, 0.30),
+    overrides_path: Path | str = DEFAULT_OVERRIDES_PATH,
+    evidence_manifest: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the complete read-only Phase 17 report."""
 
@@ -2072,24 +2148,63 @@ def summarize_offline_calibration(
         if any(not 0.0 < float(value) < 1.0 for value in values):
             raise ValueError(f"{name} values must be between 0 and 1")
 
-    inventory, runs, logs = _load_inputs(reports_path, logs_path)
-    baseline = _baseline_summary(runs)
+    manifest = evidence_manifest or build_evidence_manifest(
+        reports_path, overrides_path
+    )
+    manifest_digest = evidence_manifest_digest(manifest)
+    all_runs_inventory, runs, logs = _load_inputs(reports_path, logs_path, manifest)
+    strategy_runs = [
+        run for run in runs if run.get("include_in_strategy_aggregate") is True
+    ]
+    safety_runs = [
+        run for run in runs if run.get("include_in_safety_summary") is True
+    ]
+    manifest_runs = [
+        run for run in manifest.get("runs", []) if isinstance(run, dict)
+    ]
+    exclusions = [
+        {
+            "identity": run.get("identity"),
+            "classification": run.get("classification"),
+            "reason": run.get("classification_reason"),
+        }
+        for run in manifest_runs
+        if not run.get("include_in_strategy_aggregate")
+        and not run.get("include_in_safety_summary")
+    ]
+    evidence_fields = {
+        "evidence_manifest_schema_version": manifest.get("schema_version"),
+        "evidence_manifest_generated_at": manifest.get("generated_at"),
+        "evidence_manifest_digest": manifest_digest,
+        "evidence_runs_total": len(manifest_runs),
+        "evidence_runs_strategy_included": sum(
+            run.get("include_in_strategy_aggregate") is True for run in manifest_runs
+        ),
+        "evidence_runs_safety_included": sum(
+            run.get("include_in_safety_summary") is True for run in manifest_runs
+        ),
+        "evidence_runs_excluded": len(exclusions),
+        "evidence_exclusions": exclusions,
+    }
+    all_runs_inventory.update(evidence_fields)
+    baseline = _baseline_summary(strategy_runs)
     isolation = _isolation_forest_analysis(
-        runs,
+        safety_runs,
         logs["isolation_forest"],
         tuple(float(value) for value in target_if_block_rates),
     )
-    xgboost = _xgboost_analysis(runs, min_xgb_matched_per_group)
+    xgboost = _xgboost_analysis(strategy_runs, min_xgb_matched_per_group)
     survival = _survival_exit_analysis(
-        runs,
+        safety_runs,
         logs["survival_exit"],
         tuple(float(value) for value in target_survival_exit_rates),
     )
-    advanced = _advanced_risk_analysis(runs, logs["advanced_risk"])
-    combined = _combined_shadow_integration(runs)
+    advanced = _advanced_risk_analysis(safety_runs, logs["advanced_risk"])
+    combined = _combined_shadow_integration(safety_runs)
     return {
-        "input_inventory": inventory,
-        "run_classification": _run_classification(runs),
+        **evidence_fields,
+        "input_inventory": all_runs_inventory,
+        "run_classification": _run_classification(safety_runs),
         "baseline_cross_run_summary": baseline,
         "isolation_forest_analysis": isolation,
         "xgboost_outcome_aggregation": xgboost,
@@ -2240,6 +2355,14 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         "Phase 17: Offline Calibration Sweep",
         "",
         "A. Input inventory",
+        f"  evidence_manifest_schema_version: {summary['evidence_manifest_schema_version']}",
+        f"  evidence_manifest_generated_at: {summary['evidence_manifest_generated_at']}",
+        f"  evidence_manifest_digest: {summary['evidence_manifest_digest']}",
+        f"  evidence_runs_total: {summary['evidence_runs_total']}",
+        f"  evidence_runs_strategy_included: {summary['evidence_runs_strategy_included']}",
+        f"  evidence_runs_safety_included: {summary['evidence_runs_safety_included']}",
+        f"  evidence_runs_excluded: {summary['evidence_runs_excluded']}",
+        f"  evidence_exclusions: {_fmt(summary['evidence_exclusions'])}",
         f"  report_files_found: {inventory['report_file_count_found']}",
     ]
     lines.extend(f"    {path}" for path in inventory["report_files_found"])
@@ -2496,6 +2619,11 @@ def build_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reports-dir", default=str(DEFAULT_REPORTS_DIR))
     parser.add_argument("--logs-dir", default=str(DEFAULT_LOGS_DIR))
     parser.add_argument(
+        "--evidence-overrides",
+        default=str(DEFAULT_OVERRIDES_PATH),
+        help="Tracked reviewed evidence override registry.",
+    )
+    parser.add_argument(
         "--min-xgb-matched-per-group",
         type=_positive_int,
         default=30,
@@ -2531,6 +2659,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_xgb_matched_per_group=args.min_xgb_matched_per_group,
         target_if_block_rates=args.target_if_block_rates,
         target_survival_exit_rates=args.target_survival_exit_rates,
+        overrides_path=args.evidence_overrides,
     )
     print(format_text_summary(summary))
     if args.json:

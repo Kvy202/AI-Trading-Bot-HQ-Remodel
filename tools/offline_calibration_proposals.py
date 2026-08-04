@@ -21,6 +21,19 @@ try:
 except ModuleNotFoundError:  # Direct execution adds tools/, rather than repo root, to sys.path.
     from offline_calibration_sweep import summarize_offline_calibration
 
+try:
+    from tools.evidence_manifest import (
+        DEFAULT_OVERRIDES_PATH,
+        build_evidence_manifest,
+        evidence_manifest_digest,
+    )
+except ModuleNotFoundError:  # Direct execution adds tools/, rather than repo root, to sys.path.
+    from evidence_manifest import (  # type: ignore
+        DEFAULT_OVERRIDES_PATH,
+        build_evidence_manifest,
+        evidence_manifest_digest,
+    )
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_REPORTS_DIR = BASE_DIR / "reports"
 DEFAULT_LOGS_DIR = BASE_DIR / "logs"
@@ -123,7 +136,9 @@ def _get(mapping: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     return value
 
 
-def _discover_direct_inputs(reports_dir: Path) -> Dict[str, Any]:
+def _discover_direct_inputs(
+    reports_dir: Path, evidence_manifest: Dict[str, Any]
+) -> Dict[str, Any]:
     paths: set[Path] = set()
     for pattern in ("matrix_*_unified.json", "matrix_*_xgboost_audit.json"):
         paths.update(reports_dir.glob(pattern))
@@ -167,9 +182,29 @@ def _discover_direct_inputs(reports_dir: Path) -> Dict[str, Any]:
         identities[identity] = path
         timestamps.setdefault(mode, []).append(timestamp)
 
+    manifest_runs = {
+        str(item.get("identity")): item
+        for item in evidence_manifest.get("runs", [])
+        if isinstance(item, dict) and item.get("identity")
+    }
+    included: Dict[Path, Dict[str, Any]] = {}
+    strategy_included: Dict[Path, Dict[str, Any]] = {}
+    for path, payload in valid.items():
+        match = MATRIX_REPORT_RE.match(path.name)
+        if match is None:
+            included[path] = payload
+            continue
+        evidence = manifest_runs.get(f"{match.group('mode')}:{match.group('timestamp')}")
+        if evidence and evidence.get("include_in_safety_summary") is True:
+            included[path] = payload
+        if evidence and evidence.get("include_in_strategy_aggregate") is True:
+            strategy_included[path] = payload
+
     return {
         "paths_found": [str(path) for path in sorted(paths, key=lambda item: item.name)],
         "valid": valid,
+        "included": included,
+        "strategy_included": strategy_included,
         "valid_paths": [str(path) for path in sorted(valid, key=lambda item: item.name)],
         "malformed": malformed,
         "read_errors": read_errors,
@@ -214,6 +249,8 @@ def _phase17_schema_valid(payload: Dict[str, Any]) -> bool:
 def _load_phase17_or_reconstruct(
     reports_dir: Path,
     logs_dir: Path,
+    evidence_manifest: Dict[str, Any],
+    overrides_path: Path | str,
     xgb_min_matched_per_group: int,
     if_target_block_rate: float,
     survival_target_exit_rate: float,
@@ -224,7 +261,11 @@ def _load_phase17_or_reconstruct(
         "status": "missing",
         "preferred_input_used": False,
         "error": None,
+        "stale_reason": None,
+        "manifest_digest_match": False,
     }
+    current_digest = evidence_manifest_digest(evidence_manifest)
+    current_schema = evidence_manifest.get("schema_version")
     payload: Optional[Dict[str, Any]] = None
     if phase17_path.exists():
         loaded, error = _read_json(phase17_path)
@@ -237,9 +278,36 @@ def _load_phase17_or_reconstruct(
                     "error": f"{phase17_path}: required Phase 17 sections are missing",
                 }
             )
+        elif loaded is not None and loaded.get("evidence_manifest_digest") is None:
+            phase17_status.update(
+                {
+                    "status": "stale",
+                    "stale_reason": "Phase 17 report does not contain evidence_manifest_digest",
+                }
+            )
+        elif loaded is not None and loaded.get("evidence_manifest_schema_version") != current_schema:
+            phase17_status.update(
+                {
+                    "status": "stale",
+                    "stale_reason": "Phase 17 evidence manifest schema version does not match",
+                }
+            )
+        elif loaded is not None and loaded.get("evidence_manifest_digest") != current_digest:
+            phase17_status.update(
+                {
+                    "status": "stale",
+                    "stale_reason": "Phase 17 evidence manifest digest does not match current evidence",
+                }
+            )
         else:
             payload = loaded
-            phase17_status.update({"status": "ok", "preferred_input_used": True})
+            phase17_status.update(
+                {
+                    "status": "ok",
+                    "preferred_input_used": True,
+                    "manifest_digest_match": True,
+                }
+            )
 
     reconstructed = False
     if payload is None:
@@ -249,6 +317,8 @@ def _load_phase17_or_reconstruct(
             min_xgb_matched_per_group=xgb_min_matched_per_group,
             target_if_block_rates=(if_target_block_rate,),
             target_survival_exit_rates=(survival_target_exit_rate,),
+            overrides_path=overrides_path,
+            evidence_manifest=evidence_manifest,
         )
         reconstructed = True
 
@@ -260,6 +330,8 @@ def _load_phase17_or_reconstruct(
             else "reconstructed_from_reports_and_current_logs"
         ),
         "fallback_reconstruction_used": reconstructed,
+        "evidence_manifest_status": "current",
+        "phase17_manifest_digest_match": phase17_status["manifest_digest_match"],
     }
 
 
@@ -275,7 +347,7 @@ def _input_inventory(
     phase17_inventory = phase17.get("input_inventory")
     phase17_inventory = phase17_inventory if isinstance(phase17_inventory, dict) else {}
     fallback_used = (
-        direct["valid_paths"]
+        [str(path) for path in sorted(direct["included"], key=lambda item: item.name)]
         if phase17_meta["fallback_reconstruction_used"]
         else []
     )
@@ -286,17 +358,20 @@ def _input_inventory(
 
     malformed = list(direct["malformed"])
     phase17_status = phase17_meta["phase17_report"]
-    if phase17_status["status"] == "malformed":
+    if phase17_status["status"] in {"malformed", "stale"}:
         malformed.insert(
             0,
             {
                 "path": phase17_status["path"],
-                "error": str(phase17_status["error"]),
+                "error": str(
+                    phase17_status["error"] or phase17_status["stale_reason"]
+                ),
             },
         )
     read_errors = list(direct["read_errors"]) + list(log_errors)
-    if phase17_status["status"] == "malformed" and phase17_status["error"] not in read_errors:
-        read_errors.insert(0, str(phase17_status["error"]))
+    phase17_problem = phase17_status["error"] or phase17_status["stale_reason"]
+    if phase17_status["status"] in {"malformed", "stale"} and phase17_problem not in read_errors:
+        read_errors.insert(0, str(phase17_problem))
 
     logs_used = [
         {
@@ -324,6 +399,11 @@ def _input_inventory(
         "logs_dir": str(logs_dir),
         "phase17_report_status": phase17_status,
         "preferred_evidence_source": phase17_meta["evidence_source"],
+        "reconstruction_reason": (
+            phase17_status["stale_reason"]
+            or phase17_status["error"]
+            or ("Phase 17 report is missing" if phase17_status["status"] == "missing" else None)
+        ),
         "fallback_reports_found": direct["paths_found"],
         "fallback_reports_used": fallback_used,
         "logs_used": logs_used,
@@ -352,7 +432,7 @@ def _global_safety_gate() -> Dict[str, Any]:
 
 def _baseline_report_payloads(direct: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
     results: List[Tuple[str, Dict[str, Any]]] = []
-    for path, payload in direct["valid"].items():
+    for path, payload in direct["strategy_included"].items():
         match = MATRIX_REPORT_RE.match(path.name)
         if (
             match is not None
@@ -1303,6 +1383,7 @@ def summarize_offline_calibration_proposals(
     baseline_min_closed_trades: int = 100,
     if_target_block_rate: float = 0.05,
     survival_target_exit_rate: float = 0.10,
+    overrides_path: Path | str = DEFAULT_OVERRIDES_PATH,
 ) -> Dict[str, Any]:
     """Build the Phase 18 report without mutating trading or artifact state."""
 
@@ -1317,11 +1398,14 @@ def summarize_offline_calibration_proposals(
 
     reports_path = Path(reports_dir)
     logs_path = Path(logs_dir)
-    direct = _discover_direct_inputs(reports_path)
+    manifest = build_evidence_manifest(reports_path, overrides_path)
+    direct = _discover_direct_inputs(reports_path, manifest)
     logs, log_errors = _read_current_logs(logs_path)
     phase17, phase17_meta = _load_phase17_or_reconstruct(
         reports_path,
         logs_path,
+        manifest,
+        overrides_path,
         xgb_min_matched_per_group,
         if_target_block_rate,
         survival_target_exit_rate,
@@ -1360,7 +1444,22 @@ def summarize_offline_calibration_proposals(
     combined_evidence = (
         combined_evidence if isinstance(combined_evidence, dict) else {}
     )
+    manifest_runs = [
+        run for run in manifest.get("runs", []) if isinstance(run, dict)
+    ]
+    excluded = [
+        run
+        for run in manifest_runs
+        if not run.get("include_in_strategy_aggregate")
+        and not run.get("include_in_safety_summary")
+    ]
     return {
+        "evidence_manifest_status": phase17_meta["evidence_manifest_status"],
+        "phase17_manifest_digest_match": phase17_meta[
+            "phase17_manifest_digest_match"
+        ],
+        "excluded_run_count": len(excluded),
+        "excluded_run_identities": [run.get("identity") for run in excluded],
         "input_evidence_inventory": inventory,
         "global_safety_gate": _global_safety_gate(),
         "baseline_evidence_proposal": baseline,
@@ -1413,8 +1512,13 @@ def format_text_summary(summary: Dict[str, Any]) -> str:
         "Phase 18: Offline Calibration Proposals and Evidence Gates",
         "",
         "A. Input and evidence inventory",
+        f"  evidence_manifest_status={summary['evidence_manifest_status']}",
+        f"  phase17_manifest_digest_match={_fmt(summary['phase17_manifest_digest_match'])}",
+        f"  excluded_run_count={summary['excluded_run_count']}",
+        f"  excluded_run_identities={_fmt(summary['excluded_run_identities'])}",
         f"  phase17_report_status={_fmt(inventory['phase17_report_status'])}",
         f"  preferred_evidence_source={inventory['preferred_evidence_source']}",
+        f"  reconstruction_reason={_fmt(inventory['reconstruction_reason'])}",
         f"  fallback_reports_used={_fmt(inventory['fallback_reports_used'])}",
         f"  logs_used={_fmt(inventory['logs_used'])}",
         f"  report_timestamps={_fmt(inventory['report_timestamps'])}",
@@ -1594,6 +1698,11 @@ def build_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reports-dir", default=str(DEFAULT_REPORTS_DIR))
     parser.add_argument("--logs-dir", default=str(DEFAULT_LOGS_DIR))
     parser.add_argument(
+        "--evidence-overrides",
+        default=str(DEFAULT_OVERRIDES_PATH),
+        help="Tracked reviewed evidence override registry.",
+    )
+    parser.add_argument(
         "--xgb-min-matched-per-group",
         type=_positive_int,
         default=30,
@@ -1625,6 +1734,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         baseline_min_closed_trades=args.baseline_min_closed_trades,
         if_target_block_rate=args.if_target_block_rate,
         survival_target_exit_rate=args.survival_target_exit_rate,
+        overrides_path=args.evidence_overrides,
     )
     print(format_text_summary(summary))
     if args.json:
