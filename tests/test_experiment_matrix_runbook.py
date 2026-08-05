@@ -9,6 +9,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import joblib
+import numpy as np
+import torch
+from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tools" / "run_experiment_matrix.ps1"
@@ -143,16 +147,42 @@ def _make_fake_matrix_repo(tmp_path: Path, child_exit: int) -> Path:
     (root / "config").mkdir()
     (root / "v2").mkdir()
     (root / "research").mkdir()
+    (root / "runtime").mkdir()
+    (root / "model_artifacts").mkdir()
 
     shutil.copy2(SCRIPT, tools / "run_experiment_matrix.ps1")
     for helper in ("replay_contract.py", "replay_bundle.py", "evidence_manifest.py", "model_serving_snapshot.py"):
         shutil.copy2(ROOT / "tools" / helper, tools / helper)
+    shutil.copy2(ROOT / "runtime" / "model_serving_guard.py", root / "runtime" / "model_serving_guard.py")
+    (root / "runtime" / "__init__.py").write_text("", encoding="utf-8")
     (tools / "live_executor.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (tools / "live_writer.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (root / "ml_dl").mkdir()
-    for name in ("dl_ensemble.py", "dl_infer.py", "dl_models.py"):
-        (root / "ml_dl" / name).write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "ml_dl" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "ml_dl" / "dl_infer.py").write_text(
+        "import torch\n"
+        "class FixtureModel(torch.nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.weight = torch.nn.Parameter(torch.ones(1))\n"
+        "def _build_model(kind, width):\n"
+        "    return FixtureModel()\n",
+        encoding="utf-8",
+    )
+    (root / "ml_dl" / "dl_models.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "ml_dl" / "dl_ensemble.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (root / "features.py").write_text("FEATURE_COLS = ['fixture']\n", encoding="utf-8")
+    scaler = StandardScaler().fit(np.asarray([[0.0], [1.0]], dtype=np.float32))
+    for kind in ("lstm", "tcn", "tx"):
+        joblib.dump(scaler, root / "model_artifacts" / f"scaler_{kind}_latest.joblib")
+        torch.save({"weight": torch.ones(1)}, root / "model_artifacts" / f"dl_{kind}_latest.pt")
+        (root / "model_artifacts" / f"dl_{kind}_metadata.json").write_text(
+            json.dumps({
+                "kind": kind, "seq_len": 64, "n_features": 1, "timeframe": "1m",
+                "symbols": ["BTCUSDT", "ETHUSDT"], "val_auc": 0.6,
+            }),
+            encoding="utf-8",
+        )
     (root / "v2" / "risk_controls.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (root / "config" / "run.json").write_text("{}", encoding="utf-8")
     (root / "research" / "evidence_overrides.json").write_text(
@@ -259,6 +289,8 @@ def test_matrix_dry_run_does_not_start_processes():
     assert "no writer/executor processes will be started" in result.stdout
     assert "Starting generic paper mode" not in result.stdout
     assert "Start-Process" not in result.stdout
+    assert "model contract status: fail" in result.stdout
+    assert "serving timeframe 1m != training timeframe 5m" in result.stdout
 
 
 def test_matrix_each_mode_maps_to_expected_runbook_or_generic_command():
@@ -380,6 +412,29 @@ def test_matrix_combined_shadow_success_records_zero_child_exit(tmp_path):
     assert index["runs"][0]["replay_contract_digest"]
     assert index["runs"][0]["replay_bundle_digest"]
     assert index["runs"][0]["model_serving_snapshot_digest"]
+    assert index["runs"][0]["model_contract_status"] == "pass"
+    assert len(index["runs"][0]["model_contract_guard_digest"]) == 64
+    assert index["runs"][0]["model_contract_critical_mismatches"] == []
+
+
+def test_matrix_contract_mismatch_refuses_before_child_and_invalidates_evidence(tmp_path):
+    script = _make_fake_matrix_repo(tmp_path, child_exit=0)
+    artifacts = script.parents[1] / "model_artifacts"
+    for path in artifacts.glob("dl_*_metadata.json"):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["timeframe"] = "5m"
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    result = _run_matrix_script(script, "-Mode", "combined_shadow", "-Minutes", "5")
+    index = _latest_matrix_index(script)
+    run = index["runs"][0]
+
+    assert result.returncode == 1
+    assert "[fake-child] normal output" not in result.stdout
+    assert run["model_contract_status"] == "fail"
+    assert run["evidence_valid"] is False
+    assert "model_contract_preflight_failed" in run["notes"]
+    assert any("serving timeframe 1m != training timeframe 5m" in item for item in run["model_contract_critical_mismatches"])
 
 
 def test_matrix_index_exit_status_is_numeric_not_child_output(tmp_path):

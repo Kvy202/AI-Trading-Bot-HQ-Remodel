@@ -8,7 +8,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import joblib
+import numpy as np
 import pytest
+import torch
+from sklearn.preprocessing import StandardScaler
 
 import tools.live_executor as live_executor
 
@@ -227,15 +231,41 @@ def _make_fake_matrix_repo(tmp_path: Path, trade_rows: list[str]) -> Path:
     (root / "config").mkdir()
     (root / "v2").mkdir()
     (root / "research").mkdir()
+    (root / "runtime").mkdir()
+    (root / "model_artifacts").mkdir()
     shutil.copy2(MATRIX_SCRIPT, tools / MATRIX_SCRIPT.name)
     for helper in ("replay_contract.py", "replay_bundle.py", "evidence_manifest.py", "model_serving_snapshot.py"):
         shutil.copy2(ROOT / "tools" / helper, tools / helper)
+    shutil.copy2(ROOT / "runtime" / "model_serving_guard.py", root / "runtime" / "model_serving_guard.py")
+    (root / "runtime" / "__init__.py").write_text("", encoding="utf-8")
     (tools / "live_executor.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (tools / "live_writer.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (root / "ml_dl").mkdir()
-    for name in ("dl_ensemble.py", "dl_infer.py", "dl_models.py"):
-        (root / "ml_dl" / name).write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "ml_dl" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "ml_dl" / "dl_ensemble.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "ml_dl" / "dl_models.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
+    (root / "ml_dl" / "dl_infer.py").write_text(
+        "import torch\n"
+        "class FixtureModel(torch.nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.weight = torch.nn.Parameter(torch.ones(1))\n"
+        "def _build_model(kind, width):\n"
+        "    return FixtureModel()\n",
+        encoding="utf-8",
+    )
     (root / "features.py").write_text("FEATURE_COLS = ['fixture']\n", encoding="utf-8")
+    scaler = StandardScaler().fit(np.asarray([[0.0], [1.0]], dtype=np.float32))
+    for kind in ("lstm", "tcn", "tx"):
+        joblib.dump(scaler, root / "model_artifacts" / f"scaler_{kind}_latest.joblib")
+        torch.save({"weight": torch.ones(1)}, root / "model_artifacts" / f"dl_{kind}_latest.pt")
+        (root / "model_artifacts" / f"dl_{kind}_metadata.json").write_text(
+            json.dumps({
+                "kind": kind, "seq_len": 64, "n_features": 1, "timeframe": "1m",
+                "symbols": ["BTCUSDT", "ETHUSDT"], "val_auc": 0.6,
+            }),
+            encoding="utf-8",
+        )
     (root / "v2" / "risk_controls.py").write_text("# deterministic matrix fixture\n", encoding="utf-8")
     (root / "config" / "run.json").write_text("{}", encoding="utf-8")
     (root / "research" / "evidence_overrides.json").write_text(

@@ -75,6 +75,7 @@ except ImportError:
     pass
 
 from runtime.experimental_flags import ExperimentalFlags
+from runtime.model_serving_guard import evaluate_model_serving_contract
 
 LOGS = BASE_DIR / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
@@ -351,6 +352,29 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return v
     except Exception:
         return default
+
+
+def run_model_contract_guard(
+    models: Dict[str, dict],
+    *,
+    timeframe: str,
+    sequence_length: int,
+    add_symbol_id: bool,
+    serving_symbols: List[str],
+) -> Dict[str, Any]:
+    """Run the pure startup guard against the already-loaded ensemble."""
+
+    from features import FEATURE_COLS
+
+    return evaluate_model_serving_contract(
+        models,
+        serving_timeframe=timeframe,
+        serving_sequence_length=sequence_length,
+        generated_feature_width=len(FEATURE_COLS) + int(add_symbol_id),
+        add_symbol_id=add_symbol_id,
+        serving_symbols=serving_symbols,
+        base_feature_width=len(FEATURE_COLS),
+    )
 
 
 def make_signal_id(timestamp: str, symbol: str, sequence: int) -> str:
@@ -732,11 +756,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         return
     # Load the model ensemble.
     try:
-        models, dev = load_ensemble(X_dim=30, device=None)
+        models, dev = load_ensemble(X_dim=30, device=None, require_all=True)
         log("ensemble loaded")
     except Exception as e:
-        log_err(f"FATAL load_ensemble: {e}\n{traceback.format_exc()}")
-        write_heartbeat(False, f"load_ensemble_failed: {e}", [], 0,
+        log_err(f"FATAL MODEL_CONTRACT_FAIL model/scaler load failed: {e}\n{traceback.format_exc()}")
+        write_heartbeat(False, f"model_contract_failed: model/scaler load failed: {e}", [], 0,
                         0.0, float(args.thr), args.mode, args.sleep)
         writer_unlock()
         sys.exit(1)
@@ -760,10 +784,36 @@ def main(argv: Optional[List[str]] = None) -> None:
         writer_unlock()
         sys.exit(1)
 
+    # Fail closed before the first market-data refresh or signal row.  There is
+    # intentionally no bypass: diagnostics use the separate Phase 22 tool.
+    contract = run_model_contract_guard(
+        models,
+        timeframe=args.timeframe,
+        sequence_length=args.seq,
+        add_symbol_id=add_sid,
+        serving_symbols=symlist,
+    )
+    if contract["status"] != "pass":
+        detail = "; ".join(contract.get("critical_mismatches", [])) or "contract unverified"
+        log_err(f"FATAL MODEL_CONTRACT_FAIL {detail}")
+        write_heartbeat(False, f"model_contract_failed: {detail}", symlist, 0,
+                        0.0, float(args.thr), args.mode, args.sleep)
+        writer_unlock()
+        sys.exit(1)
+    training = contract["training_contract"]
+    log(
+        "MODEL_CONTRACT_PASS "
+        f"training_tf={training['timeframe']} serving_tf={args.timeframe} "
+        f"seq_len={args.seq} features={len(_FEATURE_COLS) + int(add_sid)}"
+    )
+
     # Per-symbol-per-model log schema is fixed by the loaded model set. If an
     # existing file has a different header (model set changed between runs),
     # rotate it aside so rows never misalign with the header.
-    models_by_sym_cols = ["ts", "symbol", "px"] + [
+    models_by_sym_cols = [
+        "ts", "symbol", "px", "source_bar_id", "source_bar_open_utc",
+        "source_bar_close_utc", "feature_window_digest",
+    ] + [
         f"{k}_p" for k in sorted(models.keys())
     ]
     _existing_mbs = read_existing_header(MODELS_BY_SYMBOL)
@@ -1032,7 +1082,15 @@ def main(argv: Optional[List[str]] = None) -> None:
                             )
                     append_aligned_row(signals_path, SIGNAL_COLS, row)
                     # Per-symbol-per-model diagnostics (missing models -> blank).
-                    mbs_row: Dict[str, Any] = {"ts": ts_now, "symbol": sym, "px": px_final}
+                    mbs_row: Dict[str, Any] = {
+                        "ts": ts_now,
+                        "symbol": sym,
+                        "px": px_final,
+                        "source_bar_id": meta.get("source_bar_id_by_symbol", {}).get(sym, ""),
+                        "source_bar_open_utc": meta.get("source_bar_open_utc_by_symbol", {}).get(sym, ""),
+                        "source_bar_close_utc": meta.get("source_bar_close_utc_by_symbol", {}).get(sym, ""),
+                        "feature_window_digest": meta.get("feature_window_digest_by_symbol", {}).get(sym, ""),
+                    }
                     for _name, _vals in per_model_sym.items():
                         _t3 = model_aggregate(_vals)
                         if _t3 is not None:

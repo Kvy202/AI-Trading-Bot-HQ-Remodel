@@ -568,3 +568,66 @@ PnL and does not write a candidate into `.env` or `config/run.json`.
 Generated snapshots and health reports remain ignored and untracked. Health
 diagnostics do not enter Phase 17 or Phase 18 promotion evidence. Active or
 blocking experimental modes, live mode, and real-order mode remain disabled.
+
+# Phase 22 training-serving alignment shadow validation
+
+Phase 22 is a research-only, non-trading workflow. It validates the deployed
+artifacts at their 5-minute/64-row training contract without changing `.env`,
+`config/run.json`, weights, calibration, models, or scalers. Historical evidence
+establishes model-output health; the short live shadow establishes only current
+completed-bar integration. Neither is profitability evidence or Phase 17/18
+promotion evidence.
+
+Capture at least 120 completed historical endpoints per serving symbol, then
+evaluate the immutable bundle without another market-data request:
+
+```powershell
+python tools/model_alignment_shadow.py capture-history `
+  --timeframe 5m `
+  --symbols BTCUSDT,ETHUSDT `
+  --unique-bars 120 `
+  --lookback-bars 800 `
+  --bundle-out reports/model_alignment_bundles/history_5m_latest
+
+python tools/model_alignment_shadow.py evaluate `
+  --bundle reports/model_alignment_bundles/history_5m_latest `
+  --json-out reports/model_alignment_evaluation_5m.json
+
+python tools/model_alignment_report.py `
+  --historical-bundle reports/model_alignment_bundles/history_5m_latest `
+  --historical-evaluation reports/model_alignment_evaluation_5m.json `
+  --phase21-report reports/model_health_audit_20260804160153.json `
+  --json-out reports/model_alignment_report.json
+```
+
+After code review, the writer-free live integration smoke can observe three new
+completed bars per symbol. It never launches an execution process or writes
+signal/trade rows:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\tools\run_model_alignment_shadow.ps1 `
+  -UniqueBars 3 `
+  -Symbols "BTCUSDT,ETHUSDT" `
+  -FreshLogs
+```
+
+Each normal invocation creates a new campaign directory. `-CampaignDir` resumes
+that exact campaign only when its symbols, timeframe, snapshot, artifact
+digests, calibration, and requested bar count still match. `-FreshLogs` refuses
+to overwrite an existing campaign directory. Repeated polls of one completed
+bar do not increment counters, while a changed window digest for the same source
+bar is a critical failure.
+
+Before running the live smoke, inspect compatibility without changing packages:
+
+```powershell
+python tools/model_alignment_report.py --compatibility-only
+```
+
+Use `-DryRun` during implementation verification. A standard experiment matrix
+now refuses a training-serving contract failure before starting its runtime
+processes; it does not silently change a normal matrix run from 1 minute to 5
+minutes. A scikit-learn artifact/runtime mismatch remains an explicit
+reproducibility warning and must be remediated manually—no Phase 22 tool changes
+installed dependencies.

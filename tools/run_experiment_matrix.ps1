@@ -373,6 +373,9 @@ function Invoke-ModelServingSnapshotCapture {
     path = $SnapshotPath
     digest = [string]$snapshot.snapshot_digest
     status = 'exact_matrix_snapshot'
+    model_contract_status = [string]$snapshot.training_serving_contract_status
+    model_contract_guard_digest = [string]$snapshot.model_serving_guard_digest
+    model_contract_critical_mismatches = @($snapshot.training_serving_critical_mismatches)
   }
 }
 
@@ -707,6 +710,15 @@ if ($DryRun) {
   Write-Host "[matrix] DRY RUN ONLY - no writer/executor processes will be started."
   Write-Host "[matrix] Matrix index would be: $(Join-Path $reportsDir "matrix_index_${matrixStamp}.json")"
   foreach ($plan in $plans) {
+    $drySnapshotRaw = & $py "tools/model_serving_snapshot.py" `
+      --identity "dry_run_model_contract" `
+      --mode ([string]$plan.mode) `
+      --base-dir $root `
+      --paper-safe
+    if ($LASTEXITCODE -ne 0) {
+      throw "dry-run model contract preflight failed to inspect"
+    }
+    $drySnapshot = $drySnapshotRaw | ConvertFrom-Json
     Write-Host ""
     Write-Host "[matrix] Mode: $($plan.mode)"
     Write-Host "  command: $($plan.command)"
@@ -715,6 +727,11 @@ if ($DryRun) {
     Write-Host "  stale paper entry guard: enabled (tolerance=$StaleEntryToleranceSeconds second(s))"
     Write-Host "  replay contract: $($plan.replay_paths.contract)"
     Write-Host "  model-serving snapshot: $($plan.replay_paths.model_snapshot)"
+    Write-Host "  model contract status: $($drySnapshot.training_serving_contract_status)"
+    Write-Host "  model contract guard digest: $($drySnapshot.model_serving_guard_digest)"
+    if ($drySnapshot.training_serving_contract_status -ne 'pass') {
+      Write-Host "  model_contract_preflight_failed: $(@($drySnapshot.training_serving_critical_mismatches) -join '; ')"
+    }
     Write-Host "  replay bundle: $($plan.replay_paths.bundle)"
     Write-Host "  replay capture creates files in non-dry-run mode only: true"
     Write-Host "  reports:"
@@ -742,6 +759,9 @@ foreach ($plan in $plans) {
   $modelServingSnapshotPath = [string]$plan.replay_paths.model_snapshot
   $modelServingSnapshotDigest = $null
   $modelServingSnapshotStatus = 'not_captured'
+  $modelContractStatus = 'unverified'
+  $modelContractGuardDigest = $null
+  $modelContractCriticalMismatches = @()
   $replayBundlePath = [string]$plan.replay_paths.bundle
   $replayBundleDigest = $null
   $replayBundleStatus = 'not_captured'
@@ -784,12 +804,21 @@ foreach ($plan in $plans) {
       $modelServingSnapshotPath = [string]$snapshotCapture.path
       $modelServingSnapshotDigest = [string]$snapshotCapture.digest
       $modelServingSnapshotStatus = [string]$snapshotCapture.status
+      $modelContractStatus = [string]$snapshotCapture.model_contract_status
+      $modelContractGuardDigest = [string]$snapshotCapture.model_contract_guard_digest
+      $modelContractCriticalMismatches = @($snapshotCapture.model_contract_critical_mismatches)
       Write-Host ("[matrix] model_serving_snapshot_status={0} digest={1}" -f `
         $modelServingSnapshotStatus, $modelServingSnapshotDigest)
+      Write-Host ("[matrix] model_contract_status={0} guard_digest={1}" -f `
+        $modelContractStatus, $modelContractGuardDigest)
     } catch {
       $modelServingSnapshotStatus = 'failed'
       $notes.Add('model_serving_snapshot_capture_failed')
       throw
+    }
+    if ($modelContractStatus -ne 'pass') {
+      $notes.Add('model_contract_preflight_failed')
+      throw ("model contract preflight failed: {0}" -f ($modelContractCriticalMismatches -join '; '))
     }
 
     if ($FreshLogs) {
@@ -879,6 +908,7 @@ foreach ($plan in $plans) {
     ($staleEntryCount -eq 0) -and
     ($replayContractStatus -eq 'exact_matrix_snapshot') -and
     ($modelServingSnapshotStatus -eq 'exact_matrix_snapshot') -and
+    ($modelContractStatus -eq 'pass') -and
     ($replayBundleStatus -eq 'exact_bundle')
   )
   Write-Host ("[matrix] {0}: run_started_utc={1} stale_entry_count={2} evidence_valid={3}" -f `
@@ -902,6 +932,9 @@ foreach ($plan in $plans) {
     model_serving_snapshot_path = $modelServingSnapshotPath
     model_serving_snapshot_digest = $modelServingSnapshotDigest
     model_serving_snapshot_status = $modelServingSnapshotStatus
+    model_contract_status = $modelContractStatus
+    model_contract_guard_digest = $modelContractGuardDigest
+    model_contract_critical_mismatches = @($modelContractCriticalMismatches)
     replay_bundle_path = $replayBundlePath
     replay_bundle_digest = $replayBundleDigest
     replay_bundle_status = $replayBundleStatus

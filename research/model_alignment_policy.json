@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "required_timeframe": "5m",
+  "required_sequence_length": 64,
+  "required_served_feature_count": 27,
+  "historical_unique_bars_required": 100,
+  "historical_capture_target": 120,
+  "live_unique_bars_required": 3,
+  "completed_bar_grace_seconds": 5,
+  "maximum_gap_bars": 2,
+  "maximum_missing_rate": 0.05,
+  "flat_output_std_threshold": 0.002,
+  "flat_output_window": 30,
+  "extreme_probability_threshold_low": 0.05,
+  "extreme_probability_threshold_high": 0.95,
+  "extreme_consecutive_limit": 20,
+  "deterministic_repeat_tolerance": 1e-10,
+  "require_exact_sklearn_version_for_reproducibility": true,
+  "allow_symbol_subset_of_training": true,
+  "require_completed_bars": true
+}

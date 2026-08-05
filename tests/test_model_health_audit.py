@@ -14,6 +14,7 @@ from tools.model_health_audit import (
     ModelHealthAuditError,
     analyze_ensemble_variants,
     analyze_historical_probabilities,
+    audit_training_serving_contract,
     parse_writer_diagnostics,
     probability_statistics,
     resolve_historical_model_outputs,
@@ -173,3 +174,24 @@ def test_lstm_tx_and_no_tcn_are_shadow_candidates_and_exclude_tcn_effect():
     encoded = json.dumps(result).lower()
     assert "pnl" not in encoded
     assert "promotion" not in encoded
+
+
+def test_loadable_sklearn_mismatch_is_a_reproducibility_warning_only():
+    snapshot = {
+        "dl_timeframe": "5m", "dl_seq_len": 64, "feature_count": 26,
+        "dl_add_symbol_id": True, "dl_symbols": ["BTCUSDT"],
+        "model_entries": [{
+            "kind": "lstm", "metadata_kind": "lstm", "metadata_timeframe": "5m",
+            "metadata_seq_len": 64, "metadata_n_features": 27,
+            "metadata_symbols": ["BTCUSDT", "ETHUSDT"], "metadata_val_auc": 0.65,
+            "scaler_n_features_in": 27, "scaler_mean_finite": True,
+            "scaler_scale_finite": True, "scaler_feature_names": None,
+            "scaler_filename": "scaler_lstm_latest.joblib",
+            "model_load_status": "loaded",
+            "sklearn_version_status": "loadable_version_mismatch",
+        }],
+    }
+    result = audit_training_serving_contract(snapshot)
+    model = result["models"]["lstm"]
+    assert model["critical_mismatches"] == []
+    assert "loadable_sklearn_version_mismatch_reproducibility_warning" in model["warnings"]

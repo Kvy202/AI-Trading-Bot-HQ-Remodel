@@ -307,6 +307,34 @@ def test_bundle_includes_validated_model_snapshot(tmp_path):
     assert validated["manifest"]["model_serving_snapshot_digest"]
 
 
+def test_new_bundle_preserves_source_bar_provenance_when_present(tmp_path):
+    logs = _logs(tmp_path)
+    _csv(
+        logs / "live_models_by_symbol.csv",
+        [
+            "ts", "symbol", "source_bar_id", "source_bar_open_utc",
+            "source_bar_close_utc", "feature_window_digest", "lstm_p",
+        ],
+        [[
+            "2026-08-03T16:00:30Z", "BTC", "BTC:2026-08-03T16:00:00Z",
+            "2026-08-03T15:55:00Z", "2026-08-03T16:00:00Z", "a" * 64, 0.6,
+        ]],
+    )
+    result = build_replay_bundle(
+        IDENTITY, START, FINISH, _contract(tmp_path),
+        reports_dir=tmp_path / "reports", logs_dir=logs,
+        bundle_root=tmp_path / "bundles", manifest_digest_value="manifest",
+    )
+    manifest = result["manifest"]
+    assert manifest["bar_unique_model_health_evidence"] is True
+    assert manifest["source_bar_provenance_columns"] == [
+        "source_bar_id", "source_bar_open_utc", "source_bar_close_utc",
+        "feature_window_digest",
+    ]
+    validated = validate_replay_bundle(result["bundle_path"])
+    assert validated["manifest"]["bar_unique_model_health_evidence"] is True
+
+
 def test_conflicting_model_probabilities_fail_bundle_capture(tmp_path):
     logs = _logs(tmp_path)
     with (logs / "live_models_by_symbol.csv").open("a", encoding="utf-8", newline="") as handle:

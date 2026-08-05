@@ -353,7 +353,9 @@ def _collect_model_output_file(path: Path, start: datetime, finish: datetime) ->
             raise ReplayBundleError(f"CSV header missing: {path}")
         for order, raw in enumerate(reader):
             row = _normalized_row(raw)
-            timestamp_text = str(row.get("ts", row.get("timestamp", "")) or "").strip()
+            timestamp_text = str(
+                row.get("ts", row.get("timestamp", row.get("source_bar_close_utc", ""))) or ""
+            ).strip()
             timestamp = parse_timestamp(timestamp_text)
             if timestamp is None:
                 malformed += 1
@@ -366,7 +368,8 @@ def _collect_model_output_file(path: Path, start: datetime, finish: datetime) ->
                 continue
             seen_exact.add(digest)
             symbol = str(row.get("symbol", "__pooled__") or "__pooled__").strip()
-            key = (canonical_timestamp(timestamp_text) or timestamp_text, symbol)
+            source_identity = str(row.get("source_bar_id", "") or "").strip()
+            key = (source_identity or canonical_timestamp(timestamp_text) or timestamp_text, symbol)
             previous = logical.get(key)
             if previous is not None and previous != digest:
                 conflicts.append({"file": path.name, "timestamp": key[0], "symbol": symbol,
@@ -402,7 +405,7 @@ def collect_model_output_rows(
     rows = [row for item in files.values() for row in item["rows"]]
     timestamps = sorted(
         value for row in rows
-        if (value := parse_timestamp(row.get("ts", row.get("timestamp", "")))) is not None
+        if (value := parse_timestamp(row.get("ts", row.get("timestamp", row.get("source_bar_close_utc", ""))))) is not None
     )
     rows_by_symbol = Counter(
         str(row.get("symbol", "__pooled__") or "__pooled__") for row in rows
@@ -625,6 +628,8 @@ def bundle_digest(manifest: Mapping[str, Any]) -> str:
             "model_output_digest",
             "model_output_duplicate_count",
             "model_output_conflict_count",
+            "source_bar_provenance_columns",
+            "bar_unique_model_health_evidence",
         )
         if key in manifest
     }
@@ -749,6 +754,18 @@ def build_replay_bundle(
             "model_output_digest": model_outputs["model_output_digest"],
             "model_output_duplicate_count": model_outputs["model_output_duplicate_count"],
             "model_output_conflict_count": model_outputs["model_output_conflict_count"],
+            "source_bar_provenance_columns": [
+                column for column in (
+                    "source_bar_id", "source_bar_open_utc", "source_bar_close_utc",
+                    "feature_window_digest",
+                ) if column in model_outputs["model_output_columns"]
+            ],
+            "bar_unique_model_health_evidence": all(
+                column in model_outputs["model_output_columns"] for column in (
+                    "source_bar_id", "source_bar_open_utc", "source_bar_close_utc",
+                    "feature_window_digest",
+                )
+            ),
         }
         manifest["bundle_digest"] = bundle_digest(manifest)
         (stage / "bundle_manifest.json").write_text(
@@ -827,6 +844,8 @@ def validate_replay_bundle(bundle_dir: Path | str) -> dict[str, Any]:
         "model_output_digest",
         "model_output_duplicate_count",
         "model_output_conflict_count",
+        "source_bar_provenance_columns",
+        "bar_unique_model_health_evidence",
     }
     missing = required_fields - set(manifest)
     unknown = set(manifest) - required_fields - optional_fields
@@ -924,13 +943,14 @@ def validate_replay_bundle(bundle_dir: Path | str) -> dict[str, Any]:
             seen: dict[tuple[str, str], str] = {}
             normalized[name] = []
             for row in values:
-                timestamp_text = row.get("ts", row.get("timestamp", ""))
+                timestamp_text = row.get("ts", row.get("timestamp", row.get("source_bar_close_utc", "")))
                 timestamp = parse_timestamp(timestamp_text)
                 if timestamp is None or not (start <= timestamp <= finish):
                     raise ReplayBundleError("bundle model-output row outside filtering window")
                 symbol = str(row.get("symbol", "__pooled__") or "__pooled__")
                 digest = canonical_row_digest(row)
-                key = (canonical_timestamp(timestamp_text) or str(timestamp_text), symbol)
+                source_identity = str(row.get("source_bar_id", "") or "").strip()
+                key = (source_identity or canonical_timestamp(timestamp_text) or str(timestamp_text), symbol)
                 if key in seen:
                     raise ReplayBundleError("duplicate or conflicting model-output logical row retained")
                 seen[key] = digest

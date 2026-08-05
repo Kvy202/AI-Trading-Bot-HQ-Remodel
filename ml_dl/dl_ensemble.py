@@ -44,13 +44,16 @@ Changelog vs the previous version
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 
 from .dl_infer import load_model, predict_next
@@ -286,15 +289,22 @@ def _load_auc_from_metadata(kind: str) -> float:
 # Load all base models
 # ---------------------------------------------------------------------------
 
-def load_ensemble(X_dim: int, device: Optional[str] = None) -> Tuple[Dict[str, dict], str]:
+def load_ensemble(
+    X_dim: int,
+    device: Optional[str] = None,
+    *,
+    require_all: bool = False,
+) -> Tuple[Dict[str, dict], str]:
     """Load every base model that has on-disk artifacts. Returns (models, device).
 
     `models` is a dict keyed by kind ('tcn', 'lstm', 'tx') where each value is
     {"scaler": ..., "model": ...}. Models that fail to load are skipped and
-    a warning is logged. If NO model loads, RuntimeError is raised - the
-    writer can't do anything useful with zero models.
+    a warning is logged. If NO model loads, RuntimeError is raised.  The live
+    writer uses ``require_all=True`` so a configured/deployed artifact failure
+    cannot silently degrade to a smaller ensemble before contract validation.
     """
     dev = device or _pick_device()
+    load_failures: Dict[str, str] = {}
 
     def maybe_load(kind: str, scaler_env: str, model_env: str) -> Optional[Dict[str, Any]]:
         scaler_path_env = os.getenv(scaler_env, "").strip()
@@ -306,16 +316,43 @@ def load_ensemble(X_dim: int, device: Optional[str] = None) -> Tuple[Dict[str, d
         if not scaler_path or not model_path:
             _LOG.warning("skip %s: missing files scaler=%r model=%r",
                          kind, scaler_path, model_path)
+            load_failures[kind] = "missing model or scaler artifact"
             return None
 
         try:
             scaler, model, _dev = load_model(kind, X_dim, scaler_path, model_path, device=dev)
+            metadata_path_raw = os.getenv(f"DL_{kind.upper()}_METADATA_PATH", "").strip()
+            metadata_path = metadata_path_raw or os.path.join(
+                _default_model_dir(), f"dl_{kind}_metadata.json"
+            )
+            metadata: Optional[Dict[str, Any]] = None
+            metadata_status = "missing"
+            try:
+                with open(metadata_path, encoding="utf-8-sig") as handle:
+                    loaded_metadata = json.load(handle)
+                if isinstance(loaded_metadata, dict):
+                    metadata = loaded_metadata
+                    metadata_status = "loaded"
+                else:
+                    metadata_status = "malformed"
+            except FileNotFoundError:
+                metadata_status = "missing"
+            except Exception:
+                metadata_status = "malformed"
             _LOG.info("loaded %s: scaler=%s model=%s dev=%s",
                       kind, os.path.basename(scaler_path),
                       os.path.basename(model_path), _dev)
-            return {"scaler": scaler, "model": model}
+            return {
+                "scaler": scaler,
+                "model": model,
+                "metadata": metadata,
+                "metadata_status": metadata_status,
+                "scaler_load_status": "loaded",
+                "model_load_status": "loaded",
+            }
         except Exception as e:
             _LOG.warning("failed to load %s: %s", kind, e)
+            load_failures[kind] = f"{type(e).__name__}: {e}"
             return None
 
     models: Dict[str, dict] = {}
@@ -325,6 +362,9 @@ def load_ensemble(X_dim: int, device: Optional[str] = None) -> Tuple[Dict[str, d
     models["adv"] = maybe_load("adv", "DL_ADV_SCALER_PATH", "DL_ADV_MODEL_PATH")
 
     models = {k: v for k, v in models.items() if v is not None}
+    if require_all and load_failures:
+        details = "; ".join(f"{kind}={load_failures[kind]}" for kind in sorted(load_failures))
+        raise RuntimeError(f"required ensemble model/scaler load failure: {details}")
     if not models:
         raise RuntimeError(
             "No ensemble members loaded. Provide *_SCALER_PATH and *_MODEL_PATH envs, "
@@ -579,6 +619,141 @@ def predict_ensemble(
 # Live feature refresh
 # ---------------------------------------------------------------------------
 
+def timeframe_duration_seconds(timeframe: str) -> int:
+    """Return a positive bar duration for standard fixed CCXT timeframes."""
+
+    value = str(timeframe or "").strip().lower()
+    if len(value) < 2 or not value[:-1].isdigit():
+        raise ValueError(f"unsupported timeframe: {timeframe!r}")
+    scale = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}.get(value[-1])
+    if scale is None or int(value[:-1]) <= 0:
+        raise ValueError(f"unsupported timeframe: {timeframe!r}")
+    return int(value[:-1]) * scale
+
+
+def _utc_timestamp(value: Any) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
+def canonical_utc(value: Any) -> str:
+    """Canonical, platform-independent UTC identity string."""
+
+    timestamp = _utc_timestamp(value)
+    if timestamp.microsecond:
+        return timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def source_bar_id(symbol: str, bar_close_utc: Any) -> str:
+    return f"{_norm_symbol(symbol)}:{canonical_utc(bar_close_utc)}"
+
+
+def feature_window_digest(
+    symbol: str,
+    timeframe: str,
+    feature_columns: List[str],
+    feature_timestamps: Any,
+    values: np.ndarray,
+) -> str:
+    """Hash an ordered float32 feature window without machine-specific data."""
+
+    matrix = np.asarray(values, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        raise ValueError("feature window must be a non-empty 2-D matrix")
+    timestamps = list(feature_timestamps)
+    if len(timestamps) != matrix.shape[0]:
+        raise ValueError("feature timestamp count does not match window rows")
+    if len(feature_columns) != matrix.shape[1]:
+        raise ValueError("ordered feature-column count does not match window width")
+    header = {
+        "symbol": _norm_symbol(symbol),
+        "timeframe": str(timeframe).strip().lower(),
+        "feature_columns": [str(value) for value in feature_columns],
+        "first_feature_utc": canonical_utc(timestamps[0]),
+        "last_feature_utc": canonical_utc(timestamps[-1]),
+    }
+    digest = hashlib.sha256(
+        json.dumps(header, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    digest.update(b"\x00")
+    little_endian = np.ascontiguousarray(matrix, dtype=np.dtype("<f4"))
+    digest.update(little_endian.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def completed_bar_mask(
+    bar_open_times: Any,
+    timeframe: str,
+    *,
+    as_of_utc: Any = None,
+    completion_grace_seconds: int = 5,
+) -> np.ndarray:
+    """Return the completed-candle mask defined by the Phase 22 contract."""
+
+    if int(completion_grace_seconds) < 0:
+        raise ValueError("completion_grace_seconds must be non-negative")
+    as_of = _utc_timestamp(
+        datetime.now(timezone.utc) if as_of_utc is None else as_of_utc
+    )
+    duration = pd.Timedelta(seconds=timeframe_duration_seconds(timeframe))
+    grace = pd.Timedelta(seconds=int(completion_grace_seconds))
+    index = pd.DatetimeIndex([_utc_timestamp(value) for value in bar_open_times])
+    return np.asarray(index + duration + grace <= as_of, dtype=bool)
+
+
+def _provenance_for_windows(
+    windows: Mapping[str, np.ndarray],
+    dfs: Any,
+    *,
+    timeframe: str,
+    add_symbol_id: bool,
+    as_of_utc: Any,
+    completion_grace_seconds: int,
+) -> Dict[str, Dict[str, Any]]:
+    from features import canonical_feature_columns
+
+    columns = canonical_feature_columns(add_symbol_id)
+    duration = pd.Timedelta(seconds=timeframe_duration_seconds(timeframe))
+    maps: Dict[str, Dict[str, Any]] = {
+        "source_bar_open_utc_by_symbol": {},
+        "source_bar_close_utc_by_symbol": {},
+        "source_bar_completed_by_symbol": {},
+        "source_bar_id_by_symbol": {},
+        "feature_window_digest_by_symbol": {},
+        "feature_window_row_count_by_symbol": {},
+        "feature_window_first_utc_by_symbol": {},
+        "feature_window_last_utc_by_symbol": {},
+    }
+    if not isinstance(dfs, Mapping):
+        return maps
+    for symbol, window in windows.items():
+        frame = dfs.get(symbol)
+        if frame is None or len(frame) < len(window):
+            continue
+        index = pd.DatetimeIndex([_utc_timestamp(value) for value in frame.index[-len(window):]])
+        bar_open = index[-1]
+        bar_close = bar_open + duration
+        complete = bool(
+            completed_bar_mask(
+                [bar_open], timeframe, as_of_utc=as_of_utc,
+                completion_grace_seconds=completion_grace_seconds,
+            )[0]
+        )
+        maps["source_bar_open_utc_by_symbol"][symbol] = canonical_utc(bar_open)
+        maps["source_bar_close_utc_by_symbol"][symbol] = canonical_utc(bar_close)
+        maps["source_bar_completed_by_symbol"][symbol] = complete
+        maps["source_bar_id_by_symbol"][symbol] = source_bar_id(symbol, bar_close)
+        maps["feature_window_digest_by_symbol"][symbol] = feature_window_digest(
+            symbol, timeframe, columns, index, window
+        )
+        maps["feature_window_row_count_by_symbol"][symbol] = int(len(window))
+        maps["feature_window_first_utc_by_symbol"][symbol] = canonical_utc(index[0])
+        maps["feature_window_last_utc_by_symbol"][symbol] = canonical_utc(index[-1])
+    return maps
+
 def _extract_last_prices_from_dfs(dfs: Any, symbols: Optional[List[str]]) -> Dict[str, float]:
     """Best-effort extraction of {symbol: last_close} from whatever
     load_prices_and_features returned as its second value.
@@ -778,6 +953,9 @@ def refresh_live_features_per_symbol(
     symbols: Optional[list] = None,
     timeframe: Optional[str] = None,
     symbol_id_map: Optional[Dict[str, int]] = None,
+    completed_only: bool = False,
+    as_of_utc: Any = None,
+    completion_grace_seconds: int = 5,
 ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
     """Build ONE feature window PER SYMBOL so each is scored independently.
 
@@ -833,6 +1011,41 @@ def refresh_live_features_per_symbol(
             f"even after pad up to {max_pad} (last error: {last_err})"
         )
 
+    effective_timeframe = str(timeframe or "1m").lower()
+    if completed_only:
+        if not isinstance(dfs, Mapping):
+            raise RuntimeError("completed-only serving requires timestamped per-symbol frames")
+        from features import canonical_feature_columns
+        ordered_columns = canonical_feature_columns(add_symbol_id)
+        filtered_dfs: Dict[str, Any] = {}
+        completed_blocks: List[np.ndarray] = []
+        completed_lengths: List[int] = []
+        for symbol, frame in dfs.items():
+            mask = completed_bar_mask(
+                frame.index,
+                effective_timeframe,
+                as_of_utc=as_of_utc,
+                completion_grace_seconds=completion_grace_seconds,
+            )
+            completed = frame.loc[mask].copy()
+            if len(completed) < seq_len:
+                raise RuntimeError(
+                    f"refresh_live_features_per_symbol: {symbol} has {len(completed)} "
+                    f"completed feature rows (need {seq_len})"
+                )
+            missing = [column for column in ordered_columns if column not in completed.columns]
+            if missing:
+                raise RuntimeError(f"completed feature frame for {symbol} missing columns {missing}")
+            filtered_dfs[symbol] = completed
+            completed_lengths.append(len(completed))
+            completed_blocks.append(np.ascontiguousarray(
+                completed[ordered_columns].to_numpy(dtype=np.float32),
+                dtype=np.float32,
+            ))
+        dfs = filtered_dfs
+        sym_lengths = completed_lengths
+        X_live = np.concatenate(completed_blocks, axis=0)
+
     last_px = _extract_last_prices_from_dfs(dfs, symbols)
 
     # dfs insertion order == the order symbols were stacked into X_live, and
@@ -863,6 +1076,16 @@ def refresh_live_features_per_symbol(
         "rows": int(X_live.shape[0]),
         "pad_used": int(pad_used),
     }
+    meta.update(
+        _provenance_for_windows(
+            windows,
+            dfs,
+            timeframe=effective_timeframe,
+            add_symbol_id=add_symbol_id,
+            as_of_utc=as_of_utc,
+            completion_grace_seconds=completion_grace_seconds,
+        )
+    )
     if not last_px:
         _LOG.warning("refresh_live_features_per_symbol: extracted 0 prices; symbols=%r", symbols)
 

@@ -15,7 +15,10 @@ from ml_dl.dl_models import TemporalConvNet
 
 from tools.model_serving_snapshot import (
     DOCUMENT_FIELDS,
+    DOCUMENT_FIELDS_V1,
     MODEL_ENTRY_FIELDS,
+    MODEL_ENTRY_FIELDS_V1,
+    SNAPSHOT_FIELDS_V1,
     ModelServingSnapshotError,
     capture_model_serving_snapshot,
     snapshot_digest,
@@ -138,4 +141,20 @@ def test_artifacts_are_loaded_read_only(tmp_path):
     tcn = next(entry for entry in snapshot["model_entries"] if entry["kind"] == "tcn")
     assert tcn["model_load_status"] == "loaded"
     assert tcn["model_parameter_count"] > 0
+    assert tcn["sklearn_version_status"] == "exact_match"
+    assert tcn["scaler_serialized_sklearn_version"] == tcn["scaler_runtime_sklearn_version"]
     assert (scaler_path.read_bytes(), model_path.read_bytes()) == before
+
+
+def test_schema_one_snapshot_remains_readable(tmp_path):
+    current = capture_model_serving_snapshot(base_dir=_root(tmp_path))
+    old = {key: current[key] for key in SNAPSHOT_FIELDS_V1}
+    old["schema_version"] = 1
+    old["model_entries"] = [
+        {key: entry[key] for key in MODEL_ENTRY_FIELDS_V1}
+        for entry in current["model_entries"]
+    ]
+    old["generated_at"] = current["generated_at"]
+    old["snapshot_digest"] = snapshot_digest(old)
+    assert set(old) == DOCUMENT_FIELDS_V1
+    assert validate_model_serving_snapshot(old)["valid"] is True

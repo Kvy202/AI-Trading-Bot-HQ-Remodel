@@ -58,6 +58,10 @@ reports/*.json
 # Generated deterministic replay bundles (Phase 20)
 reports/replay_bundles/
 
+# Generated Phase 22 training-serving alignment evidence
+reports/model_alignment_*/
+reports/model_alignment_*.csv
+
 
 # Generated experiment reports
 reports/*.json

@@ -11,9 +11,11 @@ import argparse
 import hashlib
 import json
 import math
+import platform
 import re
 import subprocess
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -21,6 +23,10 @@ from typing import Any, Mapping, Optional, Sequence
 import joblib
 import numpy as np
 import torch
+try:
+    import sklearn
+except Exception:  # pragma: no cover - a missing runtime is reported in the snapshot
+    sklearn = None  # type: ignore
 
 try:
     from tools.replay_contract import (
@@ -40,7 +46,8 @@ except ModuleNotFoundError:
 BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
-SCHEMA_VERSION = 1
+from runtime.model_serving_guard import evaluate_model_serving_contract
+SCHEMA_VERSION = 2
 KINDS = ("lstm", "tcn", "tx", "adv")
 SOURCE_FILES = {
     "live_writer_sha256": "tools/live_writer.py",
@@ -49,7 +56,7 @@ SOURCE_FILES = {
     "dl_models_sha256": "ml_dl/dl_models.py",
     "feature_cols_sha256": "features.py",
 }
-SNAPSHOT_FIELDS = (
+SNAPSHOT_FIELDS_V1 = (
     "schema_version",
     "identity",
     "mode",
@@ -77,8 +84,27 @@ SNAPSHOT_FIELDS = (
     "paper_mode",
     "place_real_orders",
 )
+SNAPSHOT_FIELDS = SNAPSHOT_FIELDS_V1 + (
+    "dl_p_long",
+    "dl_p_long_mode",
+    "dl_allow_only",
+    "dl_bias_adv",
+    "dl_temp_adv",
+    "python_version",
+    "numpy_version",
+    "torch_version",
+    "joblib_version",
+    "sklearn_runtime_version",
+    "training_serving_contract_status",
+    "training_serving_critical_mismatches",
+    "training_serving_warnings",
+    "model_serving_guard_digest",
+    "market_data_exchange",
+    "effective_completed_bar_policy",
+)
+DOCUMENT_FIELDS_V1 = set(SNAPSHOT_FIELDS_V1) | {"generated_at", "snapshot_digest"}
 DOCUMENT_FIELDS = set(SNAPSHOT_FIELDS) | {"generated_at", "snapshot_digest"}
-MODEL_ENTRY_FIELDS = {
+MODEL_ENTRY_FIELDS_V1 = {
     "kind",
     "model_filename",
     "model_sha256",
@@ -104,6 +130,13 @@ MODEL_ENTRY_FIELDS = {
     "model_load_status",
     "model_parameter_count",
     "model_state_key_count",
+}
+MODEL_ENTRY_FIELDS = MODEL_ENTRY_FIELDS_V1 | {
+    "scaler_load_status",
+    "scaler_serialized_sklearn_version",
+    "scaler_runtime_sklearn_version",
+    "sklearn_version_status",
+    "scaler_serialization_warnings",
 }
 SHA_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -245,7 +278,39 @@ def _load_metadata(path: Path) -> tuple[dict[str, Any], str]:
     return (payload, "loaded") if isinstance(payload, dict) else ({}, "malformed")
 
 
+def _serialized_sklearn_version(path: Path, warning_messages: Sequence[str]) -> Optional[str]:
+    warning_pattern = re.compile(
+        r"unpickle estimator .*? from version\s+([0-9]+(?:\.[0-9]+){1,3})",
+        re.IGNORECASE,
+    )
+    for message in warning_messages:
+        match = warning_pattern.search(message)
+        if match:
+            return match.group(1)
+    try:
+        data = path.read_bytes()
+        marker = data.find(b"_sklearn_version")
+        if marker >= 0:
+            match = re.search(rb"([0-9]+\.[0-9]+(?:\.[0-9]+){0,2})", data[marker:marker + 160])
+            if match:
+                return match.group(1).decode("ascii")
+    except Exception:
+        pass
+    return None
+
+
+def _sklearn_version_status(serialized: Optional[str], runtime: Optional[str], loaded: bool) -> str:
+    if serialized is None:
+        return "serialized_version_unknown"
+    if runtime is None:
+        return "runtime_version_unknown"
+    if serialized == runtime:
+        return "exact_match"
+    return "loadable_version_mismatch" if loaded else "runtime_version_unknown"
+
+
 def _scaler_details(path: Path) -> tuple[dict[str, Any], Any]:
+    runtime_version = None if sklearn is None else str(getattr(sklearn, "__version__", "") or "") or None
     empty = {
         "scaler_class": None,
         "scaler_n_features_in": None,
@@ -254,11 +319,20 @@ def _scaler_details(path: Path) -> tuple[dict[str, Any], Any]:
         "scaler_scale_finite": None,
         "scaler_zero_scale_count": None,
         "scaler_near_zero_scale_count": None,
+        "scaler_load_status": "missing" if not path.is_file() else "load_failed",
+        "scaler_serialized_sklearn_version": None,
+        "scaler_runtime_sklearn_version": runtime_version,
+        "sklearn_version_status": "serialized_version_unknown",
+        "scaler_serialization_warnings": [],
     }
     if not path.is_file():
         return empty, None
     try:
-        scaler = joblib.load(path)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            scaler = joblib.load(path)
+        warning_messages = [str(item.message) for item in captured]
+        serialized_version = _serialized_sklearn_version(path, warning_messages)
         mean = np.asarray(getattr(scaler, "mean_", []), dtype=float)
         scale = np.asarray(getattr(scaler, "scale_", []), dtype=float)
         names = getattr(scaler, "feature_names_in_", None)
@@ -270,8 +344,21 @@ def _scaler_details(path: Path) -> tuple[dict[str, Any], Any]:
             "scaler_scale_finite": bool(scale.size and np.isfinite(scale).all()),
             "scaler_zero_scale_count": int(np.count_nonzero(scale == 0)) if scale.size else None,
             "scaler_near_zero_scale_count": int(np.count_nonzero(np.abs(scale) < 1e-12)) if scale.size else None,
+            "scaler_load_status": "loaded",
+            "scaler_serialized_sklearn_version": serialized_version,
+            "scaler_runtime_sklearn_version": runtime_version,
+            "sklearn_version_status": _sklearn_version_status(
+                serialized_version, runtime_version, True
+            ),
+            "scaler_serialization_warnings": warning_messages,
         }, scaler
-    except Exception:
+    except Exception as exc:
+        empty["scaler_serialization_warnings"] = [f"{type(exc).__name__}: scaler_load_failed"]
+        serialized_version = _serialized_sklearn_version(path, empty["scaler_serialization_warnings"])
+        empty["scaler_serialized_sklearn_version"] = serialized_version
+        empty["sklearn_version_status"] = _sklearn_version_status(
+            serialized_version, runtime_version, False
+        )
         return empty, None
 
 
@@ -320,7 +407,11 @@ def _artifact_entry(kind: str, root: Path, env: Mapping[str, str], feature_count
         str(env.get(f"DL_{kind.upper()}_SCALER_PATH", "")),
         [model_dir / f"scaler_{kind}_latest.joblib", model_dir / "scaler_latest.joblib"],
     )
-    metadata_path = model_dir / f"dl_{kind}_metadata.json"
+    metadata_path = _resolve_path(
+        root,
+        str(env.get(f"DL_{kind.upper()}_METADATA_PATH", "")),
+        [model_dir / f"dl_{kind}_metadata.json"],
+    )
     metadata, metadata_status = _load_metadata(metadata_path)
     scaler_info, scaler = _scaler_details(scaler_path)
     model_info, model = _model_details(kind, model_path, scaler, feature_count)
@@ -347,7 +438,8 @@ def _artifact_entry(kind: str, root: Path, env: Mapping[str, str], feature_count
 
 
 def snapshot_digest(snapshot: Mapping[str, Any]) -> str:
-    return _json_digest({key: snapshot.get(key) for key in SNAPSHOT_FIELDS})
+    fields = SNAPSHOT_FIELDS_V1 if snapshot.get("schema_version") == 1 else SNAPSHOT_FIELDS
+    return _json_digest({key: snapshot.get(key) for key in fields})
 
 
 def capture_model_serving_snapshot(
@@ -402,6 +494,9 @@ def capture_model_serving_snapshot(
         "dl_seq_len": _int(env, "DL_SEQ_LEN", 64),
         "dl_add_symbol_id": add_symbol_id,
         "dl_min_agree": _int(env, "DL_MIN_AGREE", 2),
+        "dl_p_long": _float(env, "DL_P_LONG", 0.45),
+        "dl_p_long_mode": str(env.get("DL_P_LONG_MODE", "abs") or "abs").lower(),
+        "dl_allow_only": str(env.get("DL_ALLOW_ONLY", "1") or "1"),
         "dl_model_weights": _parse_weights(str(env.get("DL_MODEL_WEIGHTS", "")), active_kinds, metadata),
         "dl_bias_lstm": _float(env, "DL_BIAS_LSTM", 0.0),
         "dl_bias_tcn": _float(env, "DL_BIAS_TCN", 0.0),
@@ -409,6 +504,8 @@ def capture_model_serving_snapshot(
         "dl_temp_lstm": _float(env, "DL_TEMP_LSTM", 1.0),
         "dl_temp_tcn": _float(env, "DL_TEMP_TCN", 1.0),
         "dl_temp_tx": _float(env, "DL_TEMP_TX", 1.0),
+        "dl_bias_adv": _float(env, "DL_BIAS_ADV", 0.0),
+        "dl_temp_adv": _float(env, "DL_TEMP_ADV", 1.0),
         "model_directory": _relative_or_filename(model_dir, root),
         "model_entries": entries,
         "paper_mode": bool(
@@ -418,8 +515,41 @@ def capture_model_serving_snapshot(
             and not _bool(env, "LIVE_MODE", False)
         ),
         "place_real_orders": _bool(env, "PLACE_REAL_ORDERS", False),
+        "python_version": platform.python_version(),
+        "numpy_version": str(np.__version__),
+        "torch_version": str(torch.__version__),
+        "joblib_version": str(getattr(joblib, "__version__", "unknown")),
+        "sklearn_runtime_version": (
+            None if sklearn is None else str(getattr(sklearn, "__version__", "unknown"))
+        ),
+        "market_data_exchange": str(env.get("EXCHANGE_ID", "bitget") or "bitget").lower(),
+        "effective_completed_bar_policy": {
+            "completed_only": _bool(env, "DL_COMPLETED_ONLY", False),
+            "completion_grace_seconds": _int(env, "DL_COMPLETION_GRACE_SECONDS", 5),
+            "timeframe": str(env.get("DL_TIMEFRAME", "1m") or "1m"),
+        },
         "generated_at": generated_at or _utc_now(),
     }
+    generated_width = (
+        feature_count + int(add_symbol_id) if isinstance(add_symbol_id, bool) else None
+    )
+    guard = evaluate_model_serving_contract(
+        entries,
+        serving_timeframe=snapshot["dl_timeframe"],
+        serving_sequence_length=snapshot["dl_seq_len"],
+        generated_feature_width=generated_width,
+        add_symbol_id=add_symbol_id,
+        serving_symbols=symbols,
+        base_feature_width=feature_count,
+    )
+    snapshot.update(
+        {
+            "training_serving_contract_status": guard["status"],
+            "training_serving_critical_mismatches": guard["critical_mismatches"],
+            "training_serving_warnings": guard["warnings"],
+            "model_serving_guard_digest": guard["guard_digest"],
+        }
+    )
     validate_model_serving_snapshot(snapshot, require_digest=False)
     snapshot["snapshot_digest"] = snapshot_digest(snapshot)
     return snapshot
@@ -428,14 +558,18 @@ def capture_model_serving_snapshot(
 def validate_model_serving_snapshot(snapshot: Mapping[str, Any], *, require_digest: bool = True) -> dict[str, Any]:
     if not isinstance(snapshot, Mapping):
         raise ModelServingSnapshotError("model-serving snapshot must be an object")
-    missing = set(SNAPSHOT_FIELDS) - set(snapshot)
-    unknown = set(snapshot) - DOCUMENT_FIELDS
+    schema = snapshot.get("schema_version")
+    if schema not in {1, 2}:
+        raise ModelServingSnapshotError("snapshot schema_version must be 1 or 2")
+    fields = SNAPSHOT_FIELDS_V1 if schema == 1 else SNAPSHOT_FIELDS
+    document_fields = DOCUMENT_FIELDS_V1 if schema == 1 else DOCUMENT_FIELDS
+    entry_fields = MODEL_ENTRY_FIELDS_V1 if schema == 1 else MODEL_ENTRY_FIELDS
+    missing = set(fields) - set(snapshot)
+    unknown = set(snapshot) - document_fields
     if missing or unknown:
         raise ModelServingSnapshotError(
             f"snapshot fields invalid; missing={sorted(missing)} unknown={sorted(unknown)}"
         )
-    if snapshot.get("schema_version") != SCHEMA_VERSION:
-        raise ModelServingSnapshotError("snapshot schema_version must be 1")
     if snapshot.get("paper_mode") is not True or snapshot.get("place_real_orders") is not False:
         raise ModelServingSnapshotError("unsafe serving snapshot: paper_mode=true and place_real_orders=false required")
     for field in SOURCE_FILES:
@@ -445,12 +579,44 @@ def validate_model_serving_snapshot(snapshot: Mapping[str, Any], *, require_dige
     if not isinstance(entries, list):
         raise ModelServingSnapshotError("model_entries must be a list")
     for entry in entries:
-        if not isinstance(entry, Mapping) or set(entry) != MODEL_ENTRY_FIELDS:
+        if not isinstance(entry, Mapping) or set(entry) != entry_fields:
             raise ModelServingSnapshotError("model entry fields are invalid")
         for path_field in ("model_filename", "scaler_filename", "metadata_filename"):
             value = str(entry.get(path_field) or "")
             if Path(value).is_absolute() or ".." in Path(value).parts:
                 raise ModelServingSnapshotError(f"unsafe model entry path: {path_field}")
+        if schema == 2:
+            if entry.get("sklearn_version_status") not in {
+                "exact_match", "loadable_version_mismatch",
+                "serialized_version_unknown", "runtime_version_unknown",
+            }:
+                raise ModelServingSnapshotError("invalid scaler sklearn_version_status")
+            scaler_warnings = entry.get("scaler_serialization_warnings")
+            if not isinstance(scaler_warnings, list) or not all(
+                isinstance(value, str) for value in scaler_warnings
+            ):
+                raise ModelServingSnapshotError("invalid scaler serialization warnings")
+    if schema == 2:
+        if snapshot.get("training_serving_contract_status") not in {"pass", "fail", "unverified"}:
+            raise ModelServingSnapshotError("invalid training_serving_contract_status")
+        if not SHA_RE.fullmatch(str(snapshot.get("model_serving_guard_digest") or "")):
+            raise ModelServingSnapshotError("invalid model_serving_guard_digest")
+        for field in (
+            "training_serving_critical_mismatches", "training_serving_warnings"
+        ):
+            values = snapshot.get(field)
+            if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                raise ModelServingSnapshotError(f"invalid {field}")
+        completed_policy = snapshot.get("effective_completed_bar_policy")
+        if not isinstance(completed_policy, Mapping) or set(completed_policy) != {
+            "completed_only", "completion_grace_seconds", "timeframe"
+        }:
+            raise ModelServingSnapshotError("invalid effective_completed_bar_policy")
+        if not isinstance(completed_policy.get("completed_only"), bool):
+            raise ModelServingSnapshotError("invalid completed-only setting")
+        grace = completed_policy.get("completion_grace_seconds")
+        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
+            raise ModelServingSnapshotError("invalid completion grace setting")
     expected = snapshot_digest(snapshot)
     if require_digest and snapshot.get("snapshot_digest") != expected:
         raise ModelServingSnapshotError("model-serving snapshot digest mismatch")
@@ -507,14 +673,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-dir", default=str(BASE_DIR))
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--json-out")
+    parser.add_argument(
+        "--paper-safe", action="store_true",
+        help="Apply paper-safe values in memory for a read-only preflight.",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        paper_safe = (
+            {
+                "LIVE_TRADING": "false", "PAPER_TRADING": "true",
+                "LIVE_MODE": "false", "EXEC_PAPER": "true",
+                "PLACE_REAL_ORDERS": "false",
+            }
+            if args.paper_safe or not args.forced_env_json else None
+        )
         snapshot = capture_model_serving_snapshot(
-            args.identity, args.mode, args.forced_env_json, base_dir=args.base_dir
+            args.identity, args.mode, args.forced_env_json, base_dir=args.base_dir,
+            forced_env_overrides=paper_safe,
         )
         if args.json_out:
             write_model_serving_snapshot(snapshot, args.json_out)

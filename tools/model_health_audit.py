@@ -336,6 +336,8 @@ def audit_training_serving_contract(
         auc = _finite_float(entry.get("metadata_val_auc"))
         if auc is not None and auc < low_auc_threshold:
             warnings.append("low_validation_auc")
+        if entry.get("sklearn_version_status") == "loadable_version_mismatch":
+            warnings.append("loadable_sklearn_version_mismatch_reproducibility_warning")
         if not exact_snapshot:
             warnings.append("runtime_values_from_current_local_environment")
         models[kind] = {"comparisons": comparisons, "critical_mismatches": critical,
@@ -690,6 +692,9 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
             "effective_settings": {key: snapshot.get(key) for key in (
                 "dl_symbols", "dl_timeframe", "dl_seq_len", "dl_add_symbol_id", "dl_min_agree", "dl_model_weights"
             )},
+            "training_serving_contract_status": snapshot.get("training_serving_contract_status"),
+            "model_serving_guard_digest": snapshot.get("model_serving_guard_digest"),
+            "sklearn_runtime_version": snapshot.get("sklearn_runtime_version"),
         },
         "training_serving_contract": contract,
         "artifact_inventory": {entry["kind"]: entry for entry in snapshot["model_entries"]},
