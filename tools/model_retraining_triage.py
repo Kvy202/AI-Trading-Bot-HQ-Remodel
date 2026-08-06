@@ -277,6 +277,7 @@ def generate_retraining_specification(
     phase22_report: Mapping[str, Any],
     lineage_report: Mapping[str, Any],
     policy: Mapping[str, Any],
+    canonical_runtime_decision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     feature_names = canonical_feature_columns(True)
     feature_digest = json_digest(feature_names)
@@ -387,6 +388,17 @@ def generate_retraining_specification(
                 "direction_exclusion_and_ensemble_changes_documented": True,
             },
             "required_phase22_rerun": True,
+            "required_canonical_numerical_runtime": (
+                {
+                    "stack_id": canonical_runtime_decision.get("selected_stack_id"),
+                    "python_major_minor": canonical_runtime_decision.get("python_major_minor"),
+                    "package_versions": canonical_runtime_decision.get("package_versions"),
+                    "lock_digest": canonical_runtime_decision.get("canonical_lock_digest"),
+                    "dedicated_environment_only": True,
+                    "main_runtime_migration_allowed": False,
+                }
+                if canonical_runtime_decision else None
+            ),
             "training_config_digest": config_digest,
             "training_dataset_digest": None,
             "candidate_id_is_pretraining_contract_id": True,
@@ -397,8 +409,15 @@ def generate_retraining_specification(
         "generated_at": utc_now(),
         "policy_digest": json_digest(policy),
         "source_runtime_reproducibility_digest": runtime_report.get("reproducibility_digest"),
+        "canonical_runtime_decision_digest": (
+            canonical_runtime_decision.get("decision_digest")
+            if canonical_runtime_decision else None
+        ),
         "models": specifications,
-        "training_allowed_by_this_specification": False,
+        "training_allowed_by_this_specification": bool(
+            canonical_runtime_decision
+            and canonical_runtime_decision.get("phase24_candidate_training_allowed") is True
+        ),
         "promotion_implemented": False,
         "incumbent_overwrite_allowed": False,
     }
@@ -417,6 +436,8 @@ def build_retraining_triage_report(
     policy: Mapping[str, Any],
     candidate_registry: Mapping[str, Any],
     models: Sequence[str] | None = None,
+    canonical_runtime_decision: Mapping[str, Any] | None = None,
+    runtime_attribution_report: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     validate_candidate_registry(candidate_registry)
     bundle_digest = runtime_report.get("input_bundle", {}).get("bundle_digest")
@@ -461,17 +482,64 @@ def build_retraining_triage_report(
         and runtime_report.get("overall_decision", {}).get("worker_runs_deterministic") is True
         and runtime_report.get("overall_decision", {}).get("model_forward_passes_deterministic") is True
     )
+    phase23_1_supplied = canonical_runtime_decision is not None or runtime_attribution_report is not None
+    if phase23_1_supplied and not (canonical_runtime_decision and runtime_attribution_report):
+        raise RetrainingTriageError(
+            "canonical runtime decision and runtime attribution report must be supplied together"
+        )
+    canonical_resolved = False
+    numerical_status = None
+    behavioral_status = None
+    if canonical_runtime_decision and runtime_attribution_report:
+        if (
+            canonical_runtime_decision.get("attribution_digest")
+            != runtime_attribution_report.get("attribution_digest")
+        ):
+            raise RetrainingTriageError("canonical runtime decision attribution digest mismatch")
+        if runtime_attribution_report.get("confidence") == "unresolved":
+            raise RetrainingTriageError("runtime stack attribution remains unresolved")
+        numerical_status = canonical_runtime_decision.get("numerical_status")
+        behavioral_status = canonical_runtime_decision.get("behavioral_status")
+        canonical_resolved = bool(
+            canonical_runtime_decision.get("decision_status") == "canonical_stack_selected"
+            and canonical_runtime_decision.get("selected_stack_id") == "serialized_full_stack"
+            and canonical_runtime_decision.get("phase24_candidate_training_allowed") is True
+            and canonical_runtime_decision.get("phase24_environment_scope")
+            == ".venv-runtime-isolation/serialized_full_stack"
+            and canonical_runtime_decision.get("deterministic_workers") is True
+            and canonical_runtime_decision.get("deterministic_model_inference") is True
+            and canonical_runtime_decision.get("all_behavior_change_counts_zero") is True
+            and behavioral_status == "behaviorally_reproducible"
+            and canonical_runtime_decision.get("main_runtime_migration_allowed") is False
+            and canonical_runtime_decision.get("live_activation_allowed") is False
+        )
     phase24_allowed = bool(
-        runtime_verdict == "runtime_reproducibility_verified_no_material_delta"
-        and runtime_complete and integrity_pass and artifact_integrity_pass
+        (canonical_resolved or (
+            not phase23_1_supplied
+            and runtime_verdict == "runtime_reproducibility_verified_no_material_delta"
+            and runtime_complete
+        ))
+        and integrity_pass and artifact_integrity_pass
         and gaps_documented and artifact_safe
         and lineage_verdict != "training_lineage_conflicting"
         and failure_report.get("overall_decision", {}).get("verdict") == "failure_triage_complete"
     )
-    if runtime_verdict == "runtime_reproducibility_material_behavior_delta":
+    if canonical_resolved:
+        for decision in decisions.values():
+            provisional = decision.get("provisional_action_after_runtime_resolution")
+            if provisional in PRIMARY_ACTIONS:
+                decision["primary_action"] = provisional
+                decision["retention_scope"] = (
+                    "shadow_only" if provisional.startswith("retain_incumbent") else None
+                )
+                decision["runtime_block_resolved_by_canonical_stack"] = True
+    if phase23_1_supplied and not canonical_resolved:
         verdict = "retraining_triage_blocked_runtime_difference"
         final = "model_reproducibility_material_difference_requires_resolution"
-    elif runtime_verdict != "runtime_reproducibility_verified_no_material_delta":
+    elif runtime_verdict == "runtime_reproducibility_material_behavior_delta" and not canonical_resolved:
+        verdict = "retraining_triage_blocked_runtime_difference"
+        final = "model_reproducibility_material_difference_requires_resolution"
+    elif not canonical_resolved and runtime_verdict != "runtime_reproducibility_verified_no_material_delta":
         verdict = "retraining_triage_tooling_ready_comparison_pending"
         final = "model_reproducibility_tooling_ready_runtime_comparison_pending"
     elif lineage_verdict == "training_lineage_conflicting":
@@ -486,6 +554,7 @@ def build_retraining_triage_report(
     specification = generate_retraining_specification(
         decisions=decisions, runtime_report=runtime_report, phase22_report=phase22_report,
         lineage_report=lineage_report, policy=policy,
+        canonical_runtime_decision=canonical_runtime_decision,
     )
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -498,6 +567,21 @@ def build_retraining_triage_report(
         "candidate_registry_digest": json_digest(candidate_registry),
         "retraining_policy_validated": True,
         "runtime_comparison_complete": runtime_complete,
+        "runtime_stack_isolation_completed": canonical_resolved,
+        "runtime_attribution_digest": (
+            runtime_attribution_report.get("attribution_digest")
+            if runtime_attribution_report else None
+        ),
+        "canonical_runtime_decision_digest": (
+            canonical_runtime_decision.get("decision_digest")
+            if canonical_runtime_decision else None
+        ),
+        "canonical_stack_id": (
+            canonical_runtime_decision.get("selected_stack_id")
+            if canonical_runtime_decision else None
+        ),
+        "numerical_reproducibility_status": numerical_status,
+        "behavioral_reproducibility_status": behavioral_status,
         "incumbent_artifact_integrity_result": "pass" if artifact_integrity_pass else "failed_or_unverified",
         "model_decisions": decisions,
         "overall_decision": {"verdict": verdict, "final_implementation_verdict": final},
@@ -532,6 +616,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--json-out", required=True)
     parser.add_argument("--policy", default=str(DEFAULT_POLICY))
     parser.add_argument("--candidate-registry", default=str(DEFAULT_REGISTRY))
+    parser.add_argument("--canonical-runtime-decision")
+    parser.add_argument("--runtime-attribution-report")
     parser.add_argument("--model", action="append")
     parser.add_argument("--strict", action="store_true")
     return parser
@@ -544,11 +630,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime = _load_report(args.runtime_report, "reproducibility_digest")
         failure = _load_report(args.failure_report, "failure_triage_digest")
         lineage = _load_report(args.lineage_report, "training_lineage_digest")
+        canonical = (
+            _load_report(args.canonical_runtime_decision, "decision_digest")
+            if args.canonical_runtime_decision else None
+        )
+        attribution = (
+            _load_report(args.runtime_attribution_report, "attribution_digest")
+            if args.runtime_attribution_report else None
+        )
         registry = json.loads(Path(args.candidate_registry).read_text(encoding="utf-8-sig"))
         report, specification = build_retraining_triage_report(
             phase22_report=phase22, runtime_report=runtime, failure_report=failure,
             lineage_report=lineage, policy=load_retraining_policy(args.policy),
             candidate_registry=registry, models=args.model,
+            canonical_runtime_decision=canonical,
+            runtime_attribution_report=attribution,
         )
         spec_target = ensure_safe_report_output(args.spec_out)
         report_target = ensure_safe_report_output(args.json_out)

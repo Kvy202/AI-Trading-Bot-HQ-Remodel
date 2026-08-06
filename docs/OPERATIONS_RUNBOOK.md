@@ -661,3 +661,48 @@ After a successful comparison, generate failure, lineage, and retraining
 triage reports with the Phase 23 CLIs. `phase24_allowed` means only that
 versioned candidate training work may begin; it never means live use or
 promotion is approved.
+
+## Phase 23.1: runtime stack isolation and canonical training pin
+
+Phase 23.1 changes one scaler-only numerical dependency at a time below
+`.venv-runtime-isolation`. These environments contain NumPy, SciPy, joblib,
+scikit-learn, and threadpoolctl only. They never replace or install into the
+project `.venv`. The immutable Phase 22 bundle is the only comparison input;
+model inference for every scaled array uses the unchanged main CPU PyTorch
+runtime.
+
+Preview every exact version and output path without creating an environment or
+report:
+
+```powershell
+python tools/runtime_stack_isolation.py --inventory-only
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\run_runtime_stack_isolation.ps1" -DryRun
+```
+
+After unit-test and code review, create the primary isolated stacks and compare
+them. If no single-package stack explains the full delta, the same invocation
+creates only the required interaction stacks and repeats the comparison:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File ".\tools\run_runtime_stack_isolation.ps1" `
+  -Bootstrap -Compare `
+  -Bundle ".\reports\model_alignment_bundles\history_5m_final"
+
+python tools/runtime_stack_attribution.py `
+  --isolation-report reports/runtime_stack_isolation.json `
+  --json-out reports/runtime_stack_attribution.json
+
+python tools/runtime_stack_decision.py `
+  --isolation-report reports/runtime_stack_isolation.json `
+  --attribution-report reports/runtime_stack_attribution.json `
+  --json-out reports/runtime_stack_decision.json
+```
+
+Canonical selection pins only the scaler-side numerical packages in
+`requirements/model_numeric_canonical.txt`. It permits future Phase 24
+candidate work only inside the selected dedicated environment. The current
+serving runtime remains noncanonical and migration-blocked, and live activation
+and promotion remain disallowed. A numerical delta remains material under the
+strict Phase 23 tolerances even when every direction, exclusion, allow,
+agreement, and ensemble decision is unchanged.

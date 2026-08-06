@@ -73,6 +73,15 @@ reports/model_retraining_specification.json
 reports/model_runtime_repro_*.log
 model_artifacts/candidates/
 
+# Generated Phase 23.1 runtime-stack isolation evidence
+.venv-runtime-isolation/
+reports/runtime_stack_*/
+reports/runtime_stack_isolation.json
+reports/runtime_stack_attribution.json
+reports/runtime_stack_decision.json
+reports/model_retraining_triage_phase23_1.json
+reports/model_retraining_specification_phase23_1.json
+
 
 # Generated experiment reports
 reports/*.json
