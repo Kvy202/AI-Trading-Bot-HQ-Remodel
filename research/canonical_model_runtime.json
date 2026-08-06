@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "decision_status": "canonical_stack_selected",
+  "selected_stack_id": "serialized_full_stack",
+  "python_major_minor": "3.13",
+  "package_versions": {
+    "numpy": "2.3.3",
+    "scipy": "1.16.2",
+    "joblib": "1.5.2",
+    "scikit-learn": "1.8.0",
+    "threadpoolctl": "3.6.0"
+  },
+  "source_bundle_digest": "43597484148a569c4827ff1f1378048264e9a46878ba846efccbb81ee9362843",
+  "source_alignment_digest": "5f167c7d41e24ca048dd1ea82c3d66ebfd32fed7ed176caddf084a18d7412d4f",
+  "source_isolation_digest": "979b8da09274b3bfb45c5458e7641d580531ed6edf5e4a1c1e03f36a40d2ce4e",
+  "attribution_digest": "691cbe706e64c787151c8158472e65c20c75541d4e268f2e3d93dcc6a3c6b737",
+  "bitwise_status": "not_bitwise_reproducible",
+  "numerical_status": "numerically_material_difference",
+  "behavioral_status": "behaviorally_reproducible",
+  "deterministic_workers": true,
+  "deterministic_model_inference": true,
+  "all_behavior_change_counts_zero": true,
+  "current_main_runtime_is_canonical": false,
+  "main_runtime_migration_allowed": false,
+  "phase24_candidate_training_allowed": true,
+  "phase24_environment_scope": ".venv-runtime-isolation/serialized_full_stack",
+  "live_activation_allowed": false,
+  "canonical_lock_digest": "9fb582280151766c103fe9723669dd1a86313223ba15b826845a8529569546f0",
+  "decision_reasons": [
+    "stack matches the incumbent scaler serialization version",
+    "all incumbent scalers loaded and all worker repeats were deterministic",
+    "main-runtime PyTorch inference repeated deterministically",
+    "all required behavioral decision-change counts were zero",
+    "the exact numerical package inventory is fully pinned"
+  ],
+  "final_implementation_verdict": "runtime_stack_isolated_canonical_training_stack_selected",
+  "decision_digest": "5fb5139a9efccfe62159dc625bf419b9900d5e4e694a3b836f33edc29e5a14f6"
+}

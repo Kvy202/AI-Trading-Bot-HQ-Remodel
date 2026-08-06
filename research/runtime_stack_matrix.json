@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "python_major_minor": "3.13",
+  "packages": ["numpy", "scipy", "joblib", "scikit-learn", "threadpoolctl"],
+  "stacks": {
+    "observed_main": {
+      "phase": "primary",
+      "environment_required": false,
+      "changed_packages": [],
+      "package_versions": {
+        "numpy": "2.3.2",
+        "scipy": "1.16.1",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.7.1",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "declared_sklearn_only": {
+      "phase": "primary",
+      "environment_required": true,
+      "changed_packages": ["scikit-learn"],
+      "package_versions": {
+        "numpy": "2.3.2",
+        "scipy": "1.16.1",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.7.2",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "sklearn_only_180": {
+      "phase": "primary",
+      "environment_required": true,
+      "changed_packages": ["scikit-learn"],
+      "package_versions": {
+        "numpy": "2.3.2",
+        "scipy": "1.16.1",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.8.0",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "numpy_only_233": {
+      "phase": "primary",
+      "environment_required": true,
+      "changed_packages": ["numpy"],
+      "package_versions": {
+        "numpy": "2.3.3",
+        "scipy": "1.16.1",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.7.1",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "scipy_only_162": {
+      "phase": "primary",
+      "environment_required": true,
+      "changed_packages": ["scipy"],
+      "package_versions": {
+        "numpy": "2.3.2",
+        "scipy": "1.16.2",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.7.1",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "joblib_only_152": {
+      "phase": "primary",
+      "environment_required": true,
+      "changed_packages": ["joblib"],
+      "package_versions": {
+        "numpy": "2.3.2",
+        "scipy": "1.16.1",
+        "joblib": "1.5.2",
+        "scikit-learn": "1.7.1",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "serialized_full_stack": {
+      "phase": "primary",
+      "environment_required": true,
+      "changed_packages": ["numpy", "scipy", "joblib", "scikit-learn"],
+      "package_versions": {
+        "numpy": "2.3.3",
+        "scipy": "1.16.2",
+        "joblib": "1.5.2",
+        "scikit-learn": "1.8.0",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "numpy_233_sklearn_180": {
+      "phase": "interaction",
+      "environment_required": true,
+      "changed_packages": ["numpy", "scikit-learn"],
+      "package_versions": {
+        "numpy": "2.3.3",
+        "scipy": "1.16.1",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.8.0",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "scipy_162_sklearn_180": {
+      "phase": "interaction",
+      "environment_required": true,
+      "changed_packages": ["scipy", "scikit-learn"],
+      "package_versions": {
+        "numpy": "2.3.2",
+        "scipy": "1.16.2",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.8.0",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "joblib_152_sklearn_180": {
+      "phase": "interaction",
+      "environment_required": true,
+      "changed_packages": ["joblib", "scikit-learn"],
+      "package_versions": {
+        "numpy": "2.3.2",
+        "scipy": "1.16.1",
+        "joblib": "1.5.2",
+        "scikit-learn": "1.8.0",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "numpy_233_scipy_162": {
+      "phase": "interaction",
+      "environment_required": true,
+      "changed_packages": ["numpy", "scipy"],
+      "package_versions": {
+        "numpy": "2.3.3",
+        "scipy": "1.16.2",
+        "joblib": "1.5.1",
+        "scikit-learn": "1.7.1",
+        "threadpoolctl": "3.6.0"
+      }
+    },
+    "numpy_233_joblib_152": {
+      "phase": "interaction",
+      "environment_required": true,
+      "changed_packages": ["numpy", "joblib"],
+      "package_versions": {
+        "numpy": "2.3.3",
+        "scipy": "1.16.1",
+        "joblib": "1.5.2",
+        "scikit-learn": "1.7.1",
+        "threadpoolctl": "3.6.0"
+      }
+    }
+  }
+}

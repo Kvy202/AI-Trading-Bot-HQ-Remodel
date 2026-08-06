@@ -1,8 +1,8 @@
-"""Deterministic, scaler-only worker for Phase 23.
+"""Deterministic, scaler-only worker for Phases 23 and 23.1.
 
 This module intentionally has no PyTorch or trading-runtime dependencies.  It
 loads one immutable scaler, transforms an authenticated float32 window set,
-and writes both float64 and float32 views of the result.
+and writes sklearn plus manual StandardScaler decomposition paths.
 """
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ def _assert_safe_output_paths(
         REPOSITORY_ROOT / "config",
         REPOSITORY_ROOT / ".venv",
         REPOSITORY_ROOT / ".venv-repro-sklearn180",
+        REPOSITORY_ROOT / ".venv-runtime-isolation",
     )
     for output in outputs:
         if output in {REPOSITORY_ROOT / ".env", REPOSITORY_ROOT / "features.py"}:
@@ -121,6 +122,56 @@ def logical_array_digest(arrays: Mapping[str, np.ndarray], *, exclude: Sequence[
         digest.update(payload)
         digest.update(b"\x00")
     return digest.hexdigest()
+
+
+def maximum_ulp_distance(left: np.ndarray, right: np.ndarray) -> int | None:
+    """Return the deterministic maximum representable-step distance.
+
+    ULP distance is meaningful only for same-shaped float32 or float64 arrays.
+    The ordered unsigned representation keeps the calculation vectorized and
+    well-defined across negative and positive finite values.
+    """
+
+    first, second = np.asarray(left), np.asarray(right)
+    if first.shape != second.shape or first.dtype != second.dtype:
+        raise ScalerWorkerError("ULP comparison requires equal shapes and dtypes")
+    if first.dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        return None
+    if not np.isfinite(first).all() or not np.isfinite(second).all():
+        raise ScalerWorkerError("ULP comparison requires finite values")
+    if first.dtype == np.dtype(np.float32):
+        unsigned = np.uint32
+        sign_mask = np.uint32(1 << 31)
+        wide = np.uint64
+    else:
+        unsigned = np.uint64
+        sign_mask = np.uint64(1 << 63)
+        wide = np.uint64
+
+    def ordered(value: np.ndarray) -> np.ndarray:
+        bits = np.ascontiguousarray(value).view(unsigned)
+        return np.where((bits & sign_mask) != 0, ~bits, bits ^ sign_mask).astype(wide)
+
+    a, b = ordered(first), ordered(second)
+    distance = np.maximum(a, b) - np.minimum(a, b)
+    return int(np.max(distance)) if distance.size else 0
+
+
+def numeric_comparison(left: np.ndarray, right: np.ndarray) -> dict[str, Any]:
+    first, second = np.asarray(left), np.asarray(right)
+    if first.shape != second.shape:
+        raise ScalerWorkerError("decomposition comparison shape mismatch")
+    absolute = np.abs(first.astype(np.float64) - second.astype(np.float64))
+    return {
+        "exact_equal": bool(np.array_equal(first, second)),
+        "exact_equal_count": int(np.count_nonzero(first == second)),
+        "exact_equal_rate": float(np.mean(first == second)) if first.size else 1.0,
+        "max_absolute_error": float(np.max(absolute)) if absolute.size else 0.0,
+        "mean_absolute_error": float(np.mean(absolute)) if absolute.size else 0.0,
+        "maximum_ulp_distance": (
+            maximum_ulp_distance(first, second) if first.dtype == second.dtype else None
+        ),
+    }
 
 
 def write_deterministic_npz(path: Path | str, arrays: Mapping[str, np.ndarray]) -> Path:
@@ -193,11 +244,11 @@ def runtime_versions() -> dict[str, str]:
     }
 
 
-def transform_windows(
+def decompose_transform_paths(
     scaler_path: Path | str,
     windows: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, list[str], list[str], dict[str, Any]]:
-    """Load a scaler read-only and execute independent float64/float32 transforms.
+) -> tuple[dict[str, np.ndarray], list[str], list[str], dict[str, Any], dict[str, Any]]:
+    """Load a scaler read-only and execute sklearn/manual arithmetic paths.
 
     The authenticated source values are float32.  Casting those exact values to
     float64 before one transform preserves the input values while exercising
@@ -225,6 +276,18 @@ def transform_windows(
         )
     flat32 = np.ascontiguousarray(windows.reshape(-1, expected_width), dtype=np.float32)
     flat64 = np.ascontiguousarray(flat32, dtype=np.float64)
+    if not hasattr(scaler, "mean_") or not hasattr(scaler, "scale_"):
+        raise ScalerWorkerError("scaler does not expose loaded mean_ and scale_")
+    mean_loaded = np.asarray(scaler.mean_)
+    scale_loaded = np.asarray(scaler.scale_)
+    if (
+        mean_loaded.shape != (expected_width,)
+        or scale_loaded.shape != (expected_width,)
+        or not np.isfinite(mean_loaded).all()
+        or not np.isfinite(scale_loaded).all()
+        or np.any(scale_loaded == 0)
+    ):
+        raise ScalerWorkerError("scaler mean_/scale_ decomposition contract is invalid")
     with warnings.catch_warnings(record=True) as transformed_warnings:
         warnings.simplefilter("always")
         transformed64 = np.asarray(scaler.transform(flat64), dtype=np.float64)
@@ -238,6 +301,20 @@ def transform_windows(
         raise ScalerWorkerError("scaler produced an invalid transformed matrix")
     float64 = np.ascontiguousarray(transformed64, dtype=np.float64).reshape(windows.shape)
     float32 = np.ascontiguousarray(transformed32, dtype=np.float32).reshape(windows.shape)
+    mean64 = np.ascontiguousarray(mean_loaded, dtype=np.float64)
+    scale64 = np.ascontiguousarray(scale_loaded, dtype=np.float64)
+    mean32 = np.ascontiguousarray(mean_loaded, dtype=np.float32)
+    scale32 = np.ascontiguousarray(scale_loaded, dtype=np.float32)
+    manual64_flat = np.ascontiguousarray((flat64 - mean64) / scale64, dtype=np.float64)
+    manual64_then32_flat = np.ascontiguousarray(manual64_flat, dtype=np.float32)
+    manual32_flat = np.ascontiguousarray((flat32 - mean32) / scale32, dtype=np.float32)
+    paths = {
+        "sklearn_transform_float64_input": float64,
+        "sklearn_transform_float32_input": float32,
+        "manual_float64_formula": manual64_flat.reshape(windows.shape),
+        "manual_float64_then_float32": manual64_then32_flat.reshape(windows.shape),
+        "manual_float32_formula": manual32_flat.reshape(windows.shape),
+    }
     all_warnings = [*captured, *transformed_warnings]
     categories = [item.category.__name__ for item in all_warnings]
     messages = [sanitize_warning(str(item.message)) for item in all_warnings]
@@ -253,7 +330,72 @@ def transform_windows(
             if hasattr(scaler, "scale_") else None
         ),
     }
-    return float64, float32, categories, messages, metadata
+    path_metadata = {
+        "sklearn_transform_float64_input": {
+            "input_dtype": "float64", "mean_dtype": str(mean_loaded.dtype),
+            "scale_dtype": str(scale_loaded.dtype), "arithmetic_dtype": "runtime_managed",
+            "output_dtype": "float64",
+        },
+        "sklearn_transform_float32_input": {
+            "input_dtype": "float32", "mean_dtype": str(mean_loaded.dtype),
+            "scale_dtype": str(scale_loaded.dtype), "arithmetic_dtype": "runtime_managed",
+            "output_dtype": "float32",
+        },
+        "manual_float64_formula": {
+            "input_dtype": "float64", "mean_dtype": "float64", "scale_dtype": "float64",
+            "arithmetic_dtype": "float64", "output_dtype": "float64",
+        },
+        "manual_float64_then_float32": {
+            "input_dtype": "float64", "mean_dtype": "float64", "scale_dtype": "float64",
+            "arithmetic_dtype": "float64_then_cast", "output_dtype": "float32",
+        },
+        "manual_float32_formula": {
+            "input_dtype": "float32", "mean_dtype": "float32", "scale_dtype": "float32",
+            "arithmetic_dtype": "float32", "output_dtype": "float32",
+        },
+    }
+    references = {
+        "sklearn_transform_float64_input": "manual_float64_formula",
+        "sklearn_transform_float32_input": "manual_float32_formula",
+        "manual_float64_formula": "sklearn_transform_float64_input",
+        "manual_float64_then_float32": "sklearn_transform_float32_input",
+        "manual_float32_formula": "sklearn_transform_float32_input",
+    }
+    for name, values in paths.items():
+        path_metadata[name]["output_digest"] = logical_array_digest({name: values})
+        reference = references[name]
+        path_metadata[name]["comparison_reference"] = reference
+        path_metadata[name]["comparison"] = numeric_comparison(values, paths[reference])
+    decomposition = {
+        "formula": "(X - mean_) / scale_",
+        "scaler_refit_performed": False,
+        "paths": path_metadata,
+        "comparisons": {
+            "sklearn_float64_vs_manual_float64": numeric_comparison(float64, paths["manual_float64_formula"]),
+            "sklearn_float32_vs_manual_float32": numeric_comparison(float32, paths["manual_float32_formula"]),
+            "sklearn_float32_vs_manual_float64_then_float32": numeric_comparison(
+                float32, paths["manual_float64_then_float32"]
+            ),
+            "manual_float32_vs_manual_float64_then_float32": numeric_comparison(
+                paths["manual_float32_formula"], paths["manual_float64_then_float32"]
+            ),
+        },
+    }
+    return paths, categories, messages, metadata, decomposition
+
+
+def transform_windows(
+    scaler_path: Path | str,
+    windows: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, list[str], list[str], dict[str, Any]]:
+    """Backward-compatible Phase 23 entry point."""
+
+    paths, categories, messages, metadata, _ = decompose_transform_paths(scaler_path, windows)
+    return (
+        paths["sklearn_transform_float64_input"],
+        paths["sklearn_transform_float32_input"],
+        categories, messages, metadata,
+    )
 
 
 def run_worker(
@@ -271,10 +413,15 @@ def run_worker(
     )
     arrays = read_npz(windows_npz)
     windows, input_digest = validate_windows_payload(arrays)
-    float64, float32, categories, messages, scaler_metadata = transform_windows(scaler, windows)
+    paths, categories, messages, scaler_metadata, decomposition = decompose_transform_paths(
+        scaler, windows
+    )
+    float64 = paths["sklearn_transform_float64_input"]
+    float32 = paths["sklearn_transform_float32_input"]
     output_arrays = {
         "transformed_float64": float64,
         "transformed_float32": float32,
+        **paths,
         "symbols": np.asarray(arrays["symbols"]),
         "source_bar_ids": np.asarray(arrays["source_bar_ids"]),
         "source_bar_open_utc": np.asarray(arrays["source_bar_open_utc"]),
@@ -296,6 +443,7 @@ def run_worker(
         "input_feature_width": int(windows.shape[2]),
         "output_float64_digest": output64_digest,
         "output_float32_digest": output32_digest,
+        "transform_decomposition": decomposition,
         "warning_categories": categories,
         "warning_messages_sanitized": messages,
         "worker_code_digest": sha256_file(Path(__file__)),
