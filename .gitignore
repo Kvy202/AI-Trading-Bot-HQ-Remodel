@@ -62,6 +62,17 @@ reports/replay_bundles/
 reports/model_alignment_*/
 reports/model_alignment_*.csv
 
+# Generated Phase 23 runtime-reproducibility and retraining evidence
+.venv-repro-sklearn180/
+reports/model_runtime_reproducibility.json
+reports/model_runtime_reproducibility_*/
+reports/model_failure_triage.json
+reports/training_lineage_audit.json
+reports/model_retraining_triage.json
+reports/model_retraining_specification.json
+reports/model_runtime_repro_*.log
+model_artifacts/candidates/
+
 
 # Generated experiment reports
 reports/*.json

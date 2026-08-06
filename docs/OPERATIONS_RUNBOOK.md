@@ -631,3 +631,33 @@ processes; it does not silently change a normal matrix run from 1 minute to 5
 minutes. A scikit-learn artifact/runtime mismatch remains an explicit
 reproducibility warning and must be remediated manually—no Phase 22 tool changes
 installed dependencies.
+
+## Phase 23: runtime reproducibility and retraining triage
+
+Phase 23 is an offline, read-only diagnostic. It uses the completed Phase 22
+bundle and never fetches replacement market data, changes incumbent artifacts,
+or authorizes model activation. The dedicated environment contains only the
+scaler transformation dependencies and is separate from `.venv`.
+
+Inventory and safe runbook preview:
+
+```powershell
+python tools/model_runtime_repro.py --inventory-only
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\run_model_runtime_repro.ps1" -DryRun
+```
+
+Create or validate the dedicated environment, then compare:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\tools\run_model_runtime_repro.ps1" -Bootstrap -Compare -Bundle ".\reports\model_alignment_bundles\history_5m_final"
+```
+
+The environment path is fixed at `.venv-repro-sklearn180`. An existing
+environment is reused only when its requirements digest, Python major/minor,
+and exact package versions match. A mismatch is a hard failure; remove or
+archive that dedicated environment manually before deliberately rebuilding it.
+
+After a successful comparison, generate failure, lineage, and retraining
+triage reports with the Phase 23 CLIs. `phase24_allowed` means only that
+versioned candidate training work may begin; it never means live use or
+promotion is approved.
