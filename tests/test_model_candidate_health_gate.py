@@ -127,3 +127,23 @@ def test_confirmation_gate_is_separate_and_requires_internal_and_legacy_passes()
     assert 'legacy.get("status") != "legacy_repair_passed"' in source
     assert "record_confirmation_access" in source
     assert "selection" not in gate._inference_health.__code__.co_names
+
+
+def test_negative_rv_auxiliary_failure_blocks_health_gate_status():
+    failed_aux = {
+        "auxiliary_head_safety_gate_passed": False,
+        "hard_failure_reasons": ["auxiliary_failed_negative_rv"],
+    }
+    btc = {**_healthy(), "auxiliary_prediction_health": failed_aux}
+    result = gate.gate_acceptance(
+        "lstm", {"BTCUSDT": btc, "ETHUSDT": _healthy()}, gate="confirmation"
+    )
+    assert result["status"] == "auxiliary_head_gate_failed"
+    assert result["auxiliary_head_safety_gate_passed"] is False
+    assert "auxiliary_head_gate_failed" in result["per_symbol_failure_reasons"]["BTCUSDT"]
+
+
+def test_classification_only_mode_cannot_pass_health_confirmation():
+    source = open(gate.__file__, encoding="utf-8").read()
+    assert "classification-only mode cannot produce health_gate_passed" in source
+    assert "metadata.get(\"training_objective\"" in source

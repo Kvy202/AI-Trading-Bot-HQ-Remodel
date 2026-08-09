@@ -18,6 +18,8 @@ from tools.model_candidate_evaluate import (
     ModelCandidateEvaluationError,
     _load_candidate,
     _load_incumbent,
+    auxiliary_prediction_health,
+    infer_raw_outputs,
     infer_raw_probabilities,
     load_legacy_repair_windows,
     probability_health_statistics,
@@ -42,6 +44,8 @@ from tools.model_training_environment import (
     utc_now,
     validate_phase24_evidence,
 )
+from tools.model_candidate_objective import OBJECTIVE_NAME
+from tools.model_objective_contract import ObjectiveContractError, validate_objective_report
 
 
 CONFIRMATION_ACCESS_LEDGER = BASE_DIR / "reports" / "model_candidate_confirmation_access.json"
@@ -63,6 +67,9 @@ def _critical_reasons(stats: Mapping[str, Any]) -> list[str]:
         reasons.append("nonfinite_outputs")
     if stats.get("deterministic_repeat_passed") is not True:
         reasons.append("deterministic_repeat")
+    auxiliary = stats.get("auxiliary_prediction_health")
+    if isinstance(auxiliary, Mapping) and auxiliary.get("auxiliary_head_safety_gate_passed") is not True:
+        reasons.append("auxiliary_head_gate_failed")
     return reasons
 
 
@@ -94,11 +101,16 @@ def gate_acceptance(
             candidate_failed = bool(reasons[symbol])
             if incumbent_healthy and candidate_failed:
                 regressions.append(symbol)
+    auxiliary_failed = any("auxiliary_head_gate_failed" in value for value in reasons.values())
     passed = not any(reasons.values()) and not regressions
     if gate == "legacy-repair":
-        status = "legacy_repair_passed" if passed else "legacy_repair_failed"
+        status = "legacy_repair_passed" if passed else (
+            "auxiliary_head_gate_failed" if auxiliary_failed else "legacy_repair_failed"
+        )
     elif gate == "confirmation":
-        status = "confirmation_health_passed" if passed else "confirmation_health_failed"
+        status = "confirmation_health_passed" if passed else (
+            "auxiliary_head_gate_failed" if auxiliary_failed else "confirmation_health_failed"
+        )
     else:
         raise ModelCandidateHealthGateError("unknown health gate")
     return {
@@ -106,6 +118,7 @@ def gate_acceptance(
         "repair_targets": scope["repair_targets"],
         "regression_protection_targets": scope["regression_protection_targets"],
         "per_symbol_failure_reasons": reasons, "healthy_symbol_regressions": regressions,
+        "auxiliary_head_safety_gate_passed": not auxiliary_failed,
         "thresholds_weakened": False,
     }
 
@@ -191,13 +204,20 @@ def _inference_health(
     stats: dict[str, Any] = {}
     predictions: dict[str, np.ndarray] = {}
     for symbol, values in sorted(windows.items()):
-        first = infer_raw_probabilities(candidate_model, candidate_scaler, values["windows"])
-        second = infer_raw_probabilities(candidate_model, candidate_scaler, values["windows"])
-        error = float(np.max(np.abs(first - second))) if len(first) else 0.0
-        predictions[symbol] = first
+        first = infer_raw_outputs(candidate_model, candidate_scaler, values["windows"])
+        second = infer_raw_outputs(candidate_model, candidate_scaler, values["windows"])
+        errors = [
+            float(np.max(np.abs(first[key] - second[key]))) if len(first[key]) else 0.0
+            for key in first
+        ]
+        error = max(errors, default=0.0)
+        predictions[symbol] = first["probability"]
         stats[symbol] = probability_health_statistics(
-            first, values["source_bar_ids"], policy=policy,
+            first["probability"], values["source_bar_ids"], policy=policy,
             expected_count=len(values["source_bar_ids"]), deterministic_repeat_error=error,
+        )
+        stats[symbol]["auxiliary_prediction_health"] = auxiliary_prediction_health(
+            first, deterministic_repeat_error=error
         )
     return stats, predictions
 
@@ -233,10 +253,24 @@ def _write_gate_once(candidate: Path, filename: str, result: Mapping[str, Any]) 
     return "first_evaluation"
 
 
-def _update_candidate_status(candidate: Path, status: str, *, final: bool) -> None:
+def _update_candidate_status(
+    candidate: Path, status: str, *, final: bool,
+    auxiliary_head_safety_gate_passed: bool,
+) -> None:
     metadata_path = candidate / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
     metadata["candidate_status"] = status
+    if status == "auxiliary_head_gate_failed":
+        metadata["candidate_auxiliary_health_blocker"] = True
+    elif final and status == "confirmation_health_passed" and auxiliary_head_safety_gate_passed:
+        metadata["candidate_auxiliary_health_blocker"] = False
+    else:
+        metadata["candidate_auxiliary_health_blocker"] = "unverified"
+    metadata["candidate_auxiliary_head_promotion_blocker"] = (
+        metadata.get("objective_contract_blocker") is not False
+        or metadata["candidate_auxiliary_health_blocker"] is not False
+        or metadata.get("downstream_contract_blocker") is not False
+    )
     if final:
         metadata["candidate_directory_finalized"] = True
     metadata["metadata_digest"] = _manifest_digest(metadata, "metadata_digest")
@@ -252,6 +286,10 @@ def _update_candidate_status(candidate: Path, status: str, *, final: bool) -> No
                 model["legacy_phase22_repair_result"] = status
             if status.startswith("confirmation_health"):
                 model["sealed_confirmation_result"] = status
+            elif status == "auxiliary_head_gate_failed" and final:
+                model["sealed_confirmation_result"] = status
+            elif status == "auxiliary_head_gate_failed":
+                model["legacy_phase22_repair_result"] = status
             statuses = [value["status"] for value in summary["models"].values()]
             if len(statuses) < 3 or any(value == "confirmation_pending" for value in statuses):
                 verdict = "candidate_training_complete_confirmation_pending"
@@ -278,6 +316,14 @@ def run_health_gate(
     validate_phase24_evidence()
     root = Path(candidate)
     metadata, model, scaler = _load_candidate(root)
+    if metadata.get("training_objective", {}).get("name") != OBJECTIVE_NAME:
+        raise ModelCandidateHealthGateError("classification-only mode cannot produce health_gate_passed")
+    try:
+        objective_report = validate_objective_report()
+    except ObjectiveContractError as exc:
+        raise ModelCandidateHealthGateError(str(exc)) from exc
+    if metadata.get("objective_contract_digest") != objective_report.get("objective_contract_digest"):
+        raise ModelCandidateHealthGateError("candidate objective contract digest mismatch")
     evaluation = json.loads((root / "evaluation.json").read_text(encoding="utf-8-sig"))
     if evaluation.get("internal_test_gate", {}).get("passed") is not True:
         raise ModelCandidateHealthGateError("internal_test_failed")
@@ -328,6 +374,9 @@ def run_health_gate(
         "incumbent_per_symbol": incumbent_stats, "acceptance": acceptance,
         "candidate_scaler_used": True, "scaler_fit_performed": False,
         "raw_candidate_probabilities_used": True, "calibration_applied": False,
+        "raw_candidate_auxiliary_outputs_used": True,
+        "auxiliary_targets_present": False,
+        "post_hoc_rv_clipping_applied": False,
         "thresholds": {
             "flat_output_std_threshold": policy["flat_output_std_threshold"],
             "flat_window": policy["flat_window"],
@@ -344,7 +393,10 @@ def run_health_gate(
     })
     replay = _write_gate_once(root, filename, result)
     result["execution_type"] = access["access_type"] if access else replay
-    _update_candidate_status(root, acceptance["status"], final=(gate == "confirmation"))
+    _update_candidate_status(
+        root, acceptance["status"], final=(gate == "confirmation"),
+        auxiliary_head_safety_gate_passed=acceptance["auxiliary_head_safety_gate_passed"],
+    )
     verify_incumbent_inventory()
     return result
 

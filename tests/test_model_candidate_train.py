@@ -20,7 +20,7 @@ def _validation(auc=0.60, loss=0.5, btc=0.56, eth=0.57):
     }
 
 
-def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001):
+def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001, objective="3" * 64):
     manifest = {
         "dataset_digest": dataset,
         "feature_digest": "b" * 64,
@@ -33,26 +33,38 @@ def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001):
         training_config={"learning_rate": learning_rate}, seed=seed,
         numerical_lock_digest="f" * 64, training_environment_digest="1" * 64,
         training_code_digest="2" * 64,
+        objective_contract_digest=objective,
     )
 
 
-def test_legacy_objective_is_classification_only_and_auxiliary_heads_are_not_misrepresented():
-    contract = train.training_objective_contract()
-    assert contract["loss"] == "CrossEntropyLoss"
-    assert contract["optimized_output"] == "ret_cls_logits"
-    assert contract["ret_reg_optimized"] is False
-    assert contract["rv_reg_optimized"] is False
-    assert contract["auxiliary_head_training_status"] == "auxiliary_unoptimized_under_legacy_objective"
+def test_resolved_objective_optimizes_all_heads_and_legacy_mode_stays_research_only():
+    contract = train.training_objective_contract(
+        target_scales={"ret_target_scale": 0.01, "rv_target_scale": 0.02},
+        objective_contract_digest="f" * 64,
+    )
+    assert contract["formula"] == "L_cls + 0.5*L_ret + 0.5*L_rv"
+    assert contract["ret_reg_optimized"] is True
+    assert contract["rv_reg_optimized"] is True
+    assert contract["auxiliary_head_training_status"] == "auxiliary_heads_optimized_under_resolved_candidate_objective"
+    legacy = train.training_objective_contract(train.LEGACY_OBJECTIVE_NAME)
+    assert legacy["loss"] == "CrossEntropyLoss"
+    assert legacy["optimized_output"] == "ret_cls_logits"
+    assert legacy["ret_reg_optimized"] is False
+    assert legacy["rv_reg_optimized"] is False
+    assert legacy["candidate_finalization_allowed"] is False
+    assert legacy["confirmation_health_pass_allowed"] is False
     source = inspect.getsource(train.train_classification_candidate)
-    assert 'model(batch["x"].cpu())["ret_cls_logits"]' in source
+    assert "candidate_multitask_loss" in source
     assert "clip_grad_norm_" in source
 
 
 def test_downstream_use_sets_auxiliary_head_promotion_blocker():
     audit = train.downstream_auxiliary_head_audit()
     assert audit["candidate_auxiliary_head_promotion_blocker"] is True
-    assert audit["promotion_blocked_until_objective_contract_resolved"] is True
-    assert audit["consumers"]["trade_multi_bitget.py"]["rv_hat_referenced"] is True
+    assert audit["objective_contract_blocker"] is False
+    assert audit["candidate_auxiliary_health_blocker"] == "unverified"
+    legacy = next(row for row in audit["consumers"] if row["path"] == "trade_multi_bitget.py")
+    assert legacy["rv_hat_used"] is True and legacy["classification"] == "legacy_only"
 
 
 @pytest.mark.parametrize("kind", train.ALLOWED_KINDS)
@@ -76,6 +88,7 @@ def test_candidate_identity_is_deterministic_and_changes_with_inputs():
     assert first[0] != _identity(seed=24002)[0]
     assert first[0] != _identity(dataset="9" * 64)[0]
     assert first[0] != _identity(learning_rate=0.002)[0]
+    assert first[0] != _identity(objective="4" * 64)[0]
     assert "C:\\" not in first[1]["identity_digest"]
 
 
@@ -154,3 +167,49 @@ def test_trainer_has_no_confirmation_data_read_path():
     source = Path(train.__file__).read_text(encoding="utf-8")
     assert "model_candidate_confirmation/" not in source
     assert "capture_confirmation" not in source
+
+
+def test_target_scales_use_valid_training_sequence_endpoints_only():
+    features = np.arange(20 * 27, dtype=np.float32).reshape(20, 27)
+    labels = {
+        "ret_cls": np.arange(20) % 2,
+        "ret_reg": np.linspace(-0.1, 0.1, 20),
+        "rv_reg": np.linspace(0.01, 0.2, 20),
+    }
+    split = np.asarray([0] * 10 + [1] * 5 + [2] * 5, dtype=np.int8)
+    datasets = {}
+    for symbol, offset in (("BTCUSDT", 0.0), ("ETHUSDT", 0.001)):
+        shifted = {name: value + offset if name != "ret_cls" else value for name, value in labels.items()}
+        datasets[symbol] = {
+            "train": train.FrozenSequenceDataset(features, shifted, split, 0, 4, symbol),
+            "validation": train.FrozenSequenceDataset(features, shifted, split, 1, 4, symbol),
+            "internal_test": train.FrozenSequenceDataset(features, shifted, split, 2, 4, symbol),
+        }
+    first = train.training_sequence_target_scales(datasets)
+    # Mutating non-training targets cannot alter endpoints or scales.
+    labels["ret_reg"][10:] = 1e9
+    labels["rv_reg"][10:] = 1e9
+    second = train.training_sequence_target_scales(datasets)
+    assert first == second
+    assert first["source"] == "training_sequences_only"
+    assert first["training_sequence_count_by_symbol"] == {"BTCUSDT": 7, "ETHUSDT": 7}
+
+
+def test_resolved_manifest_contract_records_scales_weights_and_blockers():
+    source = inspect.getsource(train._write_selected_candidate)
+    for field in (
+        "objective_contract_digest", "objective_policy_digest", "ret_target_scale", "rv_target_scale",
+        "classification_weight", "return_weight", "rv_weight", "objective_contract_blocker",
+        "candidate_auxiliary_health_blocker", "downstream_contract_blocker",
+    ):
+        assert field in source
+    assert "classification-only mode cannot finalize" in source
+
+
+def test_default_real_training_objective_is_resolved_and_fixed_weighted():
+    assert train.OBJECTIVE_NAME == "resolved_candidate_objective"
+    assert train.DEFAULT_TRAINING_CONFIG["classification_weight"] == 1.0
+    assert train.DEFAULT_TRAINING_CONFIG["return_weight"] == 0.5
+    assert train.DEFAULT_TRAINING_CONFIG["rv_weight"] == 0.5
+    signature = inspect.signature(train.train_candidate_experiment)
+    assert signature.parameters["objective"].default == train.OBJECTIVE_NAME

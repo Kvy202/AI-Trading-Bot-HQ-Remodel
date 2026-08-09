@@ -57,6 +57,26 @@ def candidate_proposal_record(candidate: Path | str) -> dict[str, Any]:
     status = str(metadata.get("candidate_status", "trained_unverified"))
     if status == "legacy_repair_passed":
         status = "confirmation_pending"
+    if status == "auxiliary_head_gate_failed":
+        status = (
+            "confirmation_health_failed"
+            if confirmation.get("gate") == "confirmation"
+            else "legacy_repair_failed"
+        )
+    objective_name = metadata.get("training_objective", {}).get("name")
+    blockers_clear = all(
+        metadata.get(name) is False
+        for name in (
+            "objective_contract_blocker", "candidate_auxiliary_health_blocker",
+            "downstream_contract_blocker",
+        )
+    )
+    if status == "confirmation_health_passed" and (
+        objective_name != "resolved_candidate_objective" or not blockers_clear
+    ):
+        raise ModelCandidateRegistryProposalError(
+            "confirmation_health_passed requires resolved objective and all auxiliary blockers cleared"
+        )
     if status not in ALLOWED_PROPOSAL_STATUSES:
         raise ModelCandidateRegistryProposalError(f"unsupported candidate proposal status: {status}")
     return {
@@ -68,7 +88,13 @@ def candidate_proposal_record(candidate: Path | str) -> dict[str, Any]:
         "internal_test": evaluation["internal_test_gate"], "legacy_repair": legacy.get("status"),
         "sealed_confirmation": confirmation.get("status"),
         "candidate_auxiliary_head_promotion_blocker": metadata["candidate_auxiliary_head_promotion_blocker"],
-        "eligible_for_later_shadow_comparison": status == "confirmation_health_passed",
+        "promotion_blockers": {
+            "objective_contract_blocker": metadata.get("objective_contract_blocker"),
+            "candidate_auxiliary_health_blocker": metadata.get("candidate_auxiliary_health_blocker"),
+            "downstream_contract_blocker": metadata.get("downstream_contract_blocker"),
+        },
+        "objective_contract_digest": metadata.get("objective_contract_digest"),
+        "eligible_for_later_shadow_comparison": status == "confirmation_health_passed" and blockers_clear,
         "human_review_required": True, "live_activation_allowed": False,
     }
 

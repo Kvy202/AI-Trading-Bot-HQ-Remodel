@@ -18,7 +18,12 @@ def _candidate(tmp_path, kind="lstm", status="confirmation_pending"):
         "selected_seed": 24001,
         "supported_symbols": ["BTCUSDT", "ETHUSDT"],
         "candidate_status": status,
-        "candidate_auxiliary_head_promotion_blocker": True,
+        "candidate_auxiliary_head_promotion_blocker": status != "confirmation_health_passed",
+        "training_objective": {"name": "resolved_candidate_objective"},
+        "objective_contract_digest": "4" * 64,
+        "objective_contract_blocker": False,
+        "candidate_auxiliary_health_blocker": False,
+        "downstream_contract_blocker": False,
         "candidate_identity": {"dataset_digest": "3" * 64},
     }
     files = {
@@ -53,6 +58,17 @@ def test_candidate_record_rejects_unapproved_status(monkeypatch, tmp_path):
     candidate = _candidate(tmp_path, status="active")
     monkeypatch.setattr(registry, "_verify_candidate_artifacts_read_only", lambda root: {})
     with pytest.raises(registry.ModelCandidateRegistryProposalError, match="unsupported"):
+        registry.candidate_proposal_record(candidate)
+
+
+def test_classification_only_candidate_cannot_propose_confirmation_pass(monkeypatch, tmp_path):
+    candidate = _candidate(tmp_path, status="confirmation_health_passed")
+    metadata_path = candidate / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["training_objective"] = {"name": "classification_only_legacy"}
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    monkeypatch.setattr(registry, "_verify_candidate_artifacts_read_only", lambda root: {})
+    with pytest.raises(registry.ModelCandidateRegistryProposalError, match="resolved objective"):
         registry.candidate_proposal_record(candidate)
 
 

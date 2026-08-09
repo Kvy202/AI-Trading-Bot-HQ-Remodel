@@ -708,7 +708,7 @@ strict Phase 23 tolerances even when every direction, exclusion, allow,
 agreement, and ensemble decision is unchanged.
 # Phase 24 — versioned candidate retraining and sealed health confirmation
 
-Phase 24 is classification-health research only. It cannot place any kind of
+Phase 24 is candidate-health research only. It cannot place any kind of
 order, activate a candidate, change calibration, or overwrite a serving model
 or scaler. A passing confirmation gate means only that a candidate is eligible
 for a later, explicitly reviewed shadow comparison.
@@ -741,3 +741,64 @@ after all three selected candidate IDs and digests are frozen may the sealed
 confirmation set be captured and evaluated once per frozen candidate. Finish
 by generating the review-only registry proposal. Never copy candidate files to
 the serving names as part of this workflow.
+
+## Phase 24.1 — candidate objective contract
+
+Real candidate training is blocked until the objective report exists, has the
+verdict `candidate_objective_contract_resolved_multitask_training_required`,
+and carries the exact objective digest expected by the trainer. The normal
+candidate objective is:
+
+```text
+L_total = weighted_cross_entropy(ret_cls_logits, y_ret_cls)
+        + 0.5 * mean(((ret_reg - y_ret_reg) / ret_target_scale) ** 2)
+        + 0.5 * mean(((rv_reg - y_rv_reg) / rv_target_scale) ** 2)
+```
+
+Both scales are population standard deviations calculated only from valid
+training-sequence endpoints. Model outputs stay in raw target units. The
+return target is the signed 60-bar (5-hour) forward log return; the RV target
+is the non-negative root-sum-squared log return over 12 bars (1 hour). The
+maximum target lookahead and split purge are therefore 60 bars. A negative
+`rv_hat` is a candidate auxiliary-head failure; it is never hidden by clipping
+the live inference value.
+
+The repository history contains an older equal-weight, raw-MSE three-head loss.
+It used simple common-horizon labels, predates the current triple-label
+incumbents, and is retained as lineage evidence rather than restored. The
+resolved loss above is explicitly a new candidate-only contract. The optional
+`classification_only_legacy` diagnostic mode cannot finalize a candidate, pass
+a health gate, or enter the registry as confirmation-passed.
+
+Run the complete offline audit without writing a report:
+
+```powershell
+python tools/model_objective_contract.py --dry-run
+```
+
+After implementation review, generate the four ignored evidence reports using
+project Python. These commands use synthetic tensors and repository evidence
+only; they do not bootstrap an environment, fetch bars, or train a candidate:
+
+```powershell
+python tools/model_objective_contract.py --json-out reports/model_objective_contract.json
+python tools/model_auxiliary_head_audit.py --json-out reports/model_auxiliary_head_audit.json
+python tools/model_objective_probe.py --json-out reports/model_objective_probe.json
+python tools/model_objective_label_audit.py --json-out reports/model_objective_label_audit.json
+```
+
+The canonical writer forwards raw `rv_hat` as `rv_mean`, and the canonical
+executor can use that raw field in `EXEC_RV_MAX`. The tracked value `100`
+deliberately disables the guard because incumbent auxiliary output scale is
+known to be mismatched; the intended raw-unit ceiling remains `DL_MAX_RV=0.02`.
+Optional XGBoost and advanced-risk consumers are disabled by tracked defaults;
+the latter remains shadow-only. Legacy Bitget and standalone ensemble scripts
+are reference paths, not the active Hyperliquid Remodel path. Decoupling these
+uses is feasible but is not implemented in Phase 24.1.
+
+Objective resolution clears only `objective_contract_blocker`. Until a real
+candidate has passed validation, internal-test, legacy-repair, and sealed
+confirmation auxiliary checks, `candidate_auxiliary_health_blocker` remains
+unverified. `downstream_contract_blocker` is recorded independently. No
+candidate is promotion-ready while any blocker is true or unverified, and this
+phase implements neither promotion nor live activation.

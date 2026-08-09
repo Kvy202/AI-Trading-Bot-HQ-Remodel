@@ -67,6 +67,8 @@ if ($DryRun) {
     Write-Output "capture_planned=project Python -> tools/model_training_dataset.py capture"
     Write-Output "build_planned=project Python -> tools/model_training_dataset.py build (scaler worker uses training Python)"
     Write-Output "train_planned=training Python -> tools/model_candidate_train.py --model $Model"
+    Write-Output "objective_contract_required=reports/model_objective_contract.json verdict=candidate_objective_contract_resolved_multitask_training_required"
+    Write-Output "objective_planned=resolved_candidate_objective classification_weight=1.0 return_weight=0.5 rv_weight=0.5"
     Write-Output "evaluate_planned=training Python -> tools/model_candidate_evaluate.py"
     Write-Output "legacy_gate_planned=training Python -> tools/model_candidate_health_gate.py --gate legacy-repair"
     Write-Output "confirmation_capture_planned=project Python -> tools/model_training_dataset.py capture-confirmation"
@@ -104,7 +106,9 @@ try {
     if ($Train) {
         Require-PathArgument -Value $Dataset -Name "Dataset"
         Invoke-CheckedPython -Interpreter $TrainingPython -Arguments @(
-            "tools/model_candidate_train.py", "--model", $Model, "--dataset", $Dataset
+            "tools/model_candidate_train.py", "--model", $Model, "--dataset", $Dataset,
+            "--objective", "resolved_candidate_objective",
+            "--objective-contract", "reports/model_objective_contract.json"
         )
     }
     if ($Evaluate) {

@@ -1,8 +1,8 @@
 """Evaluate a frozen Phase 24 candidate against its incumbent on Phase 22.
 
-Only raw probabilities on the same immutable windows are compared.  No
-calibration, strategy-return calculation, promotion, or serving mutation is
-implemented here.
+Raw probabilities are compared, and raw-unit auxiliary predictions receive
+prediction-safety diagnostics.  No calibration, target fitting, strategy-return
+calculation, promotion, or serving mutation is implemented here.
 """
 
 from __future__ import annotations
@@ -141,21 +141,78 @@ def _load_incumbent(kind: str, bundle: Path | str = PHASE22_BUNDLE):
     return entry, model, joblib.load(scaler_path)
 
 
-def infer_raw_probabilities(model: Any, scaler: Any, windows: np.ndarray, *, batch_size: int = 64) -> np.ndarray:
+def infer_raw_outputs(model: Any, scaler: Any, windows: np.ndarray, *, batch_size: int = 64) -> dict[str, np.ndarray]:
     import torch
 
     values = np.asarray(windows, dtype=np.float32)
     if values.ndim != 3 or values.shape[1:] != (64, 27):
         raise ModelCandidateEvaluationError("expected [N,64,27] windows")
     transformed = scaler.transform(values.reshape(-1, 27)).reshape(values.shape).astype(np.float32, copy=False)
-    probabilities: list[np.ndarray] = []
+    parts: dict[str, list[np.ndarray]] = {"probability": [], "ret_hat": [], "rv_hat": []}
     model.eval().cpu()
     with torch.no_grad():
         for start in range(0, len(transformed), int(batch_size)):
             tensor = torch.from_numpy(np.ascontiguousarray(transformed[start:start + batch_size]))
             output = model(tensor)
-            probabilities.append(torch.softmax(output["ret_cls_logits"], dim=-1)[:, 1].cpu().numpy())
-    return np.concatenate(probabilities).astype(np.float64) if probabilities else np.asarray([], dtype=np.float64)
+            parts["probability"].append(torch.softmax(output["ret_cls_logits"], dim=-1)[:, 1].cpu().numpy())
+            parts["ret_hat"].append(output["ret_reg"].reshape(-1).cpu().numpy())
+            parts["rv_hat"].append(output["rv_reg"].reshape(-1).cpu().numpy())
+    return {
+        key: np.concatenate(value).astype(np.float64) if value else np.asarray([], dtype=np.float64)
+        for key, value in parts.items()
+    }
+
+
+def infer_raw_probabilities(model: Any, scaler: Any, windows: np.ndarray, *, batch_size: int = 64) -> np.ndarray:
+    return infer_raw_outputs(model, scaler, windows, batch_size=batch_size)["probability"]
+
+
+def auxiliary_prediction_health(
+    outputs: Mapping[str, Sequence[float]], *, deterministic_repeat_error: float = 0.0,
+) -> dict[str, Any]:
+    """Hard safety checks for unlabeled repair/confirmation windows."""
+    result: dict[str, Any] = {
+        "targets_present": False,
+        "skill_metrics_available": False,
+        "post_hoc_rv_clipping_applied": False,
+        "outputs_remain_in_raw_target_units": True,
+        "deterministic_repeat_max_absolute_error": float(deterministic_repeat_error),
+        "deterministic_repeat_passed": bool(float(deterministic_repeat_error) == 0.0),
+    }
+    hard = set()
+    for key, output_name in (("ret_hat", "ret_reg"), ("rv_hat", "rv_reg")):
+        values = np.asarray(outputs[key], dtype=np.float64).reshape(-1)
+        finite = values[np.isfinite(values)]
+        nonfinite = int(len(values) - len(finite))
+        classification = "auxiliary_unverified"
+        if nonfinite or not result["deterministic_repeat_passed"]:
+            classification = "auxiliary_failed_nonfinite"
+        elif len(finite) and float(np.std(finite, ddof=0)) <= 1e-12:
+            classification = "auxiliary_failed_constant_output"
+        negative_count = int(np.sum(finite < 0)) if key == "rv_hat" else 0
+        if key == "rv_hat" and negative_count:
+            classification = "auxiliary_failed_negative_rv"
+        row = {
+            "classification": classification,
+            "finite_prediction_count": int(len(finite)),
+            "nonfinite_prediction_count": nonfinite,
+            "prediction_mean": None if not len(finite) else float(np.mean(finite)),
+            "prediction_std": None if not len(finite) else float(np.std(finite, ddof=0)),
+            "prediction_min": None if not len(finite) else float(np.min(finite)),
+            "prediction_max": None if not len(finite) else float(np.max(finite)),
+        }
+        if key == "rv_hat":
+            row.update({
+                "negative_prediction_count": negative_count,
+                "negative_prediction_rate": 0.0 if not len(finite) else float(negative_count / len(finite)),
+                "rv_target_negative_count": None,
+            })
+        result[output_name] = row
+        if classification.startswith("auxiliary_failed_"):
+            hard.add(classification)
+    result["hard_failure_reasons"] = sorted(hard)
+    result["auxiliary_head_safety_gate_passed"] = not hard
+    return result
 
 
 def _longest_repeat(values: np.ndarray) -> int:
@@ -297,10 +354,19 @@ def evaluate_candidate_vs_incumbent(
     policy = load_training_policy()
     per_symbol: dict[str, Any] = {}
     for symbol, values in sorted(windows.items()):
-        candidate_p = infer_raw_probabilities(candidate_model, candidate_scaler, values["windows"])
+        candidate_outputs = infer_raw_outputs(candidate_model, candidate_scaler, values["windows"])
+        repeated = infer_raw_outputs(candidate_model, candidate_scaler, values["windows"])
+        repeat_error = max(
+            (float(np.max(np.abs(candidate_outputs[key] - repeated[key]))) if len(candidate_outputs[key]) else 0.0)
+            for key in candidate_outputs
+        )
+        candidate_p = candidate_outputs["probability"]
         incumbent_p = infer_raw_probabilities(incumbent_model, incumbent_scaler, values["windows"])
         per_symbol[symbol] = compare_probability_series(
             incumbent_p, candidate_p, values["source_bar_ids"], policy=policy
+        )
+        per_symbol[symbol]["candidate_auxiliary_prediction_health"] = auxiliary_prediction_health(
+            candidate_outputs, deterministic_repeat_error=repeat_error
         )
     result = {
         "schema_version": 1, "candidate_id": metadata["candidate_id"], "model_kind": kind,
@@ -309,6 +375,9 @@ def evaluate_candidate_vs_incumbent(
         "candidate_scaler_refit": False, "raw_probabilities_used": True,
         "incumbent_model_digest": incumbent_entry["model_sha256"],
         "candidate_model_digest": metadata["model_sha256"], "per_symbol": per_symbol,
+        "candidate_objective": metadata.get("training_objective", {}).get("name"),
+        "auxiliary_targets_present": False,
+        "auxiliary_skill_metrics_available": False,
         "strategy_return_calculation_performed": False,
     }
     result["comparison_digest"] = json_digest(result)

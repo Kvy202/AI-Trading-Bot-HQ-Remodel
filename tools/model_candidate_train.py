@@ -1,4 +1,4 @@
-"""Train immutable Phase 24 classification-health candidates from frozen data.
+"""Train immutable Phase 24 multitask-health candidates from frozen data.
 
 This module deliberately has no market-data or confirmation-data imports.  The
 CLI is permitted to run only under the dedicated canonical training Python.
@@ -50,6 +50,23 @@ from tools.model_training_environment import (
     verify_incumbent_inventory,
 )
 from tools.model_training_dataset import verify_dataset
+from tools.model_candidate_objective import (
+    LEGACY_AUXILIARY_STATUS,
+    LEGACY_OBJECTIVE_NAME,
+    OBJECTIVE_NAME,
+    RESOLVED_AUXILIARY_STATUS,
+    candidate_multitask_loss,
+    compute_training_target_scales,
+    load_objective_policy,
+    objective_metrics,
+)
+from tools.model_objective_contract import (
+    OBJECTIVE_REPORT,
+    ObjectiveContractError,
+    expected_objective_contract_digest,
+    validate_objective_report,
+)
+from tools.model_auxiliary_head_audit import build_auxiliary_audit
 
 
 CANDIDATE_ROOT = BASE_DIR / "model_artifacts" / "candidates"
@@ -57,8 +74,7 @@ SEED_RUN_ROOT = BASE_DIR / "reports" / "model_candidate_seed_runs"
 TRAINING_SUMMARY = BASE_DIR / "reports" / "model_candidate_training_summary.json"
 SELECTION_FREEZE = BASE_DIR / "reports" / "model_candidate_selection_freeze.json"
 ALLOWED_KINDS = ("lstm", "tcn", "tx")
-OBJECTIVE_NAME = "classification_cross_entropy_only_legacy_objective"
-AUXILIARY_STATUS = "auxiliary_unoptimized_under_legacy_objective"
+AUXILIARY_STATUS = RESOLVED_AUXILIARY_STATUS
 
 DEFAULT_TRAINING_CONFIG: dict[str, Any] = {
     "batch_size": 256,
@@ -69,6 +85,9 @@ DEFAULT_TRAINING_CONFIG: dict[str, Any] = {
     "scheduler": {"name": "CosineAnnealingLR", "eta_min_factor": 0.1},
     "gradient_clipping": 1.0,
     "class_weighting": "inverse_frequency_from_training_sequences",
+    "classification_weight": 1.0,
+    "return_weight": 0.5,
+    "rv_weight": 0.5,
     "selection_rule": [
         "highest_pooled_validation_auc",
         "lower_pooled_validation_loss",
@@ -87,53 +106,93 @@ class ModelCandidateTrainingError(ValueError):
     """A frozen-data, selection, test-access, or artifact gate failed."""
 
 
-def training_objective_contract() -> dict[str, Any]:
-    """Return the audited objective without implying trained regression heads."""
+def training_objective_contract(
+    objective: str = OBJECTIVE_NAME,
+    *,
+    target_scales: Mapping[str, Any] | None = None,
+    objective_contract_digest: str | None = None,
+) -> dict[str, Any]:
+    """Return the resolved contract or the explicitly research-only legacy mode."""
+    if objective == LEGACY_OBJECTIVE_NAME:
+        return {
+            "name": LEGACY_OBJECTIVE_NAME,
+            "optimized_output": "ret_cls_logits",
+            "target": "y_ret_cls",
+            "loss": "CrossEntropyLoss",
+            "ret_reg_optimized": False,
+            "rv_reg_optimized": False,
+            "auxiliary_head_training_status": LEGACY_AUXILIARY_STATUS,
+            "research_only": True,
+            "candidate_finalization_allowed": False,
+            "confirmation_health_pass_allowed": False,
+            "objective_contract_blocker": True,
+            "source": "ml_dl/dl_train.py:train_once",
+        }
+    if objective != OBJECTIVE_NAME:
+        raise ModelCandidateTrainingError("unknown candidate objective")
+    policy = load_objective_policy()
+    scales = dict(target_scales or {})
     return {
         "name": OBJECTIVE_NAME,
-        "optimized_output": "ret_cls_logits",
-        "target": "y_ret_cls",
-        "loss": "CrossEntropyLoss",
-        "ret_reg_optimized": False,
-        "rv_reg_optimized": False,
+        "objective_source": "new_candidate_only_contract",
+        "objective_schema_version": int(policy["schema_version"]),
+        "objective_policy_digest": json_digest(policy),
+        "objective_contract_digest": objective_contract_digest,
+        "formula": "L_cls + 0.5*L_ret + 0.5*L_rv",
+        "classification": dict(policy["classification"]),
+        "return_regression": dict(policy["return_regression"]),
+        "volatility_regression": dict(policy["volatility_regression"]),
+        "target_scale_source": policy["target_scale_source"],
+        "ret_target_scale": scales.get("ret_target_scale"),
+        "rv_target_scale": scales.get("rv_target_scale"),
+        "ret_reg_optimized": True,
+        "rv_reg_optimized": True,
         "auxiliary_head_training_status": AUXILIARY_STATUS,
+        "research_only": False,
+        "candidate_finalization_allowed": True,
+        "confirmation_health_pass_allowed": True,
+        "objective_contract_blocker": False,
         "optimizer": copy.deepcopy(DEFAULT_TRAINING_CONFIG["optimizer"]),
         "scheduler": copy.deepcopy(DEFAULT_TRAINING_CONFIG["scheduler"]),
         "gradient_clipping": DEFAULT_TRAINING_CONFIG["gradient_clipping"],
         "best_epoch_rule": "highest_validation_auc_then_lower_validation_loss",
-        "source": "ml_dl/dl_train.py:train_once",
+        "source": "Phase 24.1 new candidate-only contract",
     }
 
 
 def downstream_auxiliary_head_audit(repository: Path | str = BASE_DIR) -> dict[str, Any]:
-    """Static evidence for production consumers of the unoptimized heads."""
-    root = Path(repository)
-    consumers = {
-        "ml_dl/dl_ensemble.py": "blends ret_hat and rv_hat across serving models",
-        "live_ensemble.py": "rv_hat participates in allow-entry filtering",
-        "trade_multi_bitget.py": "rv_hat participates in entry/risk decisions",
-        "live_meta_ensemble.py": "ret_hat and rv_hat are meta-model inputs",
-    }
-    found: dict[str, dict[str, bool | str]] = {}
-    for relative, purpose in consumers.items():
-        path = root / relative
-        text = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
-        found[relative] = {
-            "ret_hat_referenced": "ret_hat" in text,
-            "rv_hat_referenced": "rv_hat" in text,
-            "purpose": purpose,
-        }
-    blocker = any(
-        value["rv_hat_referenced"] and ("decision" in str(value["purpose"]) or "filter" in str(value["purpose"]))
-        for value in found.values()
-    )
+    """Compatibility wrapper around the complete Phase 24.1 downstream audit."""
+    audit = build_auxiliary_audit(repository)
     return {
-        "audit_type": "static_downstream_use",
-        "consumers": found,
-        "candidate_auxiliary_head_promotion_blocker": bool(blocker),
+        "audit_type": "phase24_1_complete_downstream_use",
+        "audit_digest": audit["audit_digest"],
+        "consumers": audit["consumers"],
+        "objective_contract_blocker": False,
+        "candidate_auxiliary_health_blocker": "unverified",
+        "downstream_contract_blocker": audit["downstream_contract_blocker"],
+        "candidate_auxiliary_head_promotion_blocker": True,
         "classification_health_research_allowed": True,
-        "promotion_blocked_until_objective_contract_resolved": bool(blocker),
+        "promotion_blocked_until_auxiliary_health_verified": True,
     }
+
+
+def validate_training_objective_gate(
+    objective: str,
+    *,
+    report_path: Path | str = OBJECTIVE_REPORT,
+    expected_digest: str | None = None,
+) -> dict[str, Any]:
+    """Fail closed before any real training/environment/data access."""
+    if objective == LEGACY_OBJECTIVE_NAME:
+        raise ModelCandidateTrainingError("classification_only_legacy cannot finalize a Phase 24 candidate")
+    if objective != OBJECTIVE_NAME:
+        raise ModelCandidateTrainingError("resolved_candidate_objective is required")
+    try:
+        return validate_objective_report(
+            report_path, expected_digest=expected_digest or expected_objective_contract_digest()
+        )
+    except ObjectiveContractError as exc:
+        raise ModelCandidateTrainingError(str(exc)) from exc
 
 
 def _torch():
@@ -330,6 +389,32 @@ def _class_weights(dataset: Any):
     return torch.tensor([total / (2 * counts[0]), total / (2 * counts[1])], dtype=torch.float32), counts
 
 
+def training_sequence_target_scales(
+    datasets_by_symbol: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Derive scales only from endpoints that actually form training sequences."""
+    ret_targets: list[float] = []
+    rv_targets: list[float] = []
+    per_symbol: dict[str, int] = {}
+    for symbol, values in sorted(datasets_by_symbol.items()):
+        dataset = values["train"]
+        per_symbol[symbol] = len(dataset)
+        for index in range(len(dataset)):
+            row = dataset[index]
+            ret_targets.append(float(row["y_ret_reg"]))
+            rv_targets.append(float(row["y_rv_reg"]))
+    scales = compute_training_target_scales(ret_targets, rv_targets)
+    scales["training_sequence_count_by_symbol"] = per_symbol
+    scales["validation_targets_consulted"] = False
+    scales["internal_test_targets_consulted"] = False
+    scales["legacy_repair_targets_consulted"] = False
+    scales["confirmation_targets_consulted"] = False
+    scales["target_scale_digest"] = json_digest({
+        key: value for key, value in scales.items() if key != "target_scale_digest"
+    })
+    return scales
+
+
 def _forward_dataset(model: Any, dataset: Any, *, batch_size: int) -> dict[str, np.ndarray]:
     torch = _torch()
     loader = torch.utils.data.DataLoader(dataset, batch_size=int(batch_size), shuffle=False, num_workers=0)
@@ -350,7 +435,11 @@ def _forward_dataset(model: Any, dataset: Any, *, batch_size: int) -> dict[str, 
 
 
 def _metrics(
-    outputs: Mapping[str, np.ndarray], class_weights: Sequence[float] | None = None
+    outputs: Mapping[str, np.ndarray], class_weights: Sequence[float] | None = None,
+    *,
+    target_scales: Mapping[str, Any] | None = None,
+    objective: str = OBJECTIVE_NAME,
+    deterministic_repeat_passed: bool = True,
 ) -> dict[str, Any]:
     probability = np.asarray(outputs["probability"], dtype=np.float64)
     label = np.asarray(outputs["label"], dtype=np.int64)
@@ -360,6 +449,10 @@ def _metrics(
         return {
             "auc": None, "classification_loss": None, "rows": int(len(label)),
             "class_counts": counts, "nonfinite_outputs": nonfinite,
+            "auxiliary_head_gate_passed": False,
+            "auxiliary_head_training_status": (
+                AUXILIARY_STATUS if objective == OBJECTIVE_NAME else LEGACY_AUXILIARY_STATUS
+            ),
         }
     try:
         auc = binary_auc(label, probability)
@@ -376,7 +469,7 @@ def _metrics(
         loss = float(np.mean(row_loss))
     ret_error = np.asarray(outputs["ret_hat"]) - np.asarray(outputs["ret"])
     rv_error = np.asarray(outputs["rv_hat"]) - np.asarray(outputs["rv"])
-    return {
+    result: dict[str, Any] = {
         "auc": None if auc is None else float(auc),
         "classification_loss": loss,
         "rows": int(len(label)),
@@ -386,8 +479,33 @@ def _metrics(
         "ret_reg_diagnostic_rmse": float(np.sqrt(np.mean(ret_error ** 2))),
         "rv_reg_diagnostic_mae": float(np.mean(np.abs(rv_error))),
         "rv_reg_diagnostic_rmse": float(np.sqrt(np.mean(rv_error ** 2))),
-        "auxiliary_head_training_status": AUXILIARY_STATUS,
+        "auxiliary_head_training_status": (
+            AUXILIARY_STATUS if objective == OBJECTIVE_NAME else LEGACY_AUXILIARY_STATUS
+        ),
     }
+    if objective == OBJECTIVE_NAME and target_scales is not None:
+        auxiliary = objective_metrics(
+            ret_prediction=outputs["ret_hat"], ret_target=outputs["ret"],
+            rv_prediction=outputs["rv_hat"], rv_target=outputs["rv"],
+            ret_scale=float(target_scales["ret_target_scale"]),
+            rv_scale=float(target_scales["rv_target_scale"]),
+            ret_train_target_mean=float(target_scales["ret_train_target_mean"]),
+            rv_train_target_mean=float(target_scales["rv_train_target_mean"]),
+            deterministic_repeat_passed=deterministic_repeat_passed,
+        )
+        result["auxiliary_metrics"] = auxiliary
+        result["auxiliary_head_gate_passed"] = auxiliary["auxiliary_head_gate_passed"]
+        result["ret_reg_metrics"] = auxiliary["ret_reg"]
+        result["rv_reg_metrics"] = auxiliary["rv_reg"]
+    else:
+        result["auxiliary_metrics"] = {
+            "ret_reg": {"classification": "auxiliary_unverified"},
+            "rv_reg": {"classification": "auxiliary_unverified"},
+            "auxiliary_head_gate_passed": False,
+            "post_hoc_rv_clipping_applied": False,
+        }
+        result["auxiliary_head_gate_passed"] = False
+    return result
 
 
 def evaluate_classification_model(
@@ -398,16 +516,17 @@ def evaluate_classification_model(
     batch_size: int = 256,
     deterministic_repeat: bool = False,
     class_weights: Sequence[float] | None = None,
+    target_scales: Mapping[str, Any] | None = None,
+    objective: str = OBJECTIVE_NAME,
 ) -> dict[str, Any]:
     outputs_by_symbol = {
         symbol: _forward_dataset(model, values[split], batch_size=batch_size)
         for symbol, values in sorted(datasets_by_symbol.items())
     }
-    per_symbol = {symbol: _metrics(outputs, class_weights) for symbol, outputs in outputs_by_symbol.items()}
-    pooled = _metrics({
+    pooled_outputs = {
         key: np.concatenate([outputs_by_symbol[symbol][key] for symbol in sorted(outputs_by_symbol)])
         for key in next(iter(outputs_by_symbol.values()))
-    }, class_weights)
+    }
     repeat_error = None
     repeat_passed = None
     if deterministic_repeat:
@@ -415,13 +534,26 @@ def evaluate_classification_model(
             symbol: _forward_dataset(model, values[split], batch_size=batch_size)
             for symbol, values in sorted(datasets_by_symbol.items())
         }
-        errors = [
-            float(np.max(np.abs(outputs_by_symbol[symbol]["probability"] - repeated[symbol]["probability"])))
-            if len(outputs_by_symbol[symbol]["probability"]) else 0.0
-            for symbol in sorted(outputs_by_symbol)
-        ]
+        errors = []
+        for symbol in sorted(outputs_by_symbol):
+            for key in ("probability", "ret_hat", "rv_hat"):
+                first = outputs_by_symbol[symbol][key]
+                second = repeated[symbol][key]
+                errors.append(float(np.max(np.abs(first - second))) if len(first) else 0.0)
         repeat_error = max(errors, default=0.0)
         repeat_passed = bool(repeat_error == 0.0)
+    metrics_repeat_passed = True if not deterministic_repeat else bool(repeat_passed)
+    per_symbol = {
+        symbol: _metrics(
+            outputs, class_weights, target_scales=target_scales, objective=objective,
+            deterministic_repeat_passed=metrics_repeat_passed,
+        )
+        for symbol, outputs in outputs_by_symbol.items()
+    }
+    pooled = _metrics(
+        pooled_outputs, class_weights, target_scales=target_scales, objective=objective,
+        deterministic_repeat_passed=metrics_repeat_passed,
+    )
     return {
         "split": split,
         "pooled": pooled,
@@ -429,7 +561,9 @@ def evaluate_classification_model(
         "deterministic_repeat_max_absolute_error": repeat_error,
         "deterministic_repeat_passed": repeat_passed,
         "selection_evidence_allowed": split == "validation",
-        "auxiliary_metrics_are_diagnostic_only": True,
+        "auxiliary_metrics_required": objective == OBJECTIVE_NAME,
+        "auxiliary_metrics_are_diagnostic_only": objective == LEGACY_OBJECTIVE_NAME,
+        "objective": objective,
     }
 
 
@@ -439,12 +573,16 @@ def train_classification_candidate(
     *,
     seed: int,
     config: Mapping[str, Any],
+    objective: str = OBJECTIVE_NAME,
+    target_scales: Mapping[str, Any] | None = None,
+    objective_contract_digest: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Preserve the legacy train_once mathematics while recording epochs."""
+    """Train with the resolved objective; retain legacy mode for synthetic research."""
     torch = _torch()
     deterministic = set_deterministic_seed(seed)
     train_dataset = _concat(datasets_by_symbol, "train")
     weights, counts = _class_weights(train_dataset)
+    scales = dict(target_scales or training_sequence_target_scales(datasets_by_symbol))
     loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=int(config["batch_size"]),
@@ -453,7 +591,6 @@ def train_classification_candidate(
         num_workers=0,
         generator=deterministic_loader_generator(seed),
     )
-    criterion = torch.nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(config["learning_rate"]),
         weight_decay=float(config["optimizer"]["weight_decay"]),
@@ -465,27 +602,64 @@ def train_classification_candidate(
     epochs: list[dict[str, Any]] = []
     for epoch in range(1, int(config["epochs"]) + 1):
         model.train().cpu()
-        train_loss, seen = 0.0, 0
+        component_sums = {
+            "total_loss": 0.0, "classification_loss": 0.0,
+            "return_regression_loss": 0.0, "rv_regression_loss": 0.0,
+        }
+        seen = 0
         for batch in loader:
-            logits = model(batch["x"].cpu())["ret_cls_logits"]
-            loss = criterion(logits, batch["y_ret_cls"].cpu())
+            outputs = model(batch["x"].cpu())
+            if objective == OBJECTIVE_NAME:
+                components = candidate_multitask_loss(
+                    outputs,
+                    {
+                        "y_ret_cls": batch["y_ret_cls"].cpu(),
+                        "y_ret_reg": batch["y_ret_reg"].cpu(),
+                        "y_rv_reg": batch["y_rv_reg"].cpu(),
+                    },
+                    ret_scale=float(scales["ret_target_scale"]),
+                    rv_scale=float(scales["rv_target_scale"]),
+                    class_weights=weights,
+                    classification_weight=float(config["classification_weight"]),
+                    return_weight=float(config["return_weight"]),
+                    rv_weight=float(config["rv_weight"]),
+                )
+            elif objective == LEGACY_OBJECTIVE_NAME:
+                cls = torch.nn.CrossEntropyLoss(weight=weights)(
+                    outputs["ret_cls_logits"], batch["y_ret_cls"].cpu()
+                )
+                zero = cls.detach() * 0.0
+                components = {
+                    "total_loss": cls, "classification_loss": cls,
+                    "return_regression_loss": zero, "rv_regression_loss": zero,
+                }
+            else:
+                raise ModelCandidateTrainingError("unknown candidate objective")
+            loss = components["total_loss"]
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["gradient_clipping"]))
             optimizer.step()
-            train_loss += float(loss.item()) * len(batch["y_ret_cls"])
-            seen += len(batch["y_ret_cls"])
+            batch_rows = len(batch["y_ret_cls"])
+            for name in component_sums:
+                component_sums[name] += float(components[name].item()) * batch_rows
+            seen += batch_rows
         scheduler.step()
         validation = evaluate_classification_model(
             model, datasets_by_symbol, "validation", batch_size=int(config["batch_size"]),
             class_weights=weights.tolist(),
+            target_scales=scales, objective=objective,
         )
         if validation["pooled"]["auc"] is None:
             raise ModelCandidateTrainingError("validation_failed")
         auc = float(validation["pooled"]["auc"])
         val_loss = float(validation["pooled"]["classification_loss"])
         epochs.append({
-            "epoch": epoch, "training_loss": None if not seen else train_loss / seen,
+            "epoch": epoch,
+            "training_loss": None if not seen else component_sums["total_loss"] / seen,
+            "training_loss_components": {
+                name: None if not seen else value / seen for name, value in component_sums.items()
+            },
             "learning_rate": float(optimizer.param_groups[0]["lr"]), "validation": validation,
         })
         improved = auc > best_auc or (auc == best_auc and val_loss < best_loss)
@@ -503,13 +677,17 @@ def train_classification_candidate(
     selected_validation = evaluate_classification_model(
         model, datasets_by_symbol, "validation", batch_size=int(config["batch_size"]),
         deterministic_repeat=True, class_weights=weights.tolist(),
+        target_scales=scales, objective=objective,
     )
     history = {
         "seed": int(seed), "epochs": epochs, "best_epoch_auc": best_auc,
         "best_epoch_loss": best_loss, "epochs_completed": len(epochs),
         "class_counts": {"0": int(counts[0]), "1": int(counts[1])},
         "deterministic_configuration": deterministic,
-        "training_objective": training_objective_contract(),
+        "training_objective": training_objective_contract(
+            objective, target_scales=scales, objective_contract_digest=objective_contract_digest
+        ),
+        "target_scales": scales,
     }
     return history, selected_validation
 
@@ -526,6 +704,10 @@ def validation_gate(metrics: Mapping[str, Any], policy: Mapping[str, Any] | None
             reasons.append(f"{symbol}_validation_auc_below_gate")
         if set(value.get("class_counts", {})) != {"0", "1"} or min(value.get("class_counts", {}).values(), default=0) <= 0:
             reasons.append(f"{symbol}_validation_requires_both_classes")
+        if "auxiliary_metrics" in value and value.get("auxiliary_head_gate_passed") is not True:
+            reasons.append(f"{symbol}_validation_auxiliary_head_gate_failed")
+    if "auxiliary_metrics" in pooled and pooled.get("auxiliary_head_gate_passed") is not True:
+        reasons.append("pooled_validation_auxiliary_head_gate_failed")
     return {"passed": not reasons, "status": "passed" if not reasons else "validation_failed", "reasons": reasons}
 
 
@@ -577,10 +759,14 @@ def internal_test_gate(metrics: Mapping[str, Any], policy: Mapping[str, Any] | N
             reasons.append(f"{symbol}_internal_test_auc_below_gate")
         if int(value.get("nonfinite_outputs", 1)) != 0:
             reasons.append(f"{symbol}_nonfinite_outputs")
+        if "auxiliary_metrics" in value and value.get("auxiliary_head_gate_passed") is not True:
+            reasons.append(f"{symbol}_auxiliary_head_gate_failed")
     if int(pooled.get("nonfinite_outputs", 1)) != 0:
         reasons.append("pooled_nonfinite_outputs")
     if metrics.get("deterministic_repeat_passed") is not True:
         reasons.append("deterministic_repeat_failed")
+    if "auxiliary_metrics" in pooled and pooled.get("auxiliary_head_gate_passed") is not True:
+        reasons.append("pooled_auxiliary_head_gate_failed")
     return {"passed": not reasons, "status": "passed" if not reasons else "internal_test_failed", "reasons": reasons}
 
 
@@ -595,6 +781,7 @@ def candidate_identity(
     numerical_lock_digest: str,
     training_environment_digest: str,
     training_code_digest: str,
+    objective_contract_digest: str = "unresolved_objective_contract",
 ) -> tuple[str, dict[str, Any]]:
     identity = {
         "kind": kind,
@@ -609,6 +796,7 @@ def candidate_identity(
         "numerical_lock_digest": numerical_lock_digest,
         "training_environment_digest": training_environment_digest,
         "training_code_digest": training_code_digest,
+        "objective_contract_digest": str(objective_contract_digest),
     }
     config_digest = json_digest({
         "architecture": identity["architecture_config"],
@@ -619,10 +807,20 @@ def candidate_identity(
         "scaler": identity["scaler_digest"],
         "environment": identity["training_environment_digest"],
         "code": identity["training_code_digest"],
+        "objective_contract": identity["objective_contract_digest"],
     })
     candidate_id = f"{kind}_5m_{str(identity['dataset_digest'])[:8]}_{config_digest[:8]}_s{int(seed)}"
     identity["identity_digest"] = json_digest(identity)
     return candidate_id, identity
+
+
+def candidate_training_code_digest() -> str:
+    """Bind identity to both orchestration and pure objective implementation."""
+    return json_digest({
+        "model_candidate_train.py": file_digest(Path(__file__)),
+        "model_candidate_objective.py": file_digest(BASE_DIR / "tools" / "model_candidate_objective.py"),
+        "model_objective_contract.py": file_digest(BASE_DIR / "tools" / "model_objective_contract.py"),
+    })
 
 
 def _manifest_digest(value: Mapping[str, Any], field: str) -> str:
@@ -725,9 +923,17 @@ def _write_selected_candidate(
     candidate_root: Path,
     frozen_model_path: Path | None = None,
     expected_candidate_id: str | None = None,
+    objective: str = OBJECTIVE_NAME,
+    objective_contract_report: Mapping[str, Any] | None = None,
+    target_scales: Mapping[str, Any] | None = None,
 ) -> Path:
     torch = _torch()
-    training_code_digest = file_digest(Path(__file__))
+    if objective != OBJECTIVE_NAME:
+        raise ModelCandidateTrainingError("classification-only mode cannot finalize a Phase 24 candidate")
+    if objective_contract_report is None or target_scales is None:
+        raise ModelCandidateTrainingError("resolved objective report and training target scales required")
+    objective_contract_digest = str(objective_contract_report["objective_contract_digest"])
+    training_code_digest = candidate_training_code_digest()
     scaler_digest = file_digest(dataset_root / "scaler.joblib")
     candidate_id, identity = candidate_identity(
         kind,
@@ -736,6 +942,7 @@ def _write_selected_candidate(
         numerical_lock_digest=numerical_contract["canonical_numerical_lock_digest"],
         training_environment_digest=environment_manifest["manifest_digest"],
         training_code_digest=training_code_digest,
+        objective_contract_digest=objective_contract_digest,
     )
     if expected_candidate_id is not None and candidate_id != expected_candidate_id:
         raise ModelCandidateTrainingError("frozen candidate identity changed after internal-test access")
@@ -757,7 +964,10 @@ def _write_selected_candidate(
             raise ModelCandidateTrainingError("candidate scaler copy mismatch")
         model_digest = file_digest(stage / "model.pt")
         incumbent_digest = incumbent_hashes()[f"model_artifacts/dl_{kind}_latest.pt"]
-        objective = training_objective_contract()
+        objective_record = training_objective_contract(
+            objective, target_scales=target_scales,
+            objective_contract_digest=objective_contract_digest,
+        )
         auxiliary_audit = downstream_auxiliary_head_audit()
         metadata: dict[str, Any] = {
             "schema_version": 1, "candidate_id": candidate_id, "model_kind": kind,
@@ -765,8 +975,26 @@ def _write_selected_candidate(
             "supported_symbols": list(dataset_manifest["supported_symbols"]), "timeframe": "5m",
             "sequence_length": int(dataset_manifest["sequence_length"]), "feature_count": 27,
             "architecture_config": architecture["constructor"], "architecture_contract": architecture,
-            "training_objective": objective, "auxiliary_head_training_status": AUXILIARY_STATUS,
-            "candidate_auxiliary_head_promotion_blocker": auxiliary_audit["candidate_auxiliary_head_promotion_blocker"],
+            "training_objective": objective_record, "objective_contract": objective_record,
+            "objective_source": objective_record["objective_source"],
+            "objective_schema_version": objective_record["objective_schema_version"],
+            "objective_policy_digest": objective_record["objective_policy_digest"],
+            "objective_contract_digest": objective_contract_digest,
+            "classification_weight": config["classification_weight"],
+            "return_weight": config["return_weight"], "rv_weight": config["rv_weight"],
+            "ret_target_scale": target_scales["ret_target_scale"],
+            "rv_target_scale": target_scales["rv_target_scale"],
+            "ret_target_definition": objective_contract_report["return_target"],
+            "rv_target_definition": objective_contract_report["volatility_target"],
+            "classification_target_definition": objective_contract_report["classification_target"],
+            "ret_horizon_bars": objective_contract_report["return_target"]["horizon_bars"],
+            "rv_horizon_bars": objective_contract_report["volatility_target"]["horizon_bars"],
+            "classification_max_hold_bars": objective_contract_report["classification_target"]["horizon_bars"],
+            "auxiliary_head_training_status": AUXILIARY_STATUS,
+            "objective_contract_blocker": False,
+            "candidate_auxiliary_health_blocker": "unverified",
+            "downstream_contract_blocker": objective_contract_report["promotion_blockers"]["downstream_contract_blocker"],
+            "candidate_auxiliary_head_promotion_blocker": True,
             "selected_seed": int(selected_seed), "candidate_identity": identity,
             "candidate_status": _candidate_status_from_internal(internal_gate_result),
             "candidate_model_frozen": True, "candidate_scaler_frozen": True,
@@ -794,7 +1022,22 @@ def _write_selected_candidate(
             "symbol_id_map": dataset_manifest["symbol_id_map"],
             "supported_symbols": dataset_manifest["supported_symbols"], "timeframe": "5m",
             "sequence_length": dataset_manifest["sequence_length"], "feature_count": dataset_manifest["feature_count"],
-            "architecture_config": architecture["constructor"], "training_objective": objective,
+            "architecture_config": architecture["constructor"], "training_objective": objective_record,
+            "objective_source": objective_record["objective_source"],
+            "objective_schema_version": objective_record["objective_schema_version"],
+            "objective_policy_digest": objective_record["objective_policy_digest"],
+            "objective_contract_digest": objective_contract_digest,
+            "classification_weight": config["classification_weight"],
+            "return_weight": config["return_weight"], "rv_weight": config["rv_weight"],
+            "ret_target_scale": target_scales["ret_target_scale"],
+            "rv_target_scale": target_scales["rv_target_scale"],
+            "target_scale_contract": dict(target_scales),
+            "ret_target_definition": objective_contract_report["return_target"],
+            "rv_target_definition": objective_contract_report["volatility_target"],
+            "classification_target_definition": objective_contract_report["classification_target"],
+            "ret_horizon_bars": objective_contract_report["return_target"]["horizon_bars"],
+            "rv_horizon_bars": objective_contract_report["volatility_target"]["horizon_bars"],
+            "classification_max_hold_bars": objective_contract_report["classification_target"]["horizon_bars"],
             "auxiliary_head_training_status": AUXILIARY_STATUS, "seed": selected_seed,
             "optimizer": config["optimizer"], "scheduler": config["scheduler"],
             "batch_size": config["batch_size"], "epochs": config["epochs"], "patience": config["patience"],
@@ -885,6 +1128,10 @@ def _update_summary_and_maybe_freeze(candidate: Path, dataset_manifest: Mapping[
         "candidate_artifacts": artifacts, "incumbent_comparisons": "pending",
         "auxiliary_head_objective_warning": {
             "status": metadata["auxiliary_head_training_status"],
+            "objective_contract_digest": metadata["objective_contract_digest"],
+            "objective_contract_blocker": metadata["objective_contract_blocker"],
+            "candidate_auxiliary_health_blocker": metadata["candidate_auxiliary_health_blocker"],
+            "downstream_contract_blocker": metadata["downstream_contract_blocker"],
             "candidate_auxiliary_head_promotion_blocker": metadata["candidate_auxiliary_head_promotion_blocker"],
         },
     }
@@ -925,9 +1172,14 @@ def train_candidate_experiment(
     *,
     candidate_root: Path | str = CANDIDATE_ROOT,
     config: Mapping[str, Any] | None = None,
+    objective: str = OBJECTIVE_NAME,
+    objective_report: Path | str = OBJECTIVE_REPORT,
 ) -> dict[str, Any]:
     if kind not in ALLOWED_KINDS:
         raise ModelCandidateTrainingError("ADV is retained and may not be retrained in Phase 24")
+    objective_contract_report = validate_training_objective_gate(
+        objective, report_path=objective_report
+    )
     validate_phase24_evidence()
     policy = load_training_policy()
     numerical, environment = _safe_environment_contract()
@@ -938,13 +1190,25 @@ def train_candidate_experiment(
     training_config = copy.deepcopy(DEFAULT_TRAINING_CONFIG)
     if config:
         training_config.update(dict(config))
+    policy_weights = load_objective_policy()
+    expected_weights = {
+        "classification_weight": policy_weights["classification"]["weight"],
+        "return_weight": policy_weights["return_regression"]["weight"],
+        "rv_weight": policy_weights["volatility_regression"]["weight"],
+    }
+    if any(float(training_config[name]) != float(value) for name, value in expected_weights.items()):
+        raise ModelCandidateTrainingError("training task weights differ from resolved objective contract")
+    target_scales = training_sequence_target_scales(datasets)
+    objective_contract_digest = str(objective_contract_report["objective_contract_digest"])
     seed_results: list[dict[str, Any]] = []
     models: dict[int, Any] = {}
     for seed in policy["training_seeds"]:
         set_deterministic_seed(seed)
         model = make_candidate_model(kind, architecture["constructor"]).cpu()
         history, validation = train_classification_candidate(
-            model, datasets, seed=seed, config=training_config
+            model, datasets, seed=seed, config=training_config, objective=objective,
+            target_scales=target_scales,
+            objective_contract_digest=objective_contract_digest,
         )
         seed_results.append({"seed": seed, "validation": validation, "history": history})
         models[int(seed)] = model
@@ -953,13 +1217,14 @@ def train_candidate_experiment(
     selected_seed = int(selection["selected_seed"])
     selected_model = models[selected_seed]
     # Freeze identity, exact model bytes, and scaler digest before opening test.
-    training_code_digest = file_digest(Path(__file__))
+    training_code_digest = candidate_training_code_digest()
     candidate_id, candidate_identity_record = candidate_identity(
         kind, architecture_config=architecture["constructor"], dataset_manifest=manifest,
         scaler_digest=file_digest(Path(dataset) / "scaler.joblib"), training_config=training_config,
         seed=selected_seed, numerical_lock_digest=numerical["canonical_numerical_lock_digest"],
         training_environment_digest=environment["manifest_digest"],
         training_code_digest=training_code_digest,
+        objective_contract_digest=objective_contract_digest,
     )
     freeze_directory = SEED_RUN_ROOT / candidate_id
     if freeze_directory.exists():
@@ -981,9 +1246,11 @@ def train_candidate_experiment(
     selected_freeze["internal_test_first_access_at"] = utc_now()
     selected_freeze["freeze_digest"] = _manifest_digest(selected_freeze, "freeze_digest")
     atomic_write_json(freeze_directory / "selected_freeze.json", selected_freeze)
+    internal_weights, _ = _class_weights(_concat(datasets, "train"))
     internal = evaluate_classification_model(
         selected_model, datasets, "internal_test", batch_size=int(training_config["batch_size"]),
-        deterministic_repeat=True,
+        deterministic_repeat=True, class_weights=internal_weights.tolist(),
+        target_scales=target_scales, objective=objective,
     )
     internal["selection_evidence_allowed"] = False
     gate = internal_test_gate(internal, policy)
@@ -994,6 +1261,8 @@ def train_candidate_experiment(
         internal_gate_result=gate, environment_manifest=environment, numerical_contract=numerical,
         started_at=started_at, candidate_root=Path(candidate_root),
         frozen_model_path=frozen_model_path, expected_candidate_id=candidate_id,
+        objective=objective, objective_contract_report=objective_contract_report,
+        target_scales=target_scales,
     )
     verify_incumbent_inventory()
     summary = _update_summary_and_maybe_freeze(target, manifest)
@@ -1001,6 +1270,7 @@ def train_candidate_experiment(
         "status": _candidate_status_from_internal(gate), "candidate_id": target.name,
         "candidate_directory": target.as_posix(), "selected_seed": selected_seed,
         "internal_test_gate": gate, "selection": selection, "summary_digest": summary["summary_digest"],
+        "objective_contract_digest": objective_contract_digest,
     }
 
 
@@ -1008,13 +1278,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=ALLOWED_KINDS, required=True)
     parser.add_argument("--dataset", required=True)
+    parser.add_argument(
+        "--objective", choices=(OBJECTIVE_NAME, LEGACY_OBJECTIVE_NAME), default=OBJECTIVE_NAME,
+        help="classification_only_legacy is research-only and cannot finalize a candidate",
+    )
+    parser.add_argument("--objective-contract", default=str(OBJECTIVE_REPORT))
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        result = train_candidate_experiment(args.model, args.dataset)
+        result = train_candidate_experiment(
+            args.model, args.dataset, objective=args.objective,
+            objective_report=args.objective_contract,
+        )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result["status"] != "internal_test_failed" else 3
     except (ModelCandidateTrainingError, CandidateTrainingEnvironmentError) as exc:

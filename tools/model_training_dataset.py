@@ -470,14 +470,17 @@ def build_dataset(
     record_incumbent_inventory()
     from features import build_features, canonical_feature_columns
     from ml_dl.dl_labels import next_k_logret, next_k_rv, triple_barrier_label
+    from tools.model_objective_label_audit import resolve_target_contract
     columns = canonical_feature_columns(True)
     if columns != contract["feature_names"] or len(columns) != int(policy["feature_count"]):
         raise ModelTrainingDatasetError("27-feature contract mismatch")
     feature_code_digest = file_digest(BASE_DIR / "features.py")
     label_code_digest = file_digest(BASE_DIR / "ml_dl" / "dl_labels.py")
     import pandas as pd
+    resolved_targets = resolve_target_contract(contract["label_contract"])
+    maximum_lookahead = int(resolved_targets["maximum_required_purge_bars"])
     max_endpoint_ns = int(pd.Timestamp(
-        maximum_training_timestamps()["maximum_training_labeled_endpoint_utc"]
+        maximum_training_timestamps(max_lookahead=maximum_lookahead)["maximum_training_labeled_endpoint_utc"]
     ).value)
     arrays: dict[str, dict[str, np.ndarray]] = {}
     eligible_times: dict[str, np.ndarray] = {}
@@ -526,7 +529,7 @@ def build_dataset(
         }
     splits, split_info = chronological_split(
         eligible_times, train_fraction=policy["train_fraction"],
-        validation_fraction=policy["validation_fraction"], purge_bars=contract["label_contract"]["max_hold"],
+        validation_fraction=policy["validation_fraction"], purge_bars=maximum_lookahead,
     )
     feature_hashes: dict[str, str] = {}
     label_hashes: dict[str, str] = {}
@@ -570,6 +573,8 @@ def build_dataset(
         "features_py_digest": feature_code_digest,
         "label_contract": contract["label_contract"], "label_contract_digest": contract["label_contract_digest"],
         "label_implementation_digest": label_code_digest,
+        "resolved_target_contract_digest": resolved_targets["target_contract_digest"],
+        "maximum_target_lookahead_bars": maximum_lookahead,
         "raw_data_digest": raw_manifest["combined_raw_digest"],
         "feature_file_digests": feature_hashes, "label_file_digests": label_hashes,
         "feature_digest": json_digest(feature_hashes), "label_digest": json_digest(label_hashes),
