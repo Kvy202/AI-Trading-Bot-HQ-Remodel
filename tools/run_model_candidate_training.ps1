@@ -1,13 +1,14 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
     [ValidateSet("lstm", "tcn", "tx")]
-    [string]$Model,
+    [string]$Model = "lstm",
 
     [switch]$DryRun,
     [switch]$Bootstrap,
     [switch]$CaptureDataset,
     [switch]$BuildDataset,
+    [switch]$BalanceProbe,
+    [switch]$BalanceFreeze,
     [switch]$Train,
     [switch]$Evaluate,
     [switch]$LegacyRepairGate,
@@ -66,9 +67,15 @@ if ($DryRun) {
     Write-Output "bootstrap_planned=project Python -> tools/model_training_environment.py --bootstrap"
     Write-Output "capture_planned=project Python -> tools/model_training_dataset.py capture"
     Write-Output "build_planned=project Python -> tools/model_training_dataset.py build (scaler worker uses training Python)"
+    Write-Output "balance_probe_planned=project Python -> tools/model_loss_balance_probe.py synthetic_only"
+    Write-Output "balance_freeze_planned=training Python -> tools/model_candidate_loss_balance.py training_sequences_only"
+    Write-Output "balance_required=true"
+    Write-Output "balance_freeze_status=pending"
+    Write-Output "validation_access_allowed=false"
+    Write-Output "training_allowed=false"
     Write-Output "train_planned=training Python -> tools/model_candidate_train.py --model $Model"
     Write-Output "objective_contract_required=reports/model_objective_contract.json verdict=candidate_objective_contract_resolved_multitask_training_required"
-    Write-Output "objective_planned=resolved_candidate_objective classification_weight=1.0 return_weight=0.5 rv_weight=0.5"
+    Write-Output "objective_planned=parent objective plus architecture-specific frozen balance formulation"
     Write-Output "evaluate_planned=training Python -> tools/model_candidate_evaluate.py"
     Write-Output "legacy_gate_planned=training Python -> tools/model_candidate_health_gate.py --gate legacy-repair"
     Write-Output "confirmation_capture_planned=project Python -> tools/model_training_dataset.py capture-confirmation"
@@ -77,7 +84,7 @@ if ($DryRun) {
 }
 
 $OperationCount = @(
-    $Bootstrap, $CaptureDataset, $BuildDataset, $Train, $Evaluate,
+    $Bootstrap, $CaptureDataset, $BuildDataset, $BalanceProbe, $BalanceFreeze, $Train, $Evaluate,
     $LegacyRepairGate, $CaptureConfirmation, $ConfirmationGate
 ).Where({ $_ }).Count
 if ($OperationCount -eq 0) {
@@ -103,12 +110,26 @@ try {
             "--training-python", $TrainingPython
         )
     }
+    if ($BalanceProbe) {
+        Invoke-CheckedPython -Interpreter $ProjectPython -Arguments @(
+            "tools/model_loss_balance_probe.py", "--json-out", "reports/model_loss_balance_probe.json"
+        )
+    }
+    if ($BalanceFreeze) {
+        Require-PathArgument -Value $Dataset -Name "Dataset"
+        Invoke-CheckedPython -Interpreter $TrainingPython -Arguments @(
+            "tools/model_candidate_loss_balance.py", "--dataset", $Dataset,
+            "--json-out", "reports/model_candidate_loss_balance.json",
+            "--freeze-out", "reports/model_candidate_loss_balance_freeze.json"
+        )
+    }
     if ($Train) {
         Require-PathArgument -Value $Dataset -Name "Dataset"
         Invoke-CheckedPython -Interpreter $TrainingPython -Arguments @(
             "tools/model_candidate_train.py", "--model", $Model, "--dataset", $Dataset,
             "--objective", "resolved_candidate_objective",
-            "--objective-contract", "reports/model_objective_contract.json"
+            "--objective-contract", "reports/model_objective_contract.json",
+            "--balance-freeze", "reports/model_candidate_loss_balance_freeze.json"
         )
     }
     if ($Evaluate) {

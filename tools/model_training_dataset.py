@@ -434,26 +434,29 @@ def chronological_split(
     return assignments, info
 
 
+def _valid_sequence_endpoints(
+    split: np.ndarray, finite_label: np.ndarray, sequence_length: int, split_code: int,
+) -> tuple[np.ndarray, int]:
+    positions = np.flatnonzero(np.asarray(split) == int(split_code))
+    endpoints: list[int] = []
+    dropped = 0
+    segment_start = 0
+    for offset, pos in enumerate(positions):
+        if offset == 0 or pos != positions[offset - 1] + 1:
+            segment_start = offset
+        if offset - segment_start < sequence_length - 1:
+            dropped += int(bool(finite_label[pos]))
+        elif finite_label[pos]:
+            endpoints.append(int(pos))
+    return np.asarray(endpoints, dtype=np.int64), int(dropped)
+
+
 def _valid_sequence_count(split: np.ndarray, finite_label: np.ndarray, sequence_length: int) -> tuple[dict[str, int], dict[str, int]]:
     counts: dict[str, int] = {}
     context: dict[str, int] = {}
     for code, name in ((0, "train"), (1, "validation"), (2, "internal_test")):
-        positions = np.flatnonzero(split == code)
-        if not len(positions):
-            counts[name], context[name] = 0, 0
-            continue
-        # A sequence is built only inside the contiguous split slice. Any gap
-        # in its raw row positions starts a new segment and loses fresh context.
-        valid = dropped = 0
-        segment_start = 0
-        for offset, pos in enumerate(positions):
-            if offset == 0 or pos != positions[offset - 1] + 1:
-                segment_start = offset
-            if offset - segment_start < sequence_length - 1:
-                dropped += int(bool(finite_label[pos]))
-            elif finite_label[pos]:
-                valid += 1
-        counts[name], context[name] = int(valid), int(dropped)
+        endpoints, dropped = _valid_sequence_endpoints(split, finite_label, sequence_length, code)
+        counts[name], context[name] = int(len(endpoints)), dropped
     return counts, context
 
 
@@ -533,6 +536,9 @@ def build_dataset(
     )
     feature_hashes: dict[str, str] = {}
     label_hashes: dict[str, str] = {}
+    training_ret_targets: list[float] = []
+    training_rv_targets: list[float] = []
+    training_sequence_count_by_symbol: dict[str, int] = {}
     for symbol in policy["required_symbols"]:
         data = arrays[symbol]
         # Recompute split codes over every feature row using the shared exact boundaries.
@@ -554,6 +560,12 @@ def build_dataset(
         )
         feature_hashes[symbol], label_hashes[symbol] = file_digest(feature_path), file_digest(label_path)
         counts, context = _valid_sequence_count(split, data["finite_label"], policy["sequence_length"])
+        train_endpoints, _ = _valid_sequence_endpoints(
+            split, data["finite_label"], policy["sequence_length"], 0
+        )
+        training_ret_targets.extend(data["ret_reg"][train_endpoints].tolist())
+        training_rv_targets.extend(data["rv_reg"][train_endpoints].tolist())
+        training_sequence_count_by_symbol[symbol] = int(len(train_endpoints))
         per_symbol[symbol]["rows_by_split"] = {
             name: int(np.sum((split == code) & data["finite_label"]))
             for code, name in ((0, "train"), (1, "validation"), (2, "internal_test"))
@@ -563,6 +575,18 @@ def build_dataset(
         per_symbol[symbol]["purged_rows"] = int(np.sum(split == -1))
         if any(counts[name] <= 0 for name in counts):
             raise ModelTrainingDatasetError(f"insufficient per-symbol sequences: {symbol}")
+    from tools.model_candidate_objective import compute_training_target_scales
+    target_scales = compute_training_target_scales(training_ret_targets, training_rv_targets)
+    target_scales.update({
+        "training_sequence_count_by_symbol": training_sequence_count_by_symbol,
+        "validation_targets_consulted": False,
+        "internal_test_targets_consulted": False,
+        "legacy_repair_targets_consulted": False,
+        "confirmation_targets_consulted": False,
+    })
+    target_scales["target_scale_digest"] = json_digest({
+        key: value for key, value in target_scales.items() if key != "target_scale_digest"
+    })
     manifest: dict[str, Any] = {
         "schema_version": 1, "dataset_id": raw_manifest["dataset_id"], "dataset_status": "features_labels_split_built",
         "built_at": utc_now(), "git_commit": git_commit(), "source_venue": raw_manifest["source_venue"],
@@ -580,12 +604,14 @@ def build_dataset(
         "feature_digest": json_digest(feature_hashes), "label_digest": json_digest(label_hashes),
         "split": split_info, "split_digest": split_info["split_digest"], "per_symbol": per_symbol,
         "phase22_excluded": True, "per_symbol_feature_build": True, "per_symbol_label_build": True,
-        "per_symbol_sequence_construction_required": True, "scaler": None,
+        "per_symbol_sequence_construction_required": True,
+        "target_scales": target_scales, "scaler": None,
     }
     manifest["dataset_digest"] = json_digest({
         "raw": manifest["raw_data_digest"], "features": manifest["feature_digest"],
         "labels": manifest["label_digest"], "split": manifest["split_digest"],
         "feature_contract": manifest["feature_contract_digest"], "label_contract": manifest["label_contract_digest"],
+        "target_scale": manifest["target_scales"]["target_scale_digest"],
     })
     manifest["manifest_digest"] = json_digest({k: v for k, v in manifest.items() if k not in {"built_at", "manifest_digest"}})
     atomic_write_json(root / "dataset_manifest.json", manifest)
@@ -645,6 +671,7 @@ def fit_frozen_scaler(
         "labels": manifest["label_digest"], "split": manifest["split_digest"],
         "scaler": manifest["scaler"]["sha256"], "feature_contract": manifest["feature_contract_digest"],
         "label_contract": manifest["label_contract_digest"],
+        "target_scale": manifest["target_scales"]["target_scale_digest"],
     })
     manifest["manifest_digest"] = json_digest({k: v for k, v in manifest.items() if k not in {"built_at", "manifest_digest"}})
     atomic_write_json(manifest_path, manifest)
@@ -690,6 +717,9 @@ def verify_dataset(dataset: Path | str) -> dict[str, Any]:
         raise ModelTrainingDatasetError("dataset manifest digest mismatch")
     if manifest.get("feature_count") != 27 or len(manifest.get("ordered_feature_names", [])) != 27:
         raise ModelTrainingDatasetError("dataset feature width mismatch")
+    observed_ret_targets: list[float] = []
+    observed_rv_targets: list[float] = []
+    observed_train_counts: dict[str, int] = {}
     for symbol in manifest["symbols"]:
         if file_digest(root / f"features_{symbol}.npz") != manifest["feature_file_digests"][symbol]:
             raise ModelTrainingDatasetError(f"feature file digest mismatch: {symbol}")
@@ -706,10 +736,30 @@ def verify_dataset(dataset: Path | str) -> dict[str, Any]:
             raise ModelTrainingDatasetError(f"feature/label timestamp mismatch: {symbol}")
         finite_label = np.isfinite(labels["ret_cls"]) & np.isfinite(labels["ret_reg"]) & np.isfinite(labels["rv_reg"])
         counts, context = _valid_sequence_count(split, finite_label, int(manifest["sequence_length"]))
+        train_endpoints, _ = _valid_sequence_endpoints(
+            split, finite_label, int(manifest["sequence_length"]), 0
+        )
+        observed_ret_targets.extend(np.asarray(labels["ret_reg"])[train_endpoints].tolist())
+        observed_rv_targets.extend(np.asarray(labels["rv_reg"])[train_endpoints].tolist())
+        observed_train_counts[symbol] = int(len(train_endpoints))
         if counts != manifest["per_symbol"][symbol]["valid_sequences_by_split"]:
             raise ModelTrainingDatasetError(f"sequence count integrity mismatch: {symbol}")
         if context != manifest["per_symbol"][symbol]["sequence_context_drops_by_split"]:
             raise ModelTrainingDatasetError(f"sequence context integrity mismatch: {symbol}")
+    from tools.model_candidate_objective import compute_training_target_scales
+    observed_scales = compute_training_target_scales(observed_ret_targets, observed_rv_targets)
+    observed_scales.update({
+        "training_sequence_count_by_symbol": observed_train_counts,
+        "validation_targets_consulted": False,
+        "internal_test_targets_consulted": False,
+        "legacy_repair_targets_consulted": False,
+        "confirmation_targets_consulted": False,
+    })
+    observed_scales["target_scale_digest"] = json_digest({
+        key: value for key, value in observed_scales.items() if key != "target_scale_digest"
+    })
+    if manifest.get("target_scales") != observed_scales:
+        raise ModelTrainingDatasetError("training-sequence target-scale integrity mismatch")
     scaler_path = root / "scaler.joblib"
     if file_digest(scaler_path) != manifest["scaler"]["sha256"]:
         raise ModelTrainingDatasetError("frozen scaler digest mismatch")

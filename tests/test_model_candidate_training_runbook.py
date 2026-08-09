@@ -40,6 +40,7 @@ def test_runbook_exposes_every_required_operation_and_model_scope():
     for operation in (
         "DryRun", "Bootstrap", "CaptureDataset", "BuildDataset", "Train", "Evaluate",
         "LegacyRepairGate", "CaptureConfirmation", "ConfirmationGate",
+        "BalanceProbe", "BalanceFreeze",
     ):
         assert f"[switch]${operation}" in source
     assert '[ValidateSet("lstm", "tcn", "tx")]' in source
@@ -51,6 +52,19 @@ def test_runbook_visibly_separates_project_and_training_interpreters():
     assert ".venv-model-training\\canonical\\Scripts\\python.exe" in source
     assert "capture_planned=project Python" in source
     assert "train_planned=training Python" in source
+    assert "balance_freeze_planned=training Python" in source
+
+
+def test_dry_run_blocks_training_and_validation_until_balance_freeze():
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(RUNBOOK),
+         "-Model", "lstm", "-DryRun"],
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 0
+    for line in ("balance_required=true", "balance_freeze_status=pending",
+                 "validation_access_allowed=false", "training_allowed=false"):
+        assert line in completed.stdout
 
 
 def test_runbook_contains_no_prohibited_process_invocation():

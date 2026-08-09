@@ -96,6 +96,46 @@ def test_normalized_residual_losses_and_total_formula_are_exact():
     assert torch.equal(parts["total_loss"], cls + 0.5 * ret + 0.5 * rv)
 
 
+def test_normalized_huber_uses_normalized_residual_beta_one_and_raw_outputs():
+    prediction = torch.tensor([2.0, 4.0])
+    target = torch.tensor([1.0, 2.0])
+    observed = objective.normalized_huber_return_loss(prediction, target, 2.0, beta=1.0)
+    residual = (prediction - target) / 2.0
+    expected = torch.nn.functional.smooth_l1_loss(residual, torch.zeros_like(residual), beta=1.0)
+    assert torch.equal(observed, expected)
+    assert torch.equal(prediction, torch.tensor([2.0, 4.0]))
+
+
+def test_resolved_formulation_A_exactly_matches_phase24_1_loss_and_classification():
+    outputs, targets = _loss_inputs()
+    descriptor = {"formulation_id": "normalized_mse_fixed", "classification_weight": 1.0,
+                  "return_weight": 0.5, "rv_weight": 0.5, "huber_beta": None}
+    old = objective.candidate_multitask_loss(outputs, targets, ret_scale=0.02, rv_scale=0.01)
+    new = objective.resolved_candidate_loss(
+        outputs, targets, ret_scale=0.02, rv_scale=0.01, formulation=descriptor
+    )
+    for key in ("total_loss", "classification_loss", "return_regression_loss", "rv_regression_loss"):
+        assert torch.equal(old[key], new[key])
+    assert torch.equal(new["weighted_return_loss"], new["return_regression_loss"] * 0.5)
+
+
+def test_resolved_huber_total_formula_and_negative_rv_target_fail_closed():
+    outputs, targets = _loss_inputs()
+    descriptor = {"formulation_id": "normalized_huber_training_balanced",
+                  "classification_weight": 1.0, "return_weight": 0.2,
+                  "rv_weight": 0.3, "huber_beta": 1.0}
+    losses = objective.resolved_candidate_loss(
+        outputs, targets, ret_scale=0.02, rv_scale=0.01, formulation=descriptor
+    )
+    assert torch.equal(losses["total_loss"], losses["weighted_classification_loss"]
+                       + losses["weighted_return_loss"] + losses["weighted_rv_loss"])
+    targets["y_rv_reg"][0] = -0.1
+    with pytest.raises(objective.CandidateObjectiveError, match="negative"):
+        objective.resolved_candidate_loss(
+            outputs, targets, ret_scale=0.02, rv_scale=0.01, formulation=descriptor
+        )
+
+
 def test_zero_auxiliary_weights_reduce_exactly_to_legacy_classification_loss():
     outputs, targets = _loss_inputs()
     parts = objective.candidate_multitask_loss(
@@ -157,4 +197,3 @@ def test_nonfinite_and_constant_outputs_are_hard_failures_but_low_skill_is_warni
         ret_scale=1, rv_scale=1, ret_train_target_mean=0, rv_train_target_mean=2,
     )
     assert warning["ret_reg"]["classification"] == "auxiliary_warning_low_skill"
-

@@ -802,3 +802,38 @@ confirmation auxiliary checks, `candidate_auxiliary_health_blocker` remains
 unverified. `downstream_contract_blocker` is recorded independently. No
 candidate is promotion-ready while any blocker is true or unverified, and this
 phase implements neither promotion nor live activation.
+
+## Phase 24.2 — training-only loss balance freeze
+
+The Phase 24.1 target definitions and objective digest remain the parent
+contract. Phase 24.2 tests only three predeclared formulations: normalized MSE
+with fixed 1/0.5/0.5 weights, normalized Smooth-L1 (`beta=1.0`) with those
+weights, and normalized Smooth-L1 with one fixed training-gradient balance per
+architecture. Classification stays at weight 1.0. No validation, internal
+test, Phase 22, or confirmation evidence may select a formulation or weight.
+
+The full-size probe is synthetic implementation evidence and cannot freeze
+real weights:
+
+```powershell
+python tools/model_loss_balance_probe.py --json-out reports/model_loss_balance_probe.json
+```
+
+After the real dataset has been captured, built, split, purged, scaled, and
+verified, run the balance freeze before opening validation:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File ".\tools\run_model_candidate_training.ps1" `
+  -BalanceFreeze `
+  -Dataset ".\reports\model_training_datasets\<dataset_id>"
+```
+
+Calibration uses 16 deterministic training-only batches (seed 24201), the
+already frozen all-training-endpoint target scales, and the full production
+candidate constructors. It tries the minimal-change formulations A, B, then C
+and freezes one descriptor per architecture. The freeze is immutable and its
+digest becomes part of every candidate identity. Real training and validation
+remain blocked until this freeze exists and predates every non-training access
+ledger. Balance success authorizes optimization to begin; it does not prove
+auxiliary skill, candidate health, profitability, promotion, or activation.

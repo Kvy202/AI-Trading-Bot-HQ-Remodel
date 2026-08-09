@@ -55,10 +55,16 @@ from tools.model_candidate_objective import (
     LEGACY_OBJECTIVE_NAME,
     OBJECTIVE_NAME,
     RESOLVED_AUXILIARY_STATUS,
-    candidate_multitask_loss,
     compute_training_target_scales,
     load_objective_policy,
     objective_metrics,
+    resolved_candidate_loss,
+)
+from tools.model_candidate_loss_balance import (
+    DEFAULT_BALANCE_FREEZE,
+    LossBalanceError,
+    formulation_descriptor,
+    validate_balance_freeze,
 )
 from tools.model_objective_contract import (
     OBJECTIVE_REPORT,
@@ -73,6 +79,7 @@ CANDIDATE_ROOT = BASE_DIR / "model_artifacts" / "candidates"
 SEED_RUN_ROOT = BASE_DIR / "reports" / "model_candidate_seed_runs"
 TRAINING_SUMMARY = BASE_DIR / "reports" / "model_candidate_training_summary.json"
 SELECTION_FREEZE = BASE_DIR / "reports" / "model_candidate_selection_freeze.json"
+VALIDATION_ACCESS_LEDGER = BASE_DIR / "reports" / "model_candidate_validation_access.json"
 ALLOWED_KINDS = ("lstm", "tcn", "tx")
 AUXILIARY_STATUS = RESOLVED_AUXILIARY_STATUS
 
@@ -111,6 +118,8 @@ def training_objective_contract(
     *,
     target_scales: Mapping[str, Any] | None = None,
     objective_contract_digest: str | None = None,
+    formulation: Mapping[str, Any] | None = None,
+    balance_contract_digest: str | None = None,
 ) -> dict[str, Any]:
     """Return the resolved contract or the explicitly research-only legacy mode."""
     if objective == LEGACY_OBJECTIVE_NAME:
@@ -132,19 +141,28 @@ def training_objective_contract(
         raise ModelCandidateTrainingError("unknown candidate objective")
     policy = load_objective_policy()
     scales = dict(target_scales or {})
+    effective = dict(formulation or formulation_descriptor("normalized_mse_fixed"))
     return {
         "name": OBJECTIVE_NAME,
         "objective_source": "new_candidate_only_contract",
         "objective_schema_version": int(policy["schema_version"]),
         "objective_policy_digest": json_digest(policy),
         "objective_contract_digest": objective_contract_digest,
-        "formula": "L_cls + 0.5*L_ret + 0.5*L_rv",
+        "formula": "fixed_weighted_resolved_candidate_loss",
         "classification": dict(policy["classification"]),
-        "return_regression": dict(policy["return_regression"]),
-        "volatility_regression": dict(policy["volatility_regression"]),
+        "return_regression": {**dict(policy["return_regression"]),
+                              "effective_loss": effective["regression_loss"]},
+        "volatility_regression": {**dict(policy["volatility_regression"]),
+                                  "effective_loss": effective["regression_loss"]},
         "target_scale_source": policy["target_scale_source"],
         "ret_target_scale": scales.get("ret_target_scale"),
         "rv_target_scale": scales.get("rv_target_scale"),
+        "selected_loss_formulation": effective["formulation_id"],
+        "classification_weight": effective["classification_weight"],
+        "return_weight": effective["return_weight"],
+        "rv_weight": effective["rv_weight"],
+        "huber_beta": effective["huber_beta"],
+        "balance_contract_digest": balance_contract_digest,
         "ret_reg_optimized": True,
         "rv_reg_optimized": True,
         "auxiliary_head_training_status": AUXILIARY_STATUS,
@@ -576,6 +594,8 @@ def train_classification_candidate(
     objective: str = OBJECTIVE_NAME,
     target_scales: Mapping[str, Any] | None = None,
     objective_contract_digest: str | None = None,
+    formulation: Mapping[str, Any] | None = None,
+    balance_contract_digest: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Train with the resolved objective; retain legacy mode for synthetic research."""
     torch = _torch()
@@ -583,6 +603,7 @@ def train_classification_candidate(
     train_dataset = _concat(datasets_by_symbol, "train")
     weights, counts = _class_weights(train_dataset)
     scales = dict(target_scales or training_sequence_target_scales(datasets_by_symbol))
+    effective_formulation = dict(formulation or formulation_descriptor("normalized_mse_fixed"))
     loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=int(config["batch_size"]),
@@ -605,12 +626,14 @@ def train_classification_candidate(
         component_sums = {
             "total_loss": 0.0, "classification_loss": 0.0,
             "return_regression_loss": 0.0, "rv_regression_loss": 0.0,
+            "weighted_classification_loss": 0.0,
+            "weighted_return_loss": 0.0, "weighted_rv_loss": 0.0,
         }
         seen = 0
         for batch in loader:
             outputs = model(batch["x"].cpu())
             if objective == OBJECTIVE_NAME:
-                components = candidate_multitask_loss(
+                components = resolved_candidate_loss(
                     outputs,
                     {
                         "y_ret_cls": batch["y_ret_cls"].cpu(),
@@ -619,10 +642,7 @@ def train_classification_candidate(
                     },
                     ret_scale=float(scales["ret_target_scale"]),
                     rv_scale=float(scales["rv_target_scale"]),
-                    class_weights=weights,
-                    classification_weight=float(config["classification_weight"]),
-                    return_weight=float(config["return_weight"]),
-                    rv_weight=float(config["rv_weight"]),
+                    class_weights=weights, formulation=effective_formulation,
                 )
             elif objective == LEGACY_OBJECTIVE_NAME:
                 cls = torch.nn.CrossEntropyLoss(weight=weights)(
@@ -632,6 +652,8 @@ def train_classification_candidate(
                 components = {
                     "total_loss": cls, "classification_loss": cls,
                     "return_regression_loss": zero, "rv_regression_loss": zero,
+                    "weighted_classification_loss": cls,
+                    "weighted_return_loss": zero, "weighted_rv_loss": zero,
                 }
             else:
                 raise ModelCandidateTrainingError("unknown candidate objective")
@@ -685,7 +707,8 @@ def train_classification_candidate(
         "class_counts": {"0": int(counts[0]), "1": int(counts[1])},
         "deterministic_configuration": deterministic,
         "training_objective": training_objective_contract(
-            objective, target_scales=scales, objective_contract_digest=objective_contract_digest
+            objective, target_scales=scales, objective_contract_digest=objective_contract_digest,
+            formulation=effective_formulation, balance_contract_digest=balance_contract_digest,
         ),
         "target_scales": scales,
     }
@@ -782,6 +805,7 @@ def candidate_identity(
     training_environment_digest: str,
     training_code_digest: str,
     objective_contract_digest: str = "unresolved_objective_contract",
+    balance_contract_digest: str = "unresolved_balance_contract",
 ) -> tuple[str, dict[str, Any]]:
     identity = {
         "kind": kind,
@@ -797,6 +821,7 @@ def candidate_identity(
         "training_environment_digest": training_environment_digest,
         "training_code_digest": training_code_digest,
         "objective_contract_digest": str(objective_contract_digest),
+        "balance_contract_digest": str(balance_contract_digest),
     }
     config_digest = json_digest({
         "architecture": identity["architecture_config"],
@@ -808,6 +833,7 @@ def candidate_identity(
         "environment": identity["training_environment_digest"],
         "code": identity["training_code_digest"],
         "objective_contract": identity["objective_contract_digest"],
+        "balance_contract": identity["balance_contract_digest"],
     })
     candidate_id = f"{kind}_5m_{str(identity['dataset_digest'])[:8]}_{config_digest[:8]}_s{int(seed)}"
     identity["identity_digest"] = json_digest(identity)
@@ -820,6 +846,7 @@ def candidate_training_code_digest() -> str:
         "model_candidate_train.py": file_digest(Path(__file__)),
         "model_candidate_objective.py": file_digest(BASE_DIR / "tools" / "model_candidate_objective.py"),
         "model_objective_contract.py": file_digest(BASE_DIR / "tools" / "model_objective_contract.py"),
+        "model_candidate_loss_balance.py": file_digest(BASE_DIR / "tools" / "model_candidate_loss_balance.py"),
     })
 
 
@@ -904,6 +931,37 @@ def _candidate_status_from_internal(gate: Mapping[str, Any]) -> str:
     return "confirmation_pending" if gate.get("passed") else "internal_test_failed"
 
 
+def record_validation_access(
+    *, dataset_digest: str, balance_contract_digest: str, balance_freeze_timestamp: str,
+    ledger_path: Path | str = VALIDATION_ACCESS_LEDGER,
+) -> dict[str, Any]:
+    """Record that validation is being opened only after the immutable balance freeze."""
+    path = Path(ledger_path)
+    value = {"schema_version": 1, "accesses": []}
+    if path.is_file():
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    entries = value.setdefault("accesses", [])
+    matching = [item for item in entries if item.get("dataset_digest") == dataset_digest]
+    if matching:
+        if any(item.get("balance_contract_digest") != balance_contract_digest for item in matching):
+            raise ModelCandidateTrainingError("validation access balance contract mismatch")
+        if any(str(item.get("first_access_at", "")) < str(balance_freeze_timestamp) for item in matching):
+            raise ModelCandidateTrainingError("balance_freeze_contaminated")
+        return matching[0]
+    record = {
+        "dataset_digest": dataset_digest,
+        "balance_contract_digest": balance_contract_digest,
+        "first_access_at": utc_now(),
+        "access_type": "validation_seed_selection",
+        "balance_frozen_before_access": True,
+        "balance_freeze_timestamp": str(balance_freeze_timestamp),
+    }
+    entries.append(record)
+    value["ledger_digest"] = json_digest({key: item for key, item in value.items() if key != "ledger_digest"})
+    atomic_write_json(path, value)
+    return record
+
+
 def _write_selected_candidate(
     *,
     kind: str,
@@ -926,13 +984,16 @@ def _write_selected_candidate(
     objective: str = OBJECTIVE_NAME,
     objective_contract_report: Mapping[str, Any] | None = None,
     target_scales: Mapping[str, Any] | None = None,
+    balance_freeze: Mapping[str, Any] | None = None,
+    formulation: Mapping[str, Any] | None = None,
 ) -> Path:
     torch = _torch()
     if objective != OBJECTIVE_NAME:
         raise ModelCandidateTrainingError("classification-only mode cannot finalize a Phase 24 candidate")
-    if objective_contract_report is None or target_scales is None:
-        raise ModelCandidateTrainingError("resolved objective report and training target scales required")
+    if objective_contract_report is None or target_scales is None or balance_freeze is None or formulation is None:
+        raise ModelCandidateTrainingError("resolved objective, balance freeze, and training target scales required")
     objective_contract_digest = str(objective_contract_report["objective_contract_digest"])
+    balance_contract_digest = str(balance_freeze["balance_contract_digest"])
     training_code_digest = candidate_training_code_digest()
     scaler_digest = file_digest(dataset_root / "scaler.joblib")
     candidate_id, identity = candidate_identity(
@@ -943,6 +1004,7 @@ def _write_selected_candidate(
         training_environment_digest=environment_manifest["manifest_digest"],
         training_code_digest=training_code_digest,
         objective_contract_digest=objective_contract_digest,
+        balance_contract_digest=balance_contract_digest,
     )
     if expected_candidate_id is not None and candidate_id != expected_candidate_id:
         raise ModelCandidateTrainingError("frozen candidate identity changed after internal-test access")
@@ -967,6 +1029,7 @@ def _write_selected_candidate(
         objective_record = training_objective_contract(
             objective, target_scales=target_scales,
             objective_contract_digest=objective_contract_digest,
+            formulation=formulation, balance_contract_digest=balance_contract_digest,
         )
         auxiliary_audit = downstream_auxiliary_head_audit()
         metadata: dict[str, Any] = {
@@ -980,8 +1043,18 @@ def _write_selected_candidate(
             "objective_schema_version": objective_record["objective_schema_version"],
             "objective_policy_digest": objective_record["objective_policy_digest"],
             "objective_contract_digest": objective_contract_digest,
-            "classification_weight": config["classification_weight"],
-            "return_weight": config["return_weight"], "rv_weight": config["rv_weight"],
+            "parent_objective_contract_digest": objective_contract_digest,
+            "loss_balance_policy_digest": balance_freeze["balance_policy_digest"],
+            "balance_contract_digest": balance_contract_digest,
+            "balance_calibration_sample_digest": balance_freeze["calibration_sample_digest"],
+            "selected_loss_formulation": formulation["formulation_id"],
+            "task_weights": {
+                "classification": formulation["classification_weight"],
+                "return": formulation["return_weight"], "rv": formulation["rv_weight"],
+            },
+            "classification_weight": formulation["classification_weight"],
+            "return_weight": formulation["return_weight"], "rv_weight": formulation["rv_weight"],
+            "huber_beta": formulation["huber_beta"],
             "ret_target_scale": target_scales["ret_target_scale"],
             "rv_target_scale": target_scales["rv_target_scale"],
             "ret_target_definition": objective_contract_report["return_target"],
@@ -1027,8 +1100,16 @@ def _write_selected_candidate(
             "objective_schema_version": objective_record["objective_schema_version"],
             "objective_policy_digest": objective_record["objective_policy_digest"],
             "objective_contract_digest": objective_contract_digest,
-            "classification_weight": config["classification_weight"],
-            "return_weight": config["return_weight"], "rv_weight": config["rv_weight"],
+            "parent_objective_contract_digest": objective_contract_digest,
+            "loss_balance_policy_digest": balance_freeze["balance_policy_digest"],
+            "balance_contract_digest": balance_contract_digest,
+            "balance_calibration_sample_digest": balance_freeze["calibration_sample_digest"],
+            "selected_loss_formulation": formulation["formulation_id"],
+            "classification_weight": formulation["classification_weight"],
+            "return_weight": formulation["return_weight"], "rv_weight": formulation["rv_weight"],
+            "huber_beta": formulation["huber_beta"],
+            "balance_statistics": balance_freeze["architectures"][kind]["balance_statistics"],
+            "heterogeneous_architecture_objectives": balance_freeze["heterogeneous_architecture_objectives"],
             "ret_target_scale": target_scales["ret_target_scale"],
             "rv_target_scale": target_scales["rv_target_scale"],
             "target_scale_contract": dict(target_scales),
@@ -1174,32 +1255,50 @@ def train_candidate_experiment(
     config: Mapping[str, Any] | None = None,
     objective: str = OBJECTIVE_NAME,
     objective_report: Path | str = OBJECTIVE_REPORT,
+    balance_freeze_path: Path | str = DEFAULT_BALANCE_FREEZE,
 ) -> dict[str, Any]:
     if kind not in ALLOWED_KINDS:
         raise ModelCandidateTrainingError("ADV is retained and may not be retrained in Phase 24")
     objective_contract_report = validate_training_objective_gate(
         objective, report_path=objective_report
     )
+    try:
+        balance_freeze = validate_balance_freeze(balance_freeze_path)
+    except LossBalanceError as exc:
+        raise ModelCandidateTrainingError(str(exc)) from exc
     validate_phase24_evidence()
     policy = load_training_policy()
     numerical, environment = _safe_environment_contract()
     record_incumbent_inventory()
     started_at = utc_now()
     datasets, manifest = load_sequence_datasets(dataset)
+    try:
+        balance_freeze = validate_balance_freeze(balance_freeze_path, dataset_manifest=manifest)
+    except LossBalanceError as exc:
+        raise ModelCandidateTrainingError(str(exc)) from exc
     architecture = architecture_contract(kind)
     training_config = copy.deepcopy(DEFAULT_TRAINING_CONFIG)
     if config:
         training_config.update(dict(config))
-    policy_weights = load_objective_policy()
+    formulation = dict(balance_freeze["architectures"][kind]["selected_descriptor"])
     expected_weights = {
-        "classification_weight": policy_weights["classification"]["weight"],
-        "return_weight": policy_weights["return_regression"]["weight"],
-        "rv_weight": policy_weights["volatility_regression"]["weight"],
+        "classification_weight": formulation["classification_weight"],
+        "return_weight": formulation["return_weight"], "rv_weight": formulation["rv_weight"],
     }
-    if any(float(training_config[name]) != float(value) for name, value in expected_weights.items()):
-        raise ModelCandidateTrainingError("training task weights differ from resolved objective contract")
+    if config and any(name in config and float(config[name]) != float(value) for name, value in expected_weights.items()):
+        raise ModelCandidateTrainingError("training task weights differ from frozen balance contract")
+    training_config.update(expected_weights)
+    training_config["selected_loss_formulation"] = formulation["formulation_id"]
+    training_config["huber_beta"] = formulation["huber_beta"]
     target_scales = training_sequence_target_scales(datasets)
+    if manifest.get("target_scales") != target_scales:
+        raise ModelCandidateTrainingError("frozen training-sequence target scales mismatch")
     objective_contract_digest = str(objective_contract_report["objective_contract_digest"])
+    balance_contract_digest = str(balance_freeze["balance_contract_digest"])
+    record_validation_access(
+        dataset_digest=manifest["dataset_digest"], balance_contract_digest=balance_contract_digest,
+        balance_freeze_timestamp=balance_freeze["freeze_timestamp"],
+    )
     seed_results: list[dict[str, Any]] = []
     models: dict[int, Any] = {}
     for seed in policy["training_seeds"]:
@@ -1209,6 +1308,7 @@ def train_candidate_experiment(
             model, datasets, seed=seed, config=training_config, objective=objective,
             target_scales=target_scales,
             objective_contract_digest=objective_contract_digest,
+            formulation=formulation, balance_contract_digest=balance_contract_digest,
         )
         seed_results.append({"seed": seed, "validation": validation, "history": history})
         models[int(seed)] = model
@@ -1225,6 +1325,7 @@ def train_candidate_experiment(
         training_environment_digest=environment["manifest_digest"],
         training_code_digest=training_code_digest,
         objective_contract_digest=objective_contract_digest,
+        balance_contract_digest=balance_contract_digest,
     )
     freeze_directory = SEED_RUN_ROOT / candidate_id
     if freeze_directory.exists():
@@ -1262,7 +1363,7 @@ def train_candidate_experiment(
         started_at=started_at, candidate_root=Path(candidate_root),
         frozen_model_path=frozen_model_path, expected_candidate_id=candidate_id,
         objective=objective, objective_contract_report=objective_contract_report,
-        target_scales=target_scales,
+        target_scales=target_scales, balance_freeze=balance_freeze, formulation=formulation,
     )
     verify_incumbent_inventory()
     summary = _update_summary_and_maybe_freeze(target, manifest)
@@ -1271,6 +1372,7 @@ def train_candidate_experiment(
         "candidate_directory": target.as_posix(), "selected_seed": selected_seed,
         "internal_test_gate": gate, "selection": selection, "summary_digest": summary["summary_digest"],
         "objective_contract_digest": objective_contract_digest,
+        "balance_contract_digest": balance_contract_digest,
     }
 
 
@@ -1283,6 +1385,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="classification_only_legacy is research-only and cannot finalize a candidate",
     )
     parser.add_argument("--objective-contract", default=str(OBJECTIVE_REPORT))
+    parser.add_argument("--balance-freeze", default=str(DEFAULT_BALANCE_FREEZE))
     return parser
 
 
@@ -1292,6 +1395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = train_candidate_experiment(
             args.model, args.dataset, objective=args.objective,
             objective_report=args.objective_contract,
+            balance_freeze_path=args.balance_freeze,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result["status"] != "internal_test_failed" else 3

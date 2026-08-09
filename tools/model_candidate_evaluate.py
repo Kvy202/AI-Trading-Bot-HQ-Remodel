@@ -110,6 +110,13 @@ def _load_candidate(candidate: Path | str):
     kind = str(metadata.get("model_kind"))
     if kind not in ALLOWED_KINDS:
         raise ModelCandidateEvaluationError("unsupported candidate model kind")
+    if not metadata.get("balance_contract_digest") or metadata.get("selected_loss_formulation") not in {
+        "normalized_mse_fixed", "normalized_huber_fixed", "normalized_huber_training_balanced",
+    }:
+        raise ModelCandidateEvaluationError("candidate loss-balance contract missing")
+    identity = metadata.get("candidate_identity", {})
+    if identity.get("balance_contract_digest") != metadata.get("balance_contract_digest"):
+        raise ModelCandidateEvaluationError("candidate balance identity mismatch")
     if file_digest(root / "model.pt") != metadata.get("model_sha256"):
         raise ModelCandidateEvaluationError("candidate model digest mismatch")
     if file_digest(root / "scaler.joblib") != metadata.get("scaler_sha256"):
@@ -376,6 +383,8 @@ def evaluate_candidate_vs_incumbent(
         "incumbent_model_digest": incumbent_entry["model_sha256"],
         "candidate_model_digest": metadata["model_sha256"], "per_symbol": per_symbol,
         "candidate_objective": metadata.get("training_objective", {}).get("name"),
+        "selected_loss_formulation": metadata.get("selected_loss_formulation"),
+        "balance_contract_digest": metadata.get("balance_contract_digest"),
         "auxiliary_targets_present": False,
         "auxiliary_skill_metrics_available": False,
         "strategy_return_calculation_performed": False,

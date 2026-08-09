@@ -165,6 +165,32 @@ def normalized_rv_loss(rv_reg: Any, y_rv_reg: Any, rv_scale: float):
     return (((rv_reg - y_rv_reg) / scale) ** 2).mean()
 
 
+def normalized_huber_return_loss(
+    ret_reg: Any, y_ret_reg: Any, ret_scale: float, *, beta: float = 1.0,
+):
+    """Smooth-L1 on the normalized residual; predictions stay in raw units."""
+    _, functional = _torch_modules()
+    scale = _valid_scale(ret_scale, "ret_target_scale")
+    if not math.isfinite(float(beta)) or float(beta) <= 0:
+        raise CandidateObjectiveError("huber beta must be finite and positive")
+    residual = (ret_reg - y_ret_reg) / scale
+    return functional.smooth_l1_loss(residual, residual.new_zeros(residual.shape), beta=float(beta))
+
+
+def normalized_huber_rv_loss(
+    rv_reg: Any, y_rv_reg: Any, rv_scale: float, *, beta: float = 1.0,
+):
+    """Smooth-L1 on normalized RV residuals without clipping raw outputs."""
+    torch, functional = _torch_modules()
+    scale = _valid_scale(rv_scale, "rv_target_scale")
+    if bool(torch.any(y_rv_reg < 0).item()):
+        raise CandidateObjectiveError("rv_target_negative_count must be zero")
+    if not math.isfinite(float(beta)) or float(beta) <= 0:
+        raise CandidateObjectiveError("huber beta must be finite and positive")
+    residual = (rv_reg - y_rv_reg) / scale
+    return functional.smooth_l1_loss(residual, residual.new_zeros(residual.shape), beta=float(beta))
+
+
 def candidate_multitask_loss(
     outputs: Mapping[str, Any],
     targets: Mapping[str, Any],
@@ -193,6 +219,55 @@ def candidate_multitask_loss(
         "classification_loss": cls,
         "return_regression_loss": ret,
         "rv_regression_loss": rv,
+    }
+
+
+def resolved_candidate_loss(
+    outputs: Mapping[str, Any],
+    targets: Mapping[str, Any],
+    *,
+    ret_scale: float,
+    rv_scale: float,
+    formulation: Mapping[str, Any],
+    class_weights: Any | None = None,
+) -> dict[str, Any]:
+    """Evaluate an explicit immutable Phase 24.2 formulation descriptor."""
+    required = {
+        "formulation_id", "classification_weight", "return_weight", "rv_weight", "huber_beta",
+    }
+    if set(formulation) < required:
+        raise CandidateObjectiveError("incomplete frozen formulation descriptor")
+    formulation_id = str(formulation["formulation_id"])
+    if formulation_id not in {
+        "normalized_mse_fixed", "normalized_huber_fixed", "normalized_huber_training_balanced",
+    }:
+        raise CandidateObjectiveError("unknown loss-balance formulation")
+    weights = {
+        "classification_weight": float(formulation["classification_weight"]),
+        "return_weight": float(formulation["return_weight"]),
+        "rv_weight": float(formulation["rv_weight"]),
+    }
+    if any(not math.isfinite(value) or value < 0 for value in weights.values()):
+        raise CandidateObjectiveError("task weights must be finite and non-negative")
+    cls = classification_loss(outputs["ret_cls_logits"], targets["y_ret_cls"], class_weights)
+    if formulation_id == "normalized_mse_fixed":
+        ret = normalized_return_loss(outputs["ret_reg"], targets["y_ret_reg"], ret_scale)
+        rv = normalized_rv_loss(outputs["rv_reg"], targets["y_rv_reg"], rv_scale)
+    else:
+        beta = float(formulation["huber_beta"])
+        ret = normalized_huber_return_loss(outputs["ret_reg"], targets["y_ret_reg"], ret_scale, beta=beta)
+        rv = normalized_huber_rv_loss(outputs["rv_reg"], targets["y_rv_reg"], rv_scale, beta=beta)
+    weighted_cls = weights["classification_weight"] * cls
+    weighted_ret = weights["return_weight"] * ret
+    weighted_rv = weights["rv_weight"] * rv
+    return {
+        "total_loss": weighted_cls + weighted_ret + weighted_rv,
+        "classification_loss": cls,
+        "return_regression_loss": ret,
+        "rv_regression_loss": rv,
+        "weighted_classification_loss": weighted_cls,
+        "weighted_return_loss": weighted_ret,
+        "weighted_rv_loss": weighted_rv,
     }
 
 

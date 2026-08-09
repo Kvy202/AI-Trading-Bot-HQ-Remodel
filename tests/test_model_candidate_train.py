@@ -20,7 +20,7 @@ def _validation(auc=0.60, loss=0.5, btc=0.56, eth=0.57):
     }
 
 
-def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001, objective="3" * 64):
+def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001, objective="3" * 64, balance="4" * 64):
     manifest = {
         "dataset_digest": dataset,
         "feature_digest": "b" * 64,
@@ -34,6 +34,7 @@ def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001, objective="3" *
         numerical_lock_digest="f" * 64, training_environment_digest="1" * 64,
         training_code_digest="2" * 64,
         objective_contract_digest=objective,
+        balance_contract_digest=balance,
     )
 
 
@@ -42,7 +43,8 @@ def test_resolved_objective_optimizes_all_heads_and_legacy_mode_stays_research_o
         target_scales={"ret_target_scale": 0.01, "rv_target_scale": 0.02},
         objective_contract_digest="f" * 64,
     )
-    assert contract["formula"] == "L_cls + 0.5*L_ret + 0.5*L_rv"
+    assert contract["formula"] == "fixed_weighted_resolved_candidate_loss"
+    assert contract["selected_loss_formulation"] == "normalized_mse_fixed"
     assert contract["ret_reg_optimized"] is True
     assert contract["rv_reg_optimized"] is True
     assert contract["auxiliary_head_training_status"] == "auxiliary_heads_optimized_under_resolved_candidate_objective"
@@ -54,7 +56,7 @@ def test_resolved_objective_optimizes_all_heads_and_legacy_mode_stays_research_o
     assert legacy["candidate_finalization_allowed"] is False
     assert legacy["confirmation_health_pass_allowed"] is False
     source = inspect.getsource(train.train_classification_candidate)
-    assert "candidate_multitask_loss" in source
+    assert "resolved_candidate_loss" in source
     assert "clip_grad_norm_" in source
 
 
@@ -89,6 +91,7 @@ def test_candidate_identity_is_deterministic_and_changes_with_inputs():
     assert first[0] != _identity(dataset="9" * 64)[0]
     assert first[0] != _identity(learning_rate=0.002)[0]
     assert first[0] != _identity(objective="4" * 64)[0]
+    assert first[0] != _identity(balance="5" * 64)[0]
     assert "C:\\" not in first[1]["identity_digest"]
 
 
@@ -201,15 +204,34 @@ def test_resolved_manifest_contract_records_scales_weights_and_blockers():
         "objective_contract_digest", "objective_policy_digest", "ret_target_scale", "rv_target_scale",
         "classification_weight", "return_weight", "rv_weight", "objective_contract_blocker",
         "candidate_auxiliary_health_blocker", "downstream_contract_blocker",
+        "balance_contract_digest", "selected_loss_formulation", "balance_statistics",
     ):
         assert field in source
     assert "classification-only mode cannot finalize" in source
 
 
-def test_default_real_training_objective_is_resolved_and_fixed_weighted():
+def test_default_real_training_objective_is_resolved_and_balance_frozen():
     assert train.OBJECTIVE_NAME == "resolved_candidate_objective"
     assert train.DEFAULT_TRAINING_CONFIG["classification_weight"] == 1.0
     assert train.DEFAULT_TRAINING_CONFIG["return_weight"] == 0.5
     assert train.DEFAULT_TRAINING_CONFIG["rv_weight"] == 0.5
     signature = inspect.signature(train.train_candidate_experiment)
     assert signature.parameters["objective"].default == train.OBJECTIVE_NAME
+    assert signature.parameters["balance_freeze_path"].default == train.DEFAULT_BALANCE_FREEZE
+
+
+def test_real_training_refuses_missing_balance_freeze_before_environment_access(tmp_path):
+    with pytest.raises(train.ModelCandidateTrainingError, match="balance_freeze"):
+        train.train_candidate_experiment(
+            "lstm", tmp_path / "dataset", balance_freeze_path=tmp_path / "missing.json"
+        )
+
+
+def test_history_source_logs_weighted_and_unweighted_components():
+    source = inspect.getsource(train.train_classification_candidate)
+    for field in (
+        "classification_loss", "return_regression_loss", "rv_regression_loss",
+        "weighted_classification_loss", "weighted_return_loss", "weighted_rv_loss",
+    ):
+        assert field in source
+    assert "adapt" not in source.lower()
