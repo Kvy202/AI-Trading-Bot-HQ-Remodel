@@ -73,6 +73,12 @@ reports/model_retraining_specification.json
 reports/model_runtime_repro_*.log
 model_artifacts/candidates/
 
+# Generated Phase 24 candidate-training environments and evidence
+.venv-model-training/
+reports/model_training_datasets/
+reports/model_candidate_confirmation/
+reports/model_candidate_seed_runs/
+
 # Generated Phase 23.1 runtime-stack isolation evidence
 .venv-runtime-isolation/
 reports/runtime_stack_*/

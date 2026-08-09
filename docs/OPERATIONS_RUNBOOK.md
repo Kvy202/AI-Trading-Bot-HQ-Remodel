@@ -706,3 +706,38 @@ serving runtime remains noncanonical and migration-blocked, and live activation
 and promotion remain disallowed. A numerical delta remains material under the
 strict Phase 23 tolerances even when every direction, exclusion, allow,
 agreement, and ensemble decision is unchanged.
+# Phase 24 — versioned candidate retraining and sealed health confirmation
+
+Phase 24 is classification-health research only. It cannot place any kind of
+order, activate a candidate, change calibration, or overwrite a serving model
+or scaler. A passing confirmation gate means only that a candidate is eligible
+for a later, explicitly reviewed shadow comparison.
+
+Interpreter separation is mandatory:
+
+- Project/main Python performs public, completed-bar capture and feature/label
+  construction.
+- `.venv-model-training/canonical/Scripts/python.exe` performs scaler fitting,
+  candidate training, internal testing, comparisons, and health gates from
+  frozen NPZ/JSON evidence. It has no market-data capture path and contains no
+  exchange packages.
+
+Start with the non-mutating checks:
+
+```powershell
+python tools/model_training_environment.py --inventory-only
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File ".\tools\run_model_candidate_training.ps1" `
+  -Model lstm `
+  -DryRun
+```
+
+Do not bootstrap, capture, or train during an implementation-verification run.
+After code review, the explicit operational order is: bootstrap; capture the
+pre-Phase-22 training history; build and verify the frozen dataset/scaler; then
+for LSTM, TCN, and Transformer in that order train all three seeds, select on
+validation only, open internal test once, and run the legacy repair gate. Only
+after all three selected candidate IDs and digests are frozen may the sealed
+confirmation set be captured and evaluated once per frozen candidate. Finish
+by generating the review-only registry proposal. Never copy candidate files to
+the serving names as part of this workflow.
