@@ -27,6 +27,101 @@ def _ohlcv(rows=2000, start="2020-01-01", step="5min"):
     )
 
 
+def _ccxt_ohlcv(timestamps):
+    rows = len(timestamps)
+    return pd.DataFrame({
+        "timestamp": timestamps,
+        "open": np.arange(rows, dtype=float) + 100,
+        "high": np.arange(rows, dtype=float) + 101,
+        "low": np.arange(rows, dtype=float) + 99,
+        "close": np.arange(rows, dtype=float) + 100.5,
+        "volume": np.arange(rows, dtype=float) + 10,
+    })
+
+
+def test_ccxt_numeric_milliseconds_convert_to_2026_utc_not_1970():
+    frame = _ccxt_ohlcv([1770876300000])
+    normalized, duplicates, incomplete = ds._normalize_ohlcv(
+        frame, as_of_utc="2027-01-01T00:00:00Z"
+    )
+    assert normalized.index[0] == pd.Timestamp(1770876300000, unit="ms", tz="UTC")
+    assert normalized.index[0].year == 2026
+    assert duplicates == incomplete == 0
+
+
+def test_ccxt_five_minute_millisecond_sequence_has_300_second_deltas():
+    start_ms = 1770876300000
+    normalized, _, _ = ds._normalize_ohlcv(
+        _ccxt_ohlcv([start_ms, start_ms + 300_000, start_ms + 600_000]),
+        as_of_utc="2027-01-01T00:00:00Z",
+    )
+    assert (np.diff(normalized.index.asi8) / 1_000_000_000).tolist() == [300.0, 300.0]
+    assert ds._gap_statistics(normalized.index) == (0, 300.0)
+
+
+@pytest.mark.parametrize("timestamp", [
+    "2026-02-12T05:05:00Z",
+    "2026-02-12T10:35:00+05:30",
+])
+def test_iso_and_timezone_aware_timestamp_input_remains_utc_normalized(timestamp):
+    normalized, _, _ = ds._normalize_ohlcv(
+        _ccxt_ohlcv([timestamp]), as_of_utc="2027-01-01T00:00:00Z"
+    )
+    assert normalized.index[0] == pd.Timestamp("2026-02-12T05:05:00Z")
+
+
+@pytest.mark.parametrize("timestamp,match", [
+    (np.inf, "finite"),
+    (np.nan, "finite"),
+    ("definitely-not-a-timestamp", "converted cleanly"),
+])
+def test_nonfinite_or_malformed_timestamps_fail_closed(timestamp, match):
+    with pytest.raises(ds.ModelTrainingDatasetError, match=match):
+        ds._normalize_ohlcv(
+            _ccxt_ohlcv([timestamp]), as_of_utc="2027-01-01T00:00:00Z"
+        )
+
+
+def test_numeric_1970_and_requested_range_mismatch_fail_closed():
+    with pytest.raises(ds.ModelTrainingDatasetError, match="plausible"):
+        ds._normalize_ohlcv(_ccxt_ohlcv([0]), as_of_utc="2026-08-09T00:00:00Z")
+    with pytest.raises(ds.ModelTrainingDatasetError, match="requested capture range"):
+        ds._normalize_ohlcv(
+            _ccxt_ohlcv([1770876300000]), as_of_utc="2027-01-01T00:00:00Z",
+            requested_start_utc="2026-03-01T00:00:00Z",
+            requested_end_exclusive_utc="2026-04-01T00:00:00Z",
+        )
+
+
+def test_sub_timeframe_spacing_for_distinct_5m_bars_fails():
+    start_ms = 1770876300000
+    with pytest.raises(ds.ModelTrainingDatasetError, match="sub-timeframe"):
+        ds._normalize_ohlcv(
+            _ccxt_ohlcv([start_ms, start_ms + 1]),
+            as_of_utc="2027-01-01T00:00:00Z",
+        )
+
+
+def test_numeric_identical_duplicates_deduplicate_and_conflicts_still_fail():
+    start_ms = 1770876300000
+    frame = pd.concat([_ccxt_ohlcv([start_ms])] * 2, ignore_index=True)
+    normalized, duplicates, _ = ds._normalize_ohlcv(frame, as_of_utc="2027-01-01T00:00:00Z")
+    assert len(normalized) == 1 and duplicates == 1
+    conflict = frame.copy()
+    conflict.loc[1, "close"] += 1
+    with pytest.raises(ds.ModelTrainingDatasetError, match="conflicting same-timestamp"):
+        ds._normalize_ohlcv(conflict, as_of_utc="2027-01-01T00:00:00Z")
+
+
+def test_numeric_incomplete_current_candle_logic_is_preserved():
+    start = pd.Timestamp("2026-02-12T05:00:00Z")
+    timestamps = [(start + pd.Timedelta(minutes=5 * index)).value // 1_000_000 for index in range(3)]
+    normalized, _, incomplete = ds._normalize_ohlcv(
+        _ccxt_ohlcv(timestamps), as_of_utc=start + pd.Timedelta(minutes=14)
+    )
+    assert len(normalized) == 2 and incomplete == 1
+
+
 def test_incomplete_bars_are_excluded_and_exact_duplicates_deduplicate():
     frame = _ohlcv(4)
     duplicated = pd.concat([frame, frame.iloc[[1]]]).sort_index()
@@ -45,6 +140,128 @@ def test_conflicting_same_timestamp_ohlcv_fails_closed():
     conflict["close"] += 1
     with pytest.raises(ds.ModelTrainingDatasetError, match="conflicting same-timestamp"):
         ds._normalize_ohlcv(pd.concat([frame, conflict]), as_of_utc="2030-01-01Z")
+
+
+def test_bitget_public_history_pagination_uses_200_bar_chunks_without_skips():
+    start = pd.Timestamp("2026-01-01T00:00:00Z")
+    start_ms = start.value // 1_000_000
+    end = start + pd.Timedelta(minutes=5 * 450)
+
+    class FakeExchange:
+        rateLimit = 250
+        def __init__(self):
+            self.calls = []
+        def fetch_ohlcv(self, symbol, *, timeframe, since, limit, params):
+            self.calls.append({"since": since, "limit": limit, "params": params})
+            return [
+                [since + index * 300_000, 1.0, 2.0, 0.5, 1.5, 10.0]
+                for index in range(limit)
+            ]
+
+    exchange = FakeExchange()
+    frame = ds._fetch_ccxt_ohlcv_range(
+        exchange, "BTC/USDT:USDT", timeframe="5m", start_utc=ds.canonical_utc(start),
+        end_utc=ds.canonical_utc(end), limit=450, params={"productType": "USDT-FUTURES"},
+        per_page=ds.BITGET_HISTORY_PAGE_LIMIT, force_history_endpoint=True,
+        sleep_fn=lambda _: None,
+    )
+    assert len(frame) == 450
+    assert all(call["limit"] == 200 for call in exchange.calls)
+    assert all(call["params"]["useHistoryEndpoint"] is True for call in exchange.calls)
+    assert [call["since"] for call in exchange.calls] == [
+        start_ms, start_ms + 200 * 300_000, start_ms + 400 * 300_000,
+    ]
+    diagnostics = frame.attrs["capture_diagnostics"]
+    assert diagnostics["pages_requested"] == diagnostics["pages_returned"] == 3
+    assert diagnostics["pagination_stop_reason"] == "requested_end_reached"
+    normalized, _, _ = ds._normalize_ohlcv(
+        frame, as_of_utc="2027-01-01T00:00:00Z",
+        requested_start_utc=start, requested_end_exclusive_utc=end,
+    )
+    assert set(np.diff(normalized.index.asi8) / 1_000_000_000) == {300.0}
+
+
+def _patch_capture_contract(monkeypatch, target):
+    policy = ds.load_training_policy().copy()
+    policy["target_raw_bars_per_symbol"] = target
+    monkeypatch.setattr(ds, "load_training_policy", lambda: policy)
+    monkeypatch.setattr(ds, "validate_phase24_evidence", lambda: {})
+    monkeypatch.setattr(ds, "record_incumbent_inventory", lambda: {})
+    monkeypatch.setattr(ds, "verify_incumbent_inventory", lambda: {})
+    monkeypatch.setattr(ds, "specification_contract", lambda: {"label_contract": {"max_hold": 60}})
+    monkeypatch.setattr(ds, "maximum_training_timestamps", lambda **kwargs: {
+        "earliest_source_bar_open_utc": "2026-02-02T00:00:00Z",
+        "final_source_bar_open_utc": "2026-02-03T00:00:00Z",
+        "maximum_training_raw_bar_open_utc": "2026-02-01T23:55:00Z",
+        "maximum_training_labeled_endpoint_utc": "2026-02-01T18:55:00Z",
+    })
+    monkeypatch.setattr(
+        ds, "verify_raw_capture",
+        lambda root: json.loads((Path(root) / "raw_manifest.json").read_text(encoding="utf-8")),
+    )
+
+
+def test_capture_manifest_records_public_pagination_coverage_diagnostics(monkeypatch, tmp_path):
+    _patch_capture_contract(monkeypatch, 4)
+
+    def fetcher(symbol, **kwargs):
+        end = pd.Timestamp(kwargs["end_utc"])
+        timestamps = [(end - pd.Timedelta(minutes=5 * offset)).value // 1_000_000 for offset in (4, 3, 2, 1)]
+        frame = _ccxt_ohlcv(timestamps)
+        frame.attrs["capture_diagnostics"] = {
+            "pages_requested": 2, "pages_returned": 2,
+            "first_exchange_timestamp": ds.canonical_utc(end - pd.Timedelta(minutes=20)),
+            "last_exchange_timestamp": ds.canonical_utc(end - pd.Timedelta(minutes=5)),
+            "requested_start": kwargs["start_utc"], "requested_end": kwargs["end_utc"],
+            "rows_before_normalization": 4, "rows_after_normalization": None,
+            "pagination_stop_reason": "requested_end_reached",
+        }
+        return frame
+
+    manifest = ds.capture_training_data(
+        dataset_id="synthetic_capture", target_bars=4, fetcher=fetcher,
+        dataset_root=tmp_path, as_of_utc="2026-02-03T00:00:00Z",
+    )
+    for info in manifest["per_symbol"].values():
+        assert info["pages_requested"] == info["pages_returned"] == 2
+        assert info["rows_before_normalization"] == info["rows_after_normalization"] == 4
+        assert info["pagination_stop_reason"] == "requested_end_reached"
+        assert info["first_exchange_timestamp"].startswith("2026-")
+
+
+def test_incomplete_public_range_reports_specific_status_without_weakening_target(monkeypatch, tmp_path):
+    _patch_capture_contract(monkeypatch, 5)
+
+    def fetcher(symbol, **kwargs):
+        end = pd.Timestamp(kwargs["end_utc"])
+        return _ccxt_ohlcv([
+            (end - pd.Timedelta(minutes=10)).value // 1_000_000,
+            (end - pd.Timedelta(minutes=5)).value // 1_000_000,
+        ])
+
+    with pytest.raises(ds.ModelTrainingDatasetError, match="historical_capture_range_incomplete"):
+        ds.capture_training_data(
+            dataset_id="short_capture", target_bars=5, fetcher=fetcher,
+            dataset_root=tmp_path, as_of_utc="2026-02-03T00:00:00Z",
+        )
+    manifest = json.loads((tmp_path / "short_capture/raw_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["capture_status"] == "historical_capture_range_incomplete"
+    assert manifest["target_raw_bars_per_symbol"] == 5
+
+
+def test_timestamp_corrupted_partial_dataset_requires_manual_recapture():
+    manifest = {
+        "capture_status": "insufficient_training_data",
+        "per_symbol": {"BTCUSDT": {
+            "requested_start_utc": "2026-02-09T11:25:00Z",
+            "requested_end_exclusive_utc": "2026-08-02T22:55:00Z",
+            "actual_first_utc": "1970-01-01T00:29:30.876300Z",
+            "actual_last_utc": "1970-01-01T00:29:45.711000Z",
+            "rows": 15043, "maximum_gap_seconds": 0.2403,
+        }},
+    }
+    with pytest.raises(ds.ModelTrainingDatasetError, match="delete_and_recapture"):
+        ds._validate_partial_capture_manifest(manifest)
 
 
 def test_deterministic_raw_and_npz_digests(tmp_path):

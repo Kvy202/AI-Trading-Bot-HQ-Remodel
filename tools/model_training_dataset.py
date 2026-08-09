@@ -51,6 +51,8 @@ CONFIRMATION_ROOT = BASE_DIR / "reports" / "model_candidate_confirmation"
 SELECTION_FREEZE = BASE_DIR / "reports" / "model_candidate_selection_freeze.json"
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 SPLIT_NAMES = {0: "train", 1: "validation", 2: "internal_test", -1: "purged"}
+PUBLIC_MARKET_HISTORY_START_UTC = "2009-01-03T00:00:00Z"
+BITGET_HISTORY_PAGE_LIMIT = 200
 
 
 class ModelTrainingDatasetError(ValueError):
@@ -135,16 +137,45 @@ def maximum_training_timestamps(
     }
 
 
-def _normalize_ohlcv(frame: Any, *, as_of_utc: Any, timeframe: str = "5m") -> tuple[Any, int, int]:
+def _parse_ohlcv_timestamps(values: Any) -> Any:
+    """Parse CCXT numerics as Unix milliseconds and textual values as dates."""
+    import pandas as pd
+    series = pd.Series(values, copy=False)
+    try:
+        if pd.api.types.is_numeric_dtype(series.dtype):
+            numeric = pd.to_numeric(series, errors="raise")
+            if not np.isfinite(numeric.to_numpy(dtype=np.float64)).all():
+                raise ModelTrainingDatasetError("numeric OHLCV timestamps must be finite")
+            parsed = pd.to_datetime(numeric, unit="ms", utc=True, errors="raise")
+        else:
+            parsed = pd.to_datetime(series, utc=True, errors="raise")
+    except ModelTrainingDatasetError:
+        raise
+    except Exception as exc:
+        raise ModelTrainingDatasetError("OHLCV timestamps cannot be converted cleanly") from exc
+    if parsed.isna().any():
+        raise ModelTrainingDatasetError("OHLCV timestamps cannot be converted cleanly")
+    return pd.DatetimeIndex(parsed)
+
+
+def _normalize_ohlcv(
+    frame: Any,
+    *,
+    as_of_utc: Any,
+    timeframe: str = "5m",
+    requested_start_utc: Any | None = None,
+    requested_end_exclusive_utc: Any | None = None,
+) -> tuple[Any, int, int]:
     import pandas as pd
     value = frame.copy()
     if "timestamp" in value.columns:
-        value["timestamp"] = pd.to_datetime(value["timestamp"], utc=True)
+        value["timestamp"] = _parse_ohlcv_timestamps(value["timestamp"])
         value = value.set_index("timestamp")
     elif "bar_open_utc" in value.columns:
-        value["bar_open_utc"] = pd.to_datetime(value["bar_open_utc"], utc=True)
+        value["bar_open_utc"] = _parse_ohlcv_timestamps(value["bar_open_utc"])
         value = value.set_index("bar_open_utc")
-    value.index = pd.to_datetime(value.index, utc=True)
+    else:
+        value.index = _parse_ohlcv_timestamps(value.index)
     missing = [name for name in OHLCV_COLUMNS if name not in value.columns]
     if missing:
         raise ModelTrainingDatasetError(f"OHLCV missing columns: {missing}")
@@ -167,6 +198,25 @@ def _normalize_ohlcv(frame: Any, *, as_of_utc: Any, timeframe: str = "5m") -> tu
         as_of = as_of.tz_localize("UTC")
     else:
         as_of = as_of.tz_convert("UTC")
+    plausible_start = pd.Timestamp(PUBLIC_MARKET_HISTORY_START_UTC)
+    plausible_end = as_of + pd.Timedelta(seconds=seconds)
+    if len(value) and (value.index.min() < plausible_start or value.index.max() > plausible_end):
+        raise ModelTrainingDatasetError("OHLCV timestamps outside plausible public market-history range")
+    if (requested_start_utc is None) != (requested_end_exclusive_utc is None):
+        raise ModelTrainingDatasetError("both requested OHLCV range bounds are required")
+    if requested_start_utc is not None:
+        requested_start = pd.Timestamp(requested_start_utc)
+        requested_end = pd.Timestamp(requested_end_exclusive_utc)
+        requested_start = requested_start.tz_localize("UTC") if requested_start.tzinfo is None else requested_start.tz_convert("UTC")
+        requested_end = requested_end.tz_localize("UTC") if requested_end.tzinfo is None else requested_end.tz_convert("UTC")
+        if requested_start >= requested_end:
+            raise ModelTrainingDatasetError("requested OHLCV range is invalid")
+        if len(value) and (value.index.min() < requested_start or value.index.max() >= requested_end):
+            raise ModelTrainingDatasetError("normalized OHLCV timestamps outside requested capture range")
+    if len(value) > 1:
+        deltas = np.diff(value.index.asi8) / 1_000_000_000
+        if not np.isfinite(deltas).all() or np.any(deltas < seconds):
+            raise ModelTrainingDatasetError("invalid sub-timeframe spacing for distinct 5m OHLCV bars")
     complete = value.index + pd.Timedelta(seconds=seconds) <= as_of
     incomplete = int((~complete).sum())
     return value.loc[complete].copy(), int(duplicates), incomplete
@@ -203,6 +253,8 @@ def _gap_statistics(index: Any, timeframe_seconds: int = 300) -> tuple[int, floa
     if len(index) < 2:
         return 0, 0.0
     deltas = np.diff(index.asi8) / 1_000_000_000
+    if not np.isfinite(deltas).all() or np.any(deltas < timeframe_seconds):
+        raise ModelTrainingDatasetError("invalid sub-timeframe spacing for distinct 5m OHLCV bars")
     missing = int(sum(max(0, round(value / timeframe_seconds) - 1) for value in deltas))
     return missing, float(np.max(deltas))
 
@@ -213,42 +265,150 @@ def _dataset_id(venue: str, cutoff: str, target: int) -> str:
     return f"phase24_5m_{json_digest(contract)[:12]}"
 
 
+def _ccxt_timestamp_ms(value: Any) -> int:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ModelTrainingDatasetError("CCXT OHLCV timestamp is not numeric milliseconds") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ModelTrainingDatasetError("CCXT OHLCV timestamp is not finite integer milliseconds")
+    return int(numeric)
+
+
+def _fetch_ccxt_ohlcv_range(
+    exchange: Any,
+    market_symbol: str,
+    *,
+    timeframe: str,
+    start_utc: str,
+    end_utc: str,
+    limit: int,
+    params: Mapping[str, Any],
+    per_page: int,
+    force_history_endpoint: bool,
+    sleep_fn: Callable[[float], Any] = time.sleep,
+) -> Any:
+    """Deterministically page an explicitly bounded public CCXT OHLCV range."""
+    import pandas as pd
+    if timeframe != "5m" or per_page <= 0 or limit <= 0:
+        raise ModelTrainingDatasetError("invalid public OHLCV pagination contract")
+    start_ms = int(pd.Timestamp(start_utc).timestamp() * 1000)
+    end_ms = int(pd.Timestamp(end_utc).timestamp() * 1000)
+    if start_ms >= end_ms:
+        raise ModelTrainingDatasetError("invalid public OHLCV requested range")
+    interval_ms = 300_000
+    request_params = dict(params)
+    if force_history_endpoint:
+        request_params["useHistoryEndpoint"] = True
+    rows: list[list[float]] = []
+    cursor = start_ms
+    last_newest: int | None = None
+    pages_requested = 0
+    pages_returned = 0
+    exchange_timestamps: list[int] = []
+    stop_reason = "pagination_loop_complete"
+    while cursor < end_ms and len(rows) < limit:
+        pages_requested += 1
+        page = exchange.fetch_ohlcv(
+            market_symbol, timeframe=timeframe, since=cursor, limit=per_page,
+            params=dict(request_params),
+        )
+        if not page:
+            stop_reason = "empty_page"
+            break
+        pages_returned += 1
+        page_timestamps = [_ccxt_timestamp_ms(row[0]) for row in page]
+        exchange_timestamps.extend(page_timestamps)
+        rows.extend(
+            row for row, timestamp in zip(page, page_timestamps)
+            if start_ms <= timestamp < end_ms
+        )
+        newest = max(page_timestamps)
+        if last_newest is not None and newest <= last_newest:
+            stop_reason = "no_forward_progress"
+            break
+        last_newest = newest
+        cursor = newest + interval_ms
+        if cursor >= end_ms:
+            stop_reason = "requested_end_reached"
+            break
+        if len(rows) >= limit:
+            stop_reason = "row_limit_reached"
+            break
+        sleep_fn((getattr(exchange, "rateLimit", None) or 250) / 1000.0)
+    frame = pd.DataFrame(rows[:limit], columns=("timestamp", *OHLCV_COLUMNS))
+    first_exchange = min(exchange_timestamps) if exchange_timestamps else None
+    last_exchange = max(exchange_timestamps) if exchange_timestamps else None
+    frame.attrs["capture_diagnostics"] = {
+        "pages_requested": pages_requested,
+        "pages_returned": pages_returned,
+        "first_exchange_timestamp": (
+            canonical_utc(pd.Timestamp(first_exchange, unit="ms", tz="UTC"))
+            if first_exchange is not None else None
+        ),
+        "last_exchange_timestamp": (
+            canonical_utc(pd.Timestamp(last_exchange, unit="ms", tz="UTC"))
+            if last_exchange is not None else None
+        ),
+        "requested_start": canonical_utc(start_utc),
+        "requested_end": canonical_utc(end_utc),
+        "rows_before_normalization": int(len(frame)),
+        "rows_after_normalization": None,
+        "pagination_stop_reason": stop_reason,
+        "public_endpoint": "ccxt_fetch_ohlcv_history" if force_history_endpoint else "ccxt_fetch_ohlcv",
+        "page_limit": int(per_page),
+    }
+    return frame
+
+
 def _public_fetch_range(
     symbol: str, *, timeframe: str, start_utc: str, end_utc: str, limit: int, venue: str
 ) -> Any:
     """Public-only paginated CCXT read; no keys, accounts, or order adapter."""
-    import pandas as pd
     from data import _close_exchange, _ensure_markets, _market_params, _resolve_market_symbol, get_exchange
     exchange = get_exchange(exchange_id=venue, kind="swap")
     try:
         _ensure_markets(exchange, "swap")
         market_symbol = _resolve_market_symbol(exchange, symbol, "swap")
         params = _market_params(exchange, "swap")
-        start_ms = int(pd.Timestamp(start_utc).timestamp() * 1000)
-        end_ms = int(pd.Timestamp(end_utc).timestamp() * 1000)
-        interval_ms = 300_000
-        per_page = 1000
-        rows: list[list[float]] = []
-        cursor = start_ms
-        last = None
-        while cursor < end_ms and len(rows) < limit + per_page:
-            page = exchange.fetch_ohlcv(
-                market_symbol, timeframe=timeframe, since=cursor, limit=per_page, params=params
-            )
-            if not page:
-                break
-            rows.extend(row for row in page if start_ms <= int(row[0]) < end_ms)
-            newest = int(page[-1][0])
-            if last is not None and newest <= last:
-                break
-            last = newest
-            cursor = newest + interval_ms
-            if cursor >= end_ms:
-                break
-            time.sleep((getattr(exchange, "rateLimit", None) or 250) / 1000.0)
-        return pd.DataFrame(rows, columns=("timestamp", *OHLCV_COLUMNS))
+        is_bitget = str(venue).lower() == "bitget"
+        return _fetch_ccxt_ohlcv_range(
+            exchange, market_symbol, timeframe=timeframe, start_utc=start_utc,
+            end_utc=end_utc, limit=limit, params=params,
+            # CCXT documents Bitget's public history endpoint at 200 candles.
+            # Asking it for 1000 causes its end-time calculation to jump ahead
+            # before it clamps the returned page, leaving 800-bar holes.
+            per_page=BITGET_HISTORY_PAGE_LIMIT if is_bitget else 1000,
+            force_history_endpoint=is_bitget,
+        )
     finally:
         _close_exchange(exchange)
+
+
+def _validate_partial_capture_manifest(manifest: Mapping[str, Any]) -> None:
+    """Refuse in-place reuse of timestamp-corrupted partial capture evidence."""
+    import pandas as pd
+    if manifest.get("capture_status") == "complete":
+        return
+    for info in manifest.get("per_symbol", {}).values():
+        first, last = info.get("actual_first_utc"), info.get("actual_last_utc")
+        requested_start = info.get("requested_start_utc") or info.get("requested_start")
+        requested_end = info.get("requested_end_exclusive_utc") or info.get("requested_end")
+        if not all((first, last, requested_start, requested_end)):
+            continue
+        try:
+            rows = int(info.get("rows", info.get("completed_rows", 0)))
+            valid = (
+                pd.Timestamp(first) >= pd.Timestamp(requested_start)
+                and pd.Timestamp(last) < pd.Timestamp(requested_end)
+                and (rows < 2 or float(info.get("maximum_gap_seconds", 300.0)) >= 300.0)
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            raise ModelTrainingDatasetError(
+                "invalid_partial_dataset_requires_delete_and_recapture"
+            )
 
 
 def capture_training_data(
@@ -275,6 +435,7 @@ def capture_training_data(
                 raise ModelTrainingDatasetError(f"capture resume contract changed: {name}")
         if previous.get("capture_status") == "complete":
             return verify_raw_capture(directory)
+        _validate_partial_capture_manifest(previous)
     directory.mkdir(parents=True, exist_ok=True)
     record_incumbent_inventory()
     import pandas as pd
@@ -287,6 +448,11 @@ def capture_training_data(
     for symbol in policy["required_symbols"]:
         raw_path = directory / f"raw_{symbol}.csv"
         existing = _read_raw_csv(raw_path) if raw_path.is_file() else None
+        if existing is not None:
+            existing, _, _ = _normalize_ohlcv(
+                existing, as_of_utc=as_of, requested_start_utc=canonical_utc(start),
+                requested_end_exclusive_utc=canonical_utc(end_exclusive),
+            )
         try:
             incoming = fetch(
                 symbol, timeframe="5m", start_utc=canonical_utc(start),
@@ -294,7 +460,30 @@ def capture_training_data(
             )
         except TypeError:
             incoming = fetch(symbol, "5m", target + 250)
-        normalized, duplicates, incomplete = _normalize_ohlcv(incoming, as_of_utc=as_of)
+        diagnostics = dict(getattr(incoming, "attrs", {}).get("capture_diagnostics", {}))
+        rows_before_normalization = int(len(incoming))
+        normalized, duplicates, incomplete = _normalize_ohlcv(
+            incoming, as_of_utc=as_of, requested_start_utc=canonical_utc(start),
+            requested_end_exclusive_utc=canonical_utc(end_exclusive),
+        )
+        diagnostics.setdefault("pages_requested", 1)
+        diagnostics.setdefault("pages_returned", 1 if rows_before_normalization else 0)
+        diagnostics.setdefault("requested_start", canonical_utc(start))
+        diagnostics.setdefault("requested_end", canonical_utc(end_exclusive))
+        diagnostics.setdefault("rows_before_normalization", rows_before_normalization)
+        diagnostics["rows_after_normalization"] = int(len(normalized))
+        diagnostics.setdefault(
+            "pagination_stop_reason",
+            "injected_fetcher_complete" if fetcher is not None else "unknown",
+        )
+        diagnostics.setdefault(
+            "first_exchange_timestamp",
+            canonical_utc(normalized.index.min()) if len(normalized) else None,
+        )
+        diagnostics.setdefault(
+            "last_exchange_timestamp",
+            canonical_utc(normalized.index.max()) if len(normalized) else None,
+        )
         combined, merge_duplicates = _merge_ohlcv(existing, normalized)
         combined = combined[combined.index < end_exclusive].tail(target)
         duplicates_total += duplicates + merge_duplicates
@@ -308,12 +497,21 @@ def capture_training_data(
             "rows": int(len(combined)), "completed_rows": int(len(combined)),
             "incomplete_rows_dropped": int(incomplete), "duplicate_rows": int(duplicates + merge_duplicates),
             "conflicting_rows": 0, "missing_intervals": missing, "maximum_gap_seconds": max_gap,
+            "pages_requested": diagnostics["pages_requested"],
+            "pages_returned": diagnostics["pages_returned"],
+            "first_exchange_timestamp": diagnostics["first_exchange_timestamp"],
+            "last_exchange_timestamp": diagnostics["last_exchange_timestamp"],
+            "requested_start": diagnostics["requested_start"],
+            "requested_end": diagnostics["requested_end"],
+            "rows_before_normalization": diagnostics["rows_before_normalization"],
+            "rows_after_normalization": diagnostics["rows_after_normalization"],
+            "pagination_stop_reason": diagnostics["pagination_stop_reason"],
             "file_sha256": file_digest(raw_path),
         }
     complete = all(value["completed_rows"] >= target for value in per_symbol.values())
     manifest: dict[str, Any] = {
         "schema_version": 1, "dataset_id": data_id,
-        "capture_status": "complete" if complete else "insufficient_training_data",
+        "capture_status": "complete" if complete else "historical_capture_range_incomplete",
         "captured_at": utc_now(), "capture_as_of_utc": as_of,
         "public_market_data_only": True, "source_venue": venue, "market_type": "swap",
         "market_symbols": list(policy["required_symbols"]), "timeframe": "5m",
@@ -328,7 +526,7 @@ def capture_training_data(
     atomic_write_json(manifest_path, manifest)
     verify_incumbent_inventory()
     if not complete:
-        raise ModelTrainingDatasetError("insufficient_training_data")
+        raise ModelTrainingDatasetError("historical_capture_range_incomplete")
     return verify_raw_capture(directory)
 
 
@@ -336,7 +534,8 @@ def verify_raw_capture(directory: Path | str) -> dict[str, Any]:
     root = Path(directory)
     manifest = json.loads((root / "raw_manifest.json").read_text(encoding="utf-8-sig"))
     if manifest.get("capture_status") != "complete":
-        raise ModelTrainingDatasetError("insufficient_training_data")
+        status = str(manifest.get("capture_status") or "insufficient_training_data")
+        raise ModelTrainingDatasetError(status)
     calculated_manifest = json_digest({k: v for k, v in manifest.items() if k not in {"captured_at", "manifest_digest"}})
     if manifest.get("manifest_digest") != calculated_manifest:
         raise ModelTrainingDatasetError("raw manifest digest mismatch")
@@ -348,8 +547,12 @@ def verify_raw_capture(directory: Path | str) -> dict[str, Any]:
         path = root / f"raw_{symbol}.csv"
         if file_digest(path) != manifest["per_symbol"][symbol]["file_sha256"]:
             raise ModelTrainingDatasetError(f"raw file digest mismatch: {symbol}")
-        frame, duplicates, _ = _normalize_ohlcv(_read_raw_csv(path), as_of_utc=utc_now())
         info = manifest["per_symbol"][symbol]
+        frame, duplicates, _ = _normalize_ohlcv(
+            _read_raw_csv(path), as_of_utc=utc_now(),
+            requested_start_utc=info["requested_start_utc"],
+            requested_end_exclusive_utc=info["requested_end_exclusive_utc"],
+        )
         if (duplicates or frame.index.max() >= phase22_first
                 or len(frame) != int(info["completed_rows"])
                 or len(frame) < int(manifest["target_raw_bars_per_symbol"])):
