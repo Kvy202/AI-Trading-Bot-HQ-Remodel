@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from pathlib import Path
 
@@ -243,6 +244,33 @@ def test_validate_freeze_rejects_dataset_and_expected_digest_mismatch(tmp_path):
         balance.validate_balance_freeze(path, dataset_manifest=manifest)
     with pytest.raises(balance.LossBalanceError, match="unexpected"):
         balance.validate_balance_freeze(path, expected_balance_digest="0" * 64)
+
+
+def test_balance_gate_accepts_exact_target_scale_digest_and_rejects_real_mismatch(tmp_path):
+    report = _safe_report()
+    path = tmp_path / "freeze.json"
+    frozen = balance.freeze_balance_contract(report, path)
+    manifest = {
+        "dataset_digest": report["dataset"]["dataset_digest"],
+        "split_digest": report["dataset"]["split_digest"],
+        "scaler": {"sha256": report["dataset"]["scaler_digest"]},
+        "target_scales": {
+            "target_scale_digest": report["dataset"]["target_scales"]["target_scale_digest"]
+        },
+    }
+    assert balance.validate_balance_freeze(path, dataset_manifest=manifest) == frozen
+
+    manifest["target_scales"]["target_scale_digest"] = "u" * 64
+    with pytest.raises(balance.LossBalanceError, match="target-scale digest mismatch"):
+        balance.validate_balance_freeze(path, dataset_manifest=manifest)
+
+
+def test_real_calibration_target_scale_gate_is_exact_without_tolerance_bypass():
+    source = inspect.getsource(balance.run_real_calibration)
+    assert 'frozen.get("target_scale_digest") != scales["target_scale_digest"]' in source
+    assert "isclose" not in source
+    assert "allclose" not in source
+    assert "tolerance" not in source.lower()
 
 
 def test_real_calibration_source_has_no_nontraining_fallback_or_auc_selection():

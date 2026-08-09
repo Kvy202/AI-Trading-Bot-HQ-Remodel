@@ -198,6 +198,135 @@ def test_target_scales_use_valid_training_sequence_endpoints_only():
     assert first["training_sequence_count_by_symbol"] == {"BTCUSDT": 7, "ETHUSDT": 7}
 
 
+def _precision_scale_datasets():
+    features = np.arange(16 * 27, dtype=np.float32).reshape(16, 27)
+    split = np.asarray([0] * 6 + [-1] + [1] * 4 + [-1] + [2] * 4, dtype=np.int8)
+    datasets = {}
+    for symbol, shift in (("BTCUSDT", 0.0), ("ETHUSDT", 0.0314159265358979)):
+        ret_reg = np.asarray([
+            -9.1234567890123, -8.2345678901234,
+            123456.789012345 + shift, 123456.799012346 + shift,
+            123456.819012347 + shift, 123456.849012348 + shift,
+            -7.3456789012345,
+            10.1111111111111, 10.2222222222222, 10.3333333333333, 10.4444444444444,
+            -6.4567890123456,
+            20.1111111111111, 20.2222222222222, 20.3333333333333, 20.4444444444444,
+        ], dtype=np.float64)
+        rv_reg = np.asarray([
+            9.1234567890123, 8.2345678901234,
+            1.234567890123 + shift, 1.234577890124 + shift,
+            1.234607890125 + shift, 1.234697890126 + shift,
+            7.3456789012345,
+            2.1111111111111, 2.2222222222222, 2.3333333333333, 2.4444444444444,
+            6.4567890123456,
+            3.1111111111111, 3.2222222222222, 3.3333333333333, 3.4444444444444,
+        ], dtype=np.float64)
+        labels = {
+            "ret_cls": np.arange(16, dtype=np.int64) % 2,
+            "ret_reg": ret_reg,
+            "rv_reg": rv_reg,
+        }
+        datasets[symbol] = {
+            name: train.FrozenSequenceDataset(features, labels, split, code, 3, symbol)
+            for name, code in (("train", 0), ("validation", 1), ("internal_test", 2))
+        }
+    return datasets
+
+
+def _build_dataset_style_target_scales(datasets):
+    ret_targets = []
+    rv_targets = []
+    counts = {}
+    for symbol in sorted(datasets):
+        dataset = datasets[symbol]["train"]
+        ret_targets.extend(np.asarray(dataset.labels["ret_reg"])[dataset.endpoints].tolist())
+        rv_targets.extend(np.asarray(dataset.labels["rv_reg"])[dataset.endpoints].tolist())
+        counts[symbol] = len(dataset.endpoints)
+    scales = train.compute_training_target_scales(ret_targets, rv_targets)
+    scales.update({
+        "training_sequence_count_by_symbol": counts,
+        "validation_targets_consulted": False,
+        "internal_test_targets_consulted": False,
+        "legacy_repair_targets_consulted": False,
+        "confirmation_targets_consulted": False,
+    })
+    scales["target_scale_digest"] = train.json_digest({
+        key: value for key, value in scales.items() if key != "target_scale_digest"
+    })
+    return scales
+
+
+def test_float64_evidence_differs_from_float32_training_tensor_statistics():
+    datasets = _precision_scale_datasets()
+    ret64 = []
+    rv64 = []
+    for symbol in sorted(datasets):
+        dataset = datasets[symbol]["train"]
+        ret64.extend(np.asarray(dataset.labels["ret_reg"], dtype=np.float64)[dataset.endpoints])
+        rv64.extend(np.asarray(dataset.labels["rv_reg"], dtype=np.float64)[dataset.endpoints])
+    float64_scales = train.compute_training_target_scales(ret64, rv64)
+    float32_scales = train.compute_training_target_scales(
+        np.asarray(ret64, dtype=np.float32), np.asarray(rv64, dtype=np.float32)
+    )
+    assert abs(float64_scales["ret_target_scale"] - float32_scales["ret_target_scale"]) > 1e-6
+    assert abs(float64_scales["rv_target_scale"] - float32_scales["rv_target_scale"]) > 1e-10
+    assert float64_scales["target_scale_digest"] != float32_scales["target_scale_digest"]
+
+
+def test_training_tensors_remain_float32_while_scale_evidence_bypasses_getitem(monkeypatch):
+    datasets = _precision_scale_datasets()
+    row = datasets["BTCUSDT"]["train"][0]
+    torch = train._torch()
+    assert row["y_ret_reg"].dtype == torch.float32
+    assert row["y_rv_reg"].dtype == torch.float32
+
+    def rounded_training_rows_must_not_supply_evidence(self, index):
+        raise AssertionError("target-scale evidence must not pass through __getitem__")
+
+    monkeypatch.setattr(
+        train.FrozenSequenceDataset, "__getitem__", rounded_training_rows_must_not_supply_evidence
+    )
+    assert train.training_sequence_target_scales(datasets) == _build_dataset_style_target_scales(datasets)
+
+
+def test_float64_target_scales_and_digest_match_build_dataset_calculation_exactly():
+    datasets = _precision_scale_datasets()
+    expected = _build_dataset_style_target_scales(datasets)
+    observed = train.training_sequence_target_scales(datasets)
+    assert observed["ret_target_scale"] == expected["ret_target_scale"]
+    assert observed["rv_target_scale"] == expected["rv_target_scale"]
+    assert observed["target_scale_digest"] == expected["target_scale_digest"]
+    assert observed == expected
+    assert observed["training_sequence_count_by_symbol"] == {"BTCUSDT": 4, "ETHUSDT": 4}
+
+
+def test_only_selected_endpoint_labels_can_change_target_scale_evidence():
+    datasets = _precision_scale_datasets()
+    baseline = train.training_sequence_target_scales(datasets)
+    train_dataset = datasets["BTCUSDT"]["train"]
+
+    train_dataset.labels["ret_reg"][0] += 1e12
+    train_dataset.labels["rv_reg"][0] += 1e12
+    assert train.training_sequence_target_scales(datasets) == baseline
+
+    endpoint = int(train_dataset.endpoints[0])
+    train_dataset.labels["ret_reg"][endpoint] += 0.25
+    changed = train.training_sequence_target_scales(datasets)
+    assert changed["target_scale_digest"] != baseline["target_scale_digest"]
+    assert changed["training_sequence_count_by_symbol"] == baseline["training_sequence_count_by_symbol"]
+
+
+@pytest.mark.parametrize("excluded_index", [6, 7, 12], ids=["purged", "validation", "internal_test"])
+def test_nontraining_and_purged_labels_cannot_affect_training_target_scales(excluded_index):
+    datasets = _precision_scale_datasets()
+    baseline = train.training_sequence_target_scales(datasets)
+    for symbol in datasets:
+        train_dataset = datasets[symbol]["train"]
+        train_dataset.labels["ret_reg"][excluded_index] += 1e12
+        train_dataset.labels["rv_reg"][excluded_index] += 1e12
+    assert train.training_sequence_target_scales(datasets) == baseline
+
+
 def test_resolved_manifest_contract_records_scales_weights_and_blockers():
     source = inspect.getsource(train._write_selected_candidate)
     for field in (

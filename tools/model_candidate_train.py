@@ -410,17 +410,20 @@ def _class_weights(dataset: Any):
 def training_sequence_target_scales(
     datasets_by_symbol: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Derive scales only from endpoints that actually form training sequences."""
+    """Derive float64 evidence scales at frozen training-sequence endpoints."""
     ret_targets: list[float] = []
     rv_targets: list[float] = []
     per_symbol: dict[str, int] = {}
     for symbol, values in sorted(datasets_by_symbol.items()):
         dataset = values["train"]
         per_symbol[symbol] = len(dataset)
-        for index in range(len(dataset)):
-            row = dataset[index]
-            ret_targets.append(float(row["y_ret_reg"]))
-            rv_targets.append(float(row["y_rv_reg"]))
+        endpoints = dataset.endpoints
+        ret_targets.extend(
+            np.asarray(dataset.labels["ret_reg"], dtype=np.float64)[endpoints].tolist()
+        )
+        rv_targets.extend(
+            np.asarray(dataset.labels["rv_reg"], dtype=np.float64)[endpoints].tolist()
+        )
     scales = compute_training_target_scales(ret_targets, rv_targets)
     scales["training_sequence_count_by_symbol"] = per_symbol
     scales["validation_targets_consulted"] = False
