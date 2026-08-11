@@ -201,6 +201,145 @@ def _patch_capture_contract(monkeypatch, target):
     )
 
 
+def _bounded_fetcher(calls):
+    def fetcher(symbol, **kwargs):
+        calls.append({"symbol": symbol, **kwargs})
+        end = pd.Timestamp(kwargs["end_utc"])
+        return _ccxt_ohlcv([
+            (end - pd.Timedelta(minutes=5 * offset)).value // 1_000_000
+            for offset in (4, 3, 2, 1)
+        ])
+
+    return fetcher
+
+
+def test_default_capture_end_and_dataset_identity_are_unchanged(monkeypatch, tmp_path):
+    _patch_capture_contract(monkeypatch, 4)
+    calls = []
+    manifest = ds.capture_training_data(
+        target_bars=4, fetcher=_bounded_fetcher(calls), dataset_root=tmp_path,
+        as_of_utc="2026-02-03T00:00:00Z",
+    )
+    cutoff = "2026-02-01T23:55:00Z"
+    legacy_contract = {
+        "phase": 24, "venue": "bitget", "timeframe": "5m",
+        "symbols": ["BTCUSDT", "ETHUSDT"], "cutoff": cutoff, "target": 4,
+    }
+    expected_id = f"phase24_5m_{ds.json_digest(legacy_contract)[:12]}"
+
+    assert manifest["dataset_id"] == expected_id == ds._dataset_id("bitget", cutoff, 4)
+    assert {call["end_utc"] for call in calls} == {"2026-02-02T00:00:00Z"}
+    assert manifest["default_safe_end_exclusive_utc"] == "2026-02-02T00:00:00Z"
+    assert manifest["effective_end_exclusive_utc"] == "2026-02-02T00:00:00Z"
+    assert manifest["explicit_historical_end_requested"] is False
+    assert "effective_end_exclusive_utc" not in ds._raw_capture_digest_contract(manifest)
+
+
+def test_earlier_explicit_capture_end_is_accepted_and_changes_identity(monkeypatch, tmp_path):
+    _patch_capture_contract(monkeypatch, 4)
+    calls = []
+    explicit_end = "2026-01-15T00:00:00Z"
+    manifest = ds.capture_training_data(
+        target_bars=4, fetcher=_bounded_fetcher(calls), dataset_root=tmp_path,
+        as_of_utc="2026-02-03T00:00:00Z", capture_end_exclusive_utc=explicit_end,
+    )
+    default_id = ds._dataset_id("bitget", "2026-02-01T23:55:00Z", 4)
+    explicit_id = ds._dataset_id(
+        "bitget", "2026-02-01T23:55:00Z", 4,
+        effective_end_exclusive_utc=explicit_end,
+    )
+
+    assert manifest["dataset_id"] == explicit_id
+    assert explicit_id != default_id
+    assert manifest["default_safe_end_exclusive_utc"] == "2026-02-02T00:00:00Z"
+    assert manifest["effective_end_exclusive_utc"] == explicit_end
+    assert manifest["explicit_historical_end_requested"] is True
+    assert ds._raw_capture_digest_contract(manifest)["effective_end_exclusive_utc"] == explicit_end
+    assert {call["end_utc"] for call in calls} == {explicit_end}
+    assert all(
+        pd.Timestamp(info["actual_last_utc"]) < pd.Timestamp(explicit_end)
+        for info in manifest["per_symbol"].values()
+    )
+
+
+def test_later_than_safe_and_non_aligned_capture_ends_fail_closed(monkeypatch, tmp_path):
+    _patch_capture_contract(monkeypatch, 4)
+    with pytest.raises(ds.ModelTrainingDatasetError, match="Phase-22-safe maximum"):
+        ds.capture_training_data(
+            target_bars=4, fetcher=lambda *args, **kwargs: None, dataset_root=tmp_path,
+            capture_end_exclusive_utc="2026-02-02T00:05:00Z",
+        )
+    with pytest.raises(ds.ModelTrainingDatasetError, match="5-minute boundary"):
+        ds.capture_training_data(
+            target_bars=4, fetcher=lambda *args, **kwargs: None, dataset_root=tmp_path,
+            capture_end_exclusive_utc="2026-01-15T00:01:00Z",
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fetcher_rows_at_or_above_explicit_end_are_rejected(monkeypatch, tmp_path):
+    _patch_capture_contract(monkeypatch, 4)
+    explicit_end = pd.Timestamp("2026-01-15T00:00:00Z")
+
+    def fetcher(symbol, **kwargs):
+        return _ccxt_ohlcv([
+            (explicit_end - pd.Timedelta(minutes=15)).value // 1_000_000,
+            (explicit_end - pd.Timedelta(minutes=10)).value // 1_000_000,
+            (explicit_end - pd.Timedelta(minutes=5)).value // 1_000_000,
+            explicit_end.value // 1_000_000,
+        ])
+
+    with pytest.raises(ds.ModelTrainingDatasetError, match="requested capture range"):
+        ds.capture_training_data(
+            dataset_id="out_of_range", target_bars=4, fetcher=fetcher,
+            dataset_root=tmp_path, as_of_utc="2026-02-03T00:00:00Z",
+            capture_end_exclusive_utc=ds.canonical_utc(explicit_end),
+        )
+
+
+def _raw_range(first, last):
+    return {
+        "market_symbols": ["BTCUSDT", "ETHUSDT"],
+        "per_symbol": {
+            symbol: {"actual_first_utc": first, "actual_last_utc": last}
+            for symbol in ("BTCUSDT", "ETHUSDT")
+        },
+    }
+
+
+def test_raw_capture_non_overlap_requires_strictly_prior_ranges(tmp_path):
+    earlier = _raw_range("2025-08-20T17:35:00Z", "2026-02-10T08:10:00Z")
+    later = _raw_range("2026-02-10T08:15:00Z", "2026-08-02T22:50:00Z")
+    earlier_dir = tmp_path / "earlier"
+    later_dir = tmp_path / "later"
+    earlier_dir.mkdir()
+    later_dir.mkdir()
+    (earlier_dir / "raw_manifest.json").write_text(json.dumps(earlier), encoding="utf-8")
+    (later_dir / "raw_manifest.json").write_text(json.dumps(later), encoding="utf-8")
+
+    result = ds.verify_raw_capture_non_overlap(earlier_dir, later_dir)
+    assert result["passed"] is True
+    assert all(value["strictly_prior"] for value in result["symbols"].values())
+
+
+@pytest.mark.parametrize("earlier_last", [
+    "2026-02-10T08:15:00Z",
+    "2026-02-10T08:20:00Z",
+])
+def test_raw_capture_non_overlap_rejects_touching_or_overlapping_ranges(earlier_last):
+    earlier = _raw_range("2025-08-20T17:35:00Z", earlier_last)
+    later = _raw_range("2026-02-10T08:15:00Z", "2026-08-02T22:50:00Z")
+    with pytest.raises(ds.ModelTrainingDatasetError, match="timestamp overlap"):
+        ds.verify_raw_capture_non_overlap(earlier, later)
+
+
+def test_capture_cli_exposes_optional_exclusive_end():
+    args = ds.build_parser().parse_args([
+        "capture", "--capture-end-exclusive-utc", "2026-02-10T08:15:00Z",
+    ])
+    assert args.capture_end_exclusive_utc == "2026-02-10T08:15:00Z"
+
+
 def test_capture_manifest_records_public_pagination_coverage_diagnostics(monkeypatch, tmp_path):
     _patch_capture_contract(monkeypatch, 4)
 

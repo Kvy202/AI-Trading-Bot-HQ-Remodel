@@ -259,10 +259,57 @@ def _gap_statistics(index: Any, timeframe_seconds: int = 300) -> tuple[int, floa
     return missing, float(np.max(deltas))
 
 
-def _dataset_id(venue: str, cutoff: str, target: int) -> str:
+def _capture_end_contract(
+    cutoffs: Mapping[str, Any], capture_end_exclusive_utc: str | None = None,
+) -> dict[str, Any]:
+    import pandas as pd
+
+    default_end = pd.Timestamp(cutoffs["maximum_training_raw_bar_open_utc"]) + pd.Timedelta(minutes=5)
+    default_end = default_end.tz_localize("UTC") if default_end.tzinfo is None else default_end.tz_convert("UTC")
+    explicit = capture_end_exclusive_utc is not None
+    requested = default_end if not explicit else capture_end_exclusive_utc
+    try:
+        if isinstance(requested, (float, np.floating)) and not math.isfinite(float(requested)):
+            raise ValueError("non-finite timestamp")
+        effective_end = pd.Timestamp(requested)
+        if pd.isna(effective_end):
+            raise ValueError("missing timestamp")
+        effective_end = (
+            effective_end.tz_localize("UTC")
+            if effective_end.tzinfo is None else effective_end.tz_convert("UTC")
+        )
+        effective_ns = int(effective_end.value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ModelTrainingDatasetError("capture end must be a finite valid UTC timestamp") from exc
+    if effective_ns % (300 * 1_000_000_000) != 0:
+        raise ModelTrainingDatasetError("capture end must align to a 5-minute boundary")
+    if effective_end > default_end:
+        raise ModelTrainingDatasetError("capture end exceeds the Phase-22-safe maximum")
+    return {
+        "default_safe_end_exclusive_utc": canonical_utc(default_end),
+        "effective_end_exclusive_utc": canonical_utc(effective_end),
+        "explicit_historical_end_requested": explicit,
+    }
+
+
+def _dataset_id(
+    venue: str, cutoff: str, target: int, *, effective_end_exclusive_utc: str | None = None,
+) -> str:
     contract = {"phase": 24, "venue": venue, "timeframe": "5m", "symbols": ["BTCUSDT", "ETHUSDT"],
                 "cutoff": cutoff, "target": target}
+    if effective_end_exclusive_utc is not None:
+        contract["effective_end_exclusive_utc"] = canonical_utc(effective_end_exclusive_utc)
     return f"phase24_5m_{json_digest(contract)[:12]}"
+
+
+def _raw_capture_digest_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    contract = {
+        "venue": manifest["source_venue"], "timeframe": "5m",
+        "target": manifest["target_raw_bars_per_symbol"], "phase22_bounds": manifest["phase22_bounds"],
+    }
+    if manifest.get("explicit_historical_end_requested") is True:
+        contract["effective_end_exclusive_utc"] = manifest["effective_end_exclusive_utc"]
+    return contract
 
 
 def _ccxt_timestamp_ms(value: Any) -> int:
@@ -415,6 +462,7 @@ def capture_training_data(
     *, dataset_id: str | None = None, venue: str = "bitget", as_of_utc: Any | None = None,
     target_bars: int | None = None, fetcher: Callable[..., Any] | None = None,
     dataset_root: Path | str = DATASET_ROOT,
+    capture_end_exclusive_utc: str | None = None,
 ) -> dict[str, Any]:
     validate_phase24_evidence()
     policy = load_training_policy()
@@ -423,7 +471,14 @@ def capture_training_data(
     if target < int(policy["target_raw_bars_per_symbol"]):
         raise ModelTrainingDatasetError("CLI may not weaken target_raw_bars_per_symbol")
     cutoffs = maximum_training_timestamps(max_lookahead=int(contract["label_contract"]["max_hold"]))
-    data_id = dataset_id or _dataset_id(venue, cutoffs["maximum_training_raw_bar_open_utc"], target)
+    end_contract = _capture_end_contract(cutoffs, capture_end_exclusive_utc)
+    data_id = dataset_id or _dataset_id(
+        venue, cutoffs["maximum_training_raw_bar_open_utc"], target,
+        effective_end_exclusive_utc=(
+            end_contract["effective_end_exclusive_utc"]
+            if end_contract["explicit_historical_end_requested"] else None
+        ),
+    )
     directory = Path(dataset_root) / data_id
     if directory.is_symlink():
         raise ModelTrainingDatasetError("dataset directory may not be a symlink")
@@ -433,13 +488,18 @@ def capture_training_data(
         for name, expected in (("source_venue", venue), ("timeframe", "5m"), ("target_raw_bars_per_symbol", target)):
             if previous.get(name) != expected:
                 raise ModelTrainingDatasetError(f"capture resume contract changed: {name}")
+        for name, expected in end_contract.items():
+            if name in previous and previous.get(name) != expected:
+                raise ModelTrainingDatasetError(f"capture resume contract changed: {name}")
+            if end_contract["explicit_historical_end_requested"] and name not in previous:
+                raise ModelTrainingDatasetError(f"capture resume contract changed: {name}")
         if previous.get("capture_status") == "complete":
             return verify_raw_capture(directory)
         _validate_partial_capture_manifest(previous)
     directory.mkdir(parents=True, exist_ok=True)
     record_incumbent_inventory()
     import pandas as pd
-    end_exclusive = pd.Timestamp(cutoffs["maximum_training_raw_bar_open_utc"]) + pd.Timedelta(minutes=5)
+    end_exclusive = pd.Timestamp(end_contract["effective_end_exclusive_utc"])
     start = end_exclusive - pd.Timedelta(minutes=5 * (target + 250))
     as_of = canonical_utc(as_of_utc or utc_now())
     fetch = fetcher or _public_fetch_range
@@ -486,6 +546,8 @@ def capture_training_data(
         )
         combined, merge_duplicates = _merge_ohlcv(existing, normalized)
         combined = combined[combined.index < end_exclusive].tail(target)
+        if len(combined) and combined.index.max() >= end_exclusive:
+            raise ModelTrainingDatasetError("captured raw bar reaches or exceeds exclusive capture end")
         duplicates_total += duplicates + merge_duplicates
         _write_raw_csv(raw_path, combined)
         missing, max_gap = _gap_statistics(combined.index)
@@ -516,10 +578,11 @@ def capture_training_data(
         "public_market_data_only": True, "source_venue": venue, "market_type": "swap",
         "market_symbols": list(policy["required_symbols"]), "timeframe": "5m",
         "target_raw_bars_per_symbol": target, "phase22_bounds": cutoffs,
+        **end_contract,
         "per_symbol": per_symbol, "duplicates": duplicates_total, "conflicts": 0,
     }
     manifest["combined_raw_digest"] = json_digest({
-        "contract": {"venue": venue, "timeframe": "5m", "target": target, "phase22_bounds": cutoffs},
+        "contract": _raw_capture_digest_contract(manifest),
         "files": {symbol: per_symbol[symbol]["file_sha256"] for symbol in sorted(per_symbol)},
     })
     manifest["manifest_digest"] = json_digest({k: v for k, v in manifest.items() if k not in {"captured_at", "manifest_digest"}})
@@ -540,6 +603,14 @@ def verify_raw_capture(directory: Path | str) -> dict[str, Any]:
     if manifest.get("manifest_digest") != calculated_manifest:
         raise ModelTrainingDatasetError("raw manifest digest mismatch")
     cutoffs = maximum_training_timestamps()
+    explicit_end = manifest.get("explicit_historical_end_requested") is True
+    recorded_end = manifest.get("effective_end_exclusive_utc")
+    if explicit_end and recorded_end is None:
+        raise ModelTrainingDatasetError("explicit historical capture end evidence missing")
+    end_contract = _capture_end_contract(cutoffs, recorded_end if explicit_end else None)
+    for name, expected in end_contract.items():
+        if name in manifest and manifest.get(name) != expected:
+            raise ModelTrainingDatasetError(f"raw capture end contract mismatch: {name}")
     import pandas as pd
     phase22_first = pd.Timestamp(cutoffs["earliest_source_bar_open_utc"])
     file_hashes = {}
@@ -548,6 +619,8 @@ def verify_raw_capture(directory: Path | str) -> dict[str, Any]:
         if file_digest(path) != manifest["per_symbol"][symbol]["file_sha256"]:
             raise ModelTrainingDatasetError(f"raw file digest mismatch: {symbol}")
         info = manifest["per_symbol"][symbol]
+        if canonical_utc(info["requested_end_exclusive_utc"]) != end_contract["effective_end_exclusive_utc"]:
+            raise ModelTrainingDatasetError(f"raw capture end mismatch: {symbol}")
         frame, duplicates, _ = _normalize_ohlcv(
             _read_raw_csv(path), as_of_utc=utc_now(),
             requested_start_utc=info["requested_start_utc"],
@@ -559,13 +632,75 @@ def verify_raw_capture(directory: Path | str) -> dict[str, Any]:
             raise ModelTrainingDatasetError("Phase22 excluded contract failed")
         file_hashes[symbol] = file_digest(path)
     observed = json_digest({
-        "contract": {"venue": manifest["source_venue"], "timeframe": "5m",
-                     "target": manifest["target_raw_bars_per_symbol"], "phase22_bounds": manifest["phase22_bounds"]},
+        "contract": _raw_capture_digest_contract(manifest),
         "files": {symbol: file_hashes[symbol] for symbol in sorted(file_hashes)},
     })
     if observed != manifest.get("combined_raw_digest"):
         raise ModelTrainingDatasetError("combined raw digest mismatch")
     return manifest
+
+
+def _raw_manifest_from(source: Mapping[str, Any] | Path | str) -> dict[str, Any]:
+    if isinstance(source, Mapping):
+        return dict(source)
+    path = Path(source)
+    manifest_path = path / "raw_manifest.json" if path.is_dir() else path
+    if not manifest_path.is_file():
+        raise ModelTrainingDatasetError("raw capture manifest required for overlap verification")
+    return json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+
+
+def verify_raw_capture_non_overlap(
+    earlier_capture: Mapping[str, Any] | Path | str,
+    later_capture: Mapping[str, Any] | Path | str,
+    *,
+    symbols: Sequence[str] = ("BTCUSDT", "ETHUSDT"),
+) -> dict[str, Any]:
+    """Require every earlier last timestamp to precede the later first timestamp."""
+    import pandas as pd
+
+    earlier = _raw_manifest_from(earlier_capture)
+    later = _raw_manifest_from(later_capture)
+    required = tuple(str(symbol) for symbol in symbols)
+    if not required or any(
+        symbol not in earlier.get("per_symbol", {}) or symbol not in later.get("per_symbol", {})
+        for symbol in required
+    ):
+        raise ModelTrainingDatasetError("raw capture overlap evidence lacks required symbols")
+    evidence: dict[str, Any] = {}
+    for symbol in required:
+        earlier_info = earlier["per_symbol"][symbol]
+        later_info = later["per_symbol"][symbol]
+        try:
+            earlier_first = pd.Timestamp(earlier_info["actual_first_utc"])
+            earlier_last = pd.Timestamp(earlier_info["actual_last_utc"])
+            later_first = pd.Timestamp(later_info["actual_first_utc"])
+            later_last = pd.Timestamp(later_info["actual_last_utc"])
+            if any(pd.isna(value) for value in (earlier_first, earlier_last, later_first, later_last)):
+                raise ValueError("missing timestamp")
+            values = [
+                value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+                for value in (earlier_first, earlier_last, later_first, later_last)
+            ]
+            earlier_first, earlier_last, later_first, later_last = values
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ModelTrainingDatasetError("invalid raw capture overlap timestamps") from exc
+        if earlier_first > earlier_last or later_first > later_last:
+            raise ModelTrainingDatasetError("invalid raw capture timestamp range")
+        if earlier_last >= later_first:
+            raise ModelTrainingDatasetError(f"raw capture timestamp overlap: {symbol}")
+        evidence[symbol] = {
+            "earlier_first_utc": canonical_utc(earlier_first),
+            "earlier_last_utc": canonical_utc(earlier_last),
+            "later_first_utc": canonical_utc(later_first),
+            "later_last_utc": canonical_utc(later_last),
+            "strictly_prior": True,
+        }
+    return {
+        "passed": True,
+        "relationship": "strictly_prior_no_timestamp_overlap",
+        "symbols": evidence,
+    }
 
 
 def _write_deterministic_npz(path: Path, **arrays: Any) -> None:
@@ -1156,6 +1291,7 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--dataset-id")
     capture.add_argument("--venue", default="bitget")
     capture.add_argument("--as-of-utc")
+    capture.add_argument("--capture-end-exclusive-utc")
     build = sub.add_parser("build")
     build.add_argument("--dataset", required=True)
     build.add_argument("--training-python", default=str(TRAINING_PYTHON))
@@ -1180,7 +1316,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "capture":
-            result = capture_training_data(dataset_id=args.dataset_id, venue=args.venue, as_of_utc=args.as_of_utc)
+            result = capture_training_data(
+                dataset_id=args.dataset_id, venue=args.venue, as_of_utc=args.as_of_utc,
+                capture_end_exclusive_utc=args.capture_end_exclusive_utc,
+            )
         elif args.command == "build":
             python = Path(args.training_python)
             if (not python.is_file() or not TRAINING_PYTHON.is_file()
