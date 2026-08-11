@@ -1038,10 +1038,7 @@ def verify_dataset(dataset: Path | str) -> dict[str, Any]:
                 or len(raw_rows) < int(raw["target_raw_bars_per_symbol"])):
             raise ModelTrainingDatasetError(f"raw completed-row count mismatch: {symbol}")
     observed_raw_digest = json_digest({
-        "contract": {
-            "venue": raw["source_venue"], "timeframe": "5m",
-            "target": raw["target_raw_bars_per_symbol"], "phase22_bounds": raw["phase22_bounds"],
-        },
+        "contract": _raw_capture_digest_contract(raw),
         "files": {symbol: raw_hashes[symbol] for symbol in sorted(raw_hashes)},
     })
     if observed_raw_digest != raw.get("combined_raw_digest"):

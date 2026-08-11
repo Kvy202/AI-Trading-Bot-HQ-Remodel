@@ -523,6 +523,114 @@ def test_scaler_fits_only_pooled_training_rows_and_is_finite(monkeypatch, tmp_pa
         ds.fit_frozen_scaler(tmp_path, require_canonical_version=False)
 
 
+def _build_frozen_verifier_dataset(monkeypatch, root, *, explicit):
+    real_verify_raw_capture = ds.verify_raw_capture
+    policy = _patch_build_contract(monkeypatch)
+    policy["target_raw_bars_per_symbol"] = 2000
+    monkeypatch.setattr(ds, "verify_raw_capture", real_verify_raw_capture)
+    frames = {}
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        frames[symbol] = _ohlcv()
+        ds._write_raw_csv(root / f"raw_{symbol}.csv", frames[symbol])
+    bounds = ds.maximum_training_timestamps()
+    default_end = "2099-01-02T00:00:00Z"
+    effective_end = "2098-12-31T00:00:00Z" if explicit else default_end
+    per_symbol = {
+        symbol: {
+            "requested_start_utc": "2019-12-31T00:00:00Z",
+            "requested_end_exclusive_utc": effective_end,
+            "actual_first_utc": ds.canonical_utc(frame.index[0]),
+            "actual_last_utc": ds.canonical_utc(frame.index[-1]),
+            "completed_rows": len(frame),
+            "file_sha256": ds.file_digest(root / f"raw_{symbol}.csv"),
+        }
+        for symbol, frame in frames.items()
+    }
+    raw = {
+        "schema_version": 1,
+        "dataset_id": "synthetic_explicit" if explicit else "synthetic_legacy",
+        "capture_status": "complete",
+        "captured_at": "2026-01-01T00:00:00Z",
+        "source_venue": "synthetic-public",
+        "market_symbols": ["BTCUSDT", "ETHUSDT"],
+        "timeframe": "5m",
+        "target_raw_bars_per_symbol": 2000,
+        "phase22_bounds": bounds,
+        "per_symbol": per_symbol,
+    }
+    if explicit:
+        raw.update({
+            "default_safe_end_exclusive_utc": default_end,
+            "effective_end_exclusive_utc": effective_end,
+            "explicit_historical_end_requested": True,
+        })
+    raw["combined_raw_digest"] = ds.json_digest({
+        "contract": ds._raw_capture_digest_contract(raw),
+        "files": {
+            symbol: per_symbol[symbol]["file_sha256"] for symbol in sorted(per_symbol)
+        },
+    })
+    raw["manifest_digest"] = ds.json_digest({
+        key: value for key, value in raw.items() if key not in {"captured_at", "manifest_digest"}
+    })
+    (root / "raw_manifest.json").write_text(json.dumps(raw), encoding="utf-8")
+    ds.build_dataset(root, fit_scaler=False, minimum_usable_rows=200)
+    ds.fit_frozen_scaler(root, require_canonical_version=False)
+    return raw
+
+
+def test_verify_dataset_uses_canonical_raw_contract_for_bounded_capture(
+    monkeypatch, tmp_path
+):
+    raw = _build_frozen_verifier_dataset(monkeypatch, tmp_path, explicit=True)
+    canonical_helper = ds._raw_capture_digest_contract
+    calls = []
+
+    def observed_contract(value):
+        calls.append(value)
+        return canonical_helper(value)
+
+    monkeypatch.setattr(ds, "_raw_capture_digest_contract", observed_contract)
+    manifest = ds.verify_dataset(tmp_path)
+
+    assert manifest["dataset_status"] == "frozen_ready"
+    assert calls and calls[0]["combined_raw_digest"] == raw["combined_raw_digest"]
+    assert canonical_helper(raw)["effective_end_exclusive_utc"] == "2098-12-31T00:00:00Z"
+
+
+def test_verify_dataset_legacy_raw_contract_remains_bit_compatible(monkeypatch, tmp_path):
+    raw = _build_frozen_verifier_dataset(monkeypatch, tmp_path, explicit=False)
+    legacy_contract = {
+        "venue": raw["source_venue"], "timeframe": "5m",
+        "target": raw["target_raw_bars_per_symbol"], "phase22_bounds": raw["phase22_bounds"],
+    }
+    expected = ds.json_digest({
+        "contract": legacy_contract,
+        "files": {
+            symbol: raw["per_symbol"][symbol]["file_sha256"]
+            for symbol in sorted(raw["per_symbol"])
+        },
+    })
+
+    assert ds._raw_capture_digest_contract(raw) == legacy_contract
+    assert raw["combined_raw_digest"] == expected
+    assert ds.verify_dataset(tmp_path)["dataset_status"] == "frozen_ready"
+
+
+def test_verify_dataset_rejects_tampered_explicit_capture_end(monkeypatch, tmp_path):
+    _build_frozen_verifier_dataset(monkeypatch, tmp_path, explicit=True)
+    path = tmp_path / "raw_manifest.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["effective_end_exclusive_utc"] = "2098-12-30T23:55:00Z"
+    raw["manifest_digest"] = ds.json_digest({
+        key: value for key, value in raw.items() if key not in {"captured_at", "manifest_digest"}
+    })
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ds.ModelTrainingDatasetError, match="combined raw digest mismatch"):
+        ds.verify_dataset(tmp_path)
+
+
 def test_confirmation_capture_refuses_without_all_candidate_freeze(tmp_path):
     with pytest.raises(ds.ModelTrainingDatasetError, match="freeze manifest required"):
         ds._load_selection_freeze(tmp_path / "missing.json")
