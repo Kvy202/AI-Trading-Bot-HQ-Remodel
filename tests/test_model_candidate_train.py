@@ -20,7 +20,10 @@ def _validation(auc=0.60, loss=0.5, btc=0.56, eth=0.57):
     }
 
 
-def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001, objective="3" * 64, balance="4" * 64):
+def _identity(
+    seed=24001, dataset="a" * 64, learning_rate=0.001, objective="3" * 64,
+    balance="4" * 64, rv_output=None,
+):
     manifest = {
         "dataset_digest": dataset,
         "feature_digest": "b" * 64,
@@ -35,6 +38,9 @@ def _identity(seed=24001, dataset="a" * 64, learning_rate=0.001, objective="3" *
         training_code_digest="2" * 64,
         objective_contract_digest=objective,
         balance_contract_digest=balance,
+        rv_output_contract_digest=(
+            rv_output or train.candidate_rv_output_contract()["rv_output_contract_digest"]
+        ),
     )
 
 
@@ -70,12 +76,19 @@ def test_downstream_use_sets_auxiliary_head_promotion_blocker():
 
 
 @pytest.mark.parametrize("kind", train.ALLOWED_KINDS)
-def test_architecture_contract_matches_incumbent_shapes_and_existing_defaults(kind):
+def test_architecture_contract_matches_incumbent_shapes_and_new_candidate_output_contract(kind):
     contract = train.architecture_contract(kind)
-    assert contract["constructor"] == train.ARCHITECTURE_DEFAULTS[kind]
-    assert contract["architecture_mathematics_modified"] is False
+    assert contract["incumbent_compatible_base_geometry"] == train.ARCHITECTURE_DEFAULTS[kind]
+    assert contract["constructor"] == {
+        **train.ARCHITECTURE_DEFAULTS[kind], "rv_output_transform": "softplus"
+    }
+    assert contract["architecture_mathematics_modified"] is True
+    assert contract["rv_output_transform"] == "softplus"
+    assert contract["rv_output_support"] == "strictly_positive"
+    assert contract["post_hoc_rv_clipping_applied"] is False
+    assert contract["rv_output_contract_digest"]
     assert contract["incumbent_state_shape_digest"]
-    assert len(train.make_candidate_model(kind).state_dict()) > 0
+    assert train.make_candidate_model(kind).rv_output_transform == "softplus"
 
 
 def test_adv_retraining_is_prohibited():
@@ -92,6 +105,7 @@ def test_candidate_identity_is_deterministic_and_changes_with_inputs():
     assert first[0] != _identity(learning_rate=0.002)[0]
     assert first[0] != _identity(objective="4" * 64)[0]
     assert first[0] != _identity(balance="5" * 64)[0]
+    assert first[0] != _identity(rv_output="6" * 64)[0]
     assert "C:\\" not in first[1]["identity_digest"]
 
 
@@ -354,6 +368,18 @@ def test_real_training_refuses_missing_balance_freeze_before_environment_access(
         train.train_candidate_experiment(
             "lstm", tmp_path / "dataset", balance_freeze_path=tmp_path / "missing.json"
         )
+
+
+def test_real_training_rejects_historical_balance_before_dataset_or_evidence_access(
+    tmp_path, monkeypatch
+):
+    def forbidden_access(*args, **kwargs):
+        raise AssertionError("dataset and experiment evidence must remain unopened")
+
+    monkeypatch.setattr(train, "validate_phase24_evidence", forbidden_access)
+    monkeypatch.setattr(train, "load_sequence_datasets", forbidden_access)
+    with pytest.raises(train.ModelCandidateTrainingError, match="RV-output contract mismatch"):
+        train.train_candidate_experiment("lstm", tmp_path / "unopened-dataset")
 
 
 def test_history_source_logs_weighted_and_unweighted_components():

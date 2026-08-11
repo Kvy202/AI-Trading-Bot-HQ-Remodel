@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from tools import model_candidate_loss_balance as balance
+from tools import model_candidate_train as candidate_train
 from tools import model_loss_balance_probe as probe
 
 
@@ -195,6 +196,7 @@ def _safe_report():
                     "target_scales": {"target_scale_digest": "t" * 64}},
         "balance_policy": {"digest": balance.balance_policy_digest()},
         "calibration_sample": {"endpoint_digest": "e" * 64, "source": "training_sequences_only"},
+        "rv_output_contract": candidate_train.candidate_rv_output_contract(),
         "architectures": architectures,
     }
 
@@ -263,6 +265,51 @@ def test_balance_gate_accepts_exact_target_scale_digest_and_rejects_real_mismatc
     manifest["target_scales"]["target_scale_digest"] = "u" * 64
     with pytest.raises(balance.LossBalanceError, match="target-scale digest mismatch"):
         balance.validate_balance_freeze(path, dataset_manifest=manifest)
+
+
+def test_new_freeze_records_and_authorizes_only_matching_rv_output_contract(tmp_path):
+    path = tmp_path / "new-freeze.json"
+    frozen = balance.freeze_balance_contract(_safe_report(), path)
+    expected = candidate_train.candidate_rv_output_contract()["rv_output_contract_digest"]
+
+    assert frozen["rv_output_contract_digest"] == expected
+    assert frozen["rv_output_contract"]["rv_output_transform"] == "softplus"
+    assert balance.validate_balance_freeze(
+        path, expected_rv_output_contract_digest=expected
+    ) == frozen
+    with pytest.raises(balance.LossBalanceError, match="RV-output contract mismatch"):
+        balance.validate_balance_freeze(
+            path, expected_rv_output_contract_digest="0" * 64
+        )
+
+
+def test_historical_freeze_is_readable_but_cannot_authorize_softplus_training():
+    historical = balance.validate_balance_freeze(balance.DEFAULT_BALANCE_FREEZE)
+    expected = candidate_train.candidate_rv_output_contract()["rv_output_contract_digest"]
+
+    assert historical.get("rv_output_contract_digest") is None
+    with pytest.raises(balance.LossBalanceError, match="RV-output contract mismatch"):
+        balance.validate_balance_freeze(
+            balance.DEFAULT_BALANCE_FREEZE,
+            expected_rv_output_contract_digest=expected,
+        )
+
+
+def test_freeze_rejects_missing_or_mismatched_new_rv_output_contract(tmp_path):
+    missing = _safe_report()
+    missing.pop("rv_output_contract")
+    with pytest.raises(balance.LossBalanceError, match="RV-output contract required"):
+        balance.freeze_balance_contract(missing, tmp_path / "missing.json")
+
+    mismatched = _safe_report()
+    mismatched["rv_output_contract"]["rv_output_transform"] = "identity"
+    payload = {
+        key: value for key, value in mismatched["rv_output_contract"].items()
+        if key != "rv_output_contract_digest"
+    }
+    mismatched["rv_output_contract"]["rv_output_contract_digest"] = balance._digest(payload)
+    with pytest.raises(balance.LossBalanceError, match="RV-output contract mismatch"):
+        balance.freeze_balance_contract(mismatched, tmp_path / "mismatched.json")
 
 
 def test_real_calibration_target_scale_gate_is_exact_without_tolerance_bypass():

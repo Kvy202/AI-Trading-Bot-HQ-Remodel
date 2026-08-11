@@ -103,15 +103,33 @@ DEFAULT_TRAINING_CONFIG: dict[str, Any] = {
     ],
 }
 
-ARCHITECTURE_DEFAULTS: dict[str, dict[str, Any]] = {
+INCUMBENT_COMPATIBLE_ARCHITECTURE_GEOMETRY: dict[str, dict[str, Any]] = {
     "lstm": {"in_dim": 27, "hidden": 64, "layers": 2, "dropout": 0.1},
     "tcn": {"in_dim": 27, "hid": 64, "levels": 4, "kernel": 3, "dropout": 0.1},
     "tx": {"in_dim": 27, "d_model": 64, "nhead": 4, "nlayers": 2, "dropout": 0.1},
 }
+# Retain the established public geometry name without changing incumbent defaults.
+ARCHITECTURE_DEFAULTS = copy.deepcopy(INCUMBENT_COMPATIBLE_ARCHITECTURE_GEOMETRY)
+NEW_CANDIDATE_RV_OUTPUT_TRANSFORM = "softplus"
+NEW_CANDIDATE_RV_OUTPUT_SUPPORT = "strictly_positive"
 
 
 class ModelCandidateTrainingError(ValueError):
     """A frozen-data, selection, test-access, or artifact gate failed."""
+
+
+def candidate_rv_output_contract() -> dict[str, Any]:
+    """Return the immutable forward-mathematics contract for new candidates."""
+    contract: dict[str, Any] = {
+        "schema_version": 1,
+        "rv_output_transform": NEW_CANDIDATE_RV_OUTPUT_TRANSFORM,
+        "rv_output_support": NEW_CANDIDATE_RV_OUTPUT_SUPPORT,
+        "post_hoc_rv_clipping_applied": False,
+        "application": "forward_output_before_existing_loss",
+        "rv_target_units": "raw_positive_runtime_units",
+    }
+    contract["rv_output_contract_digest"] = json_digest(contract)
+    return contract
 
 
 def training_objective_contract(
@@ -282,7 +300,9 @@ def architecture_contract(kind: str, repository: Path | str = BASE_DIR) -> dict[
     from ml_dl.dl_models import TemporalConvNet, TinyLSTM, TinyTransformer
 
     cls = {"lstm": TinyLSTM, "tcn": TemporalConvNet, "tx": TinyTransformer}[kind]
-    config = copy.deepcopy(ARCHITECTURE_DEFAULTS[kind])
+    base_geometry = copy.deepcopy(INCUMBENT_COMPATIBLE_ARCHITECTURE_GEOMETRY[kind])
+    config = {**base_geometry, "rv_output_transform": NEW_CANDIDATE_RV_OUTPUT_TRANSFORM}
+    rv_contract = candidate_rv_output_contract()
     signature = str(inspect.signature(cls.__init__))
     model = cls(**config)
     root = Path(repository)
@@ -295,18 +315,25 @@ def architecture_contract(kind: str, repository: Path | str = BASE_DIR) -> dict[
     incumbent_shapes = {name: list(value.shape) for name, value in incumbent_state.items()}
     if candidate_shapes != incumbent_shapes:
         raise ModelCandidateTrainingError("candidate_architecture_contract_incomplete")
+    model.load_state_dict(incumbent_state, strict=True)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
     if int(metadata.get("n_features", -1)) != 27 or int(metadata.get("seq_len", -1)) != 64:
         raise ModelCandidateTrainingError("candidate_architecture_contract_incomplete")
     return {
         "kind": kind,
         "class": f"{cls.__module__}.{cls.__name__}",
+        "incumbent_compatible_base_geometry": base_geometry,
         "constructor": config,
         "constructor_signature": signature,
         "derived_from": ["existing_factory", "model_class_defaults", "incumbent_state_shapes", "incumbent_metadata"],
         "incumbent_state_shape_digest": json_digest(incumbent_shapes),
         "model_code_digest": file_digest(root / "ml_dl" / "dl_models.py"),
-        "architecture_mathematics_modified": False,
+        "architecture_mathematics_modified": True,
+        "rv_output_transform": rv_contract["rv_output_transform"],
+        "rv_output_support": rv_contract["rv_output_support"],
+        "post_hoc_rv_clipping_applied": rv_contract["post_hoc_rv_clipping_applied"],
+        "rv_output_contract": rv_contract,
+        "rv_output_contract_digest": rv_contract["rv_output_contract_digest"],
     }
 
 
@@ -315,7 +342,10 @@ def make_candidate_model(kind: str, config: Mapping[str, Any] | None = None):
 
     if kind not in ALLOWED_KINDS:
         raise ModelCandidateTrainingError("ADV is retained and may not be retrained in Phase 24")
-    values = dict(config or ARCHITECTURE_DEFAULTS[kind])
+    values = copy.deepcopy(INCUMBENT_COMPATIBLE_ARCHITECTURE_GEOMETRY[kind])
+    if config is not None:
+        values.update(dict(config))
+    values.setdefault("rv_output_transform", NEW_CANDIDATE_RV_OUTPUT_TRANSFORM)
     return {"lstm": TinyLSTM, "tcn": TemporalConvNet, "tx": TinyTransformer}[kind](**values)
 
 
@@ -869,6 +899,7 @@ def candidate_identity(
     training_code_digest: str,
     objective_contract_digest: str = "unresolved_objective_contract",
     balance_contract_digest: str = "unresolved_balance_contract",
+    rv_output_contract_digest: str = "unresolved_rv_output_contract",
 ) -> tuple[str, dict[str, Any]]:
     identity = {
         "kind": kind,
@@ -885,6 +916,7 @@ def candidate_identity(
         "training_code_digest": training_code_digest,
         "objective_contract_digest": str(objective_contract_digest),
         "balance_contract_digest": str(balance_contract_digest),
+        "rv_output_contract_digest": str(rv_output_contract_digest),
     }
     config_digest = json_digest({
         "architecture": identity["architecture_config"],
@@ -897,6 +929,7 @@ def candidate_identity(
         "code": identity["training_code_digest"],
         "objective_contract": identity["objective_contract_digest"],
         "balance_contract": identity["balance_contract_digest"],
+        "rv_output_contract": identity["rv_output_contract_digest"],
     })
     candidate_id = f"{kind}_5m_{str(identity['dataset_digest'])[:8]}_{config_digest[:8]}_s{int(seed)}"
     identity["identity_digest"] = json_digest(identity)
@@ -910,6 +943,7 @@ def candidate_training_code_digest() -> str:
         "model_candidate_objective.py": file_digest(BASE_DIR / "tools" / "model_candidate_objective.py"),
         "model_objective_contract.py": file_digest(BASE_DIR / "tools" / "model_objective_contract.py"),
         "model_candidate_loss_balance.py": file_digest(BASE_DIR / "tools" / "model_candidate_loss_balance.py"),
+        "dl_models.py": file_digest(BASE_DIR / "ml_dl" / "dl_models.py"),
     })
 
 
@@ -1057,6 +1091,9 @@ def _write_selected_candidate(
         raise ModelCandidateTrainingError("resolved objective, balance freeze, and training target scales required")
     objective_contract_digest = str(objective_contract_report["objective_contract_digest"])
     balance_contract_digest = str(balance_freeze["balance_contract_digest"])
+    rv_output_contract_digest = str(architecture["rv_output_contract_digest"])
+    if balance_freeze.get("rv_output_contract_digest") != rv_output_contract_digest:
+        raise ModelCandidateTrainingError("loss-balance freeze RV-output contract mismatch")
     training_code_digest = candidate_training_code_digest()
     scaler_digest = file_digest(dataset_root / "scaler.joblib")
     candidate_id, identity = candidate_identity(
@@ -1068,6 +1105,7 @@ def _write_selected_candidate(
         training_code_digest=training_code_digest,
         objective_contract_digest=objective_contract_digest,
         balance_contract_digest=balance_contract_digest,
+        rv_output_contract_digest=rv_output_contract_digest,
     )
     if expected_candidate_id is not None and candidate_id != expected_candidate_id:
         raise ModelCandidateTrainingError("frozen candidate identity changed after internal-test access")
@@ -1101,6 +1139,10 @@ def _write_selected_candidate(
             "supported_symbols": list(dataset_manifest["supported_symbols"]), "timeframe": "5m",
             "sequence_length": int(dataset_manifest["sequence_length"]), "feature_count": 27,
             "architecture_config": architecture["constructor"], "architecture_contract": architecture,
+            "rv_output_transform": architecture["rv_output_transform"],
+            "rv_output_support": architecture["rv_output_support"],
+            "post_hoc_rv_clipping_applied": architecture["post_hoc_rv_clipping_applied"],
+            "rv_output_contract_digest": rv_output_contract_digest,
             "training_objective": objective_record, "objective_contract": objective_record,
             "objective_source": objective_record["objective_source"],
             "objective_schema_version": objective_record["objective_schema_version"],
@@ -1159,6 +1201,10 @@ def _write_selected_candidate(
             "supported_symbols": dataset_manifest["supported_symbols"], "timeframe": "5m",
             "sequence_length": dataset_manifest["sequence_length"], "feature_count": dataset_manifest["feature_count"],
             "architecture_config": architecture["constructor"], "training_objective": objective_record,
+            "rv_output_transform": architecture["rv_output_transform"],
+            "rv_output_support": architecture["rv_output_support"],
+            "post_hoc_rv_clipping_applied": architecture["post_hoc_rv_clipping_applied"],
+            "rv_output_contract_digest": rv_output_contract_digest,
             "objective_source": objective_record["objective_source"],
             "objective_schema_version": objective_record["objective_schema_version"],
             "objective_policy_digest": objective_record["objective_policy_digest"],
@@ -1322,11 +1368,15 @@ def train_candidate_experiment(
 ) -> dict[str, Any]:
     if kind not in ALLOWED_KINDS:
         raise ModelCandidateTrainingError("ADV is retained and may not be retrained in Phase 24")
+    rv_output_contract = candidate_rv_output_contract()
     objective_contract_report = validate_training_objective_gate(
         objective, report_path=objective_report
     )
     try:
-        balance_freeze = validate_balance_freeze(balance_freeze_path)
+        balance_freeze = validate_balance_freeze(
+            balance_freeze_path,
+            expected_rv_output_contract_digest=rv_output_contract["rv_output_contract_digest"],
+        )
     except LossBalanceError as exc:
         raise ModelCandidateTrainingError(str(exc)) from exc
     validate_phase24_evidence()
@@ -1338,7 +1388,11 @@ def train_candidate_experiment(
     datasets, manifest = load_sequence_datasets(dataset)
     _timing("load_sequence_datasets", dataset_load_started_at, model_kind=kind)
     try:
-        balance_freeze = validate_balance_freeze(balance_freeze_path, dataset_manifest=manifest)
+        balance_freeze = validate_balance_freeze(
+            balance_freeze_path,
+            dataset_manifest=manifest,
+            expected_rv_output_contract_digest=rv_output_contract["rv_output_contract_digest"],
+        )
     except LossBalanceError as exc:
         raise ModelCandidateTrainingError(str(exc)) from exc
     architecture = architecture_contract(kind)
@@ -1399,6 +1453,7 @@ def train_candidate_experiment(
         training_code_digest=training_code_digest,
         objective_contract_digest=objective_contract_digest,
         balance_contract_digest=balance_contract_digest,
+        rv_output_contract_digest=rv_output_contract["rv_output_contract_digest"],
     )
     freeze_directory = SEED_RUN_ROOT / candidate_id
     if freeze_directory.exists():
@@ -1447,6 +1502,7 @@ def train_candidate_experiment(
         "internal_test_gate": gate, "selection": selection, "summary_digest": summary["summary_digest"],
         "objective_contract_digest": objective_contract_digest,
         "balance_contract_digest": balance_contract_digest,
+        "rv_output_contract_digest": rv_output_contract["rv_output_contract_digest"],
     }
 
 

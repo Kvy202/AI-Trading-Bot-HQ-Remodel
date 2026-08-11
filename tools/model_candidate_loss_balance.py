@@ -107,6 +107,22 @@ def _digest(value: Any) -> str:
     ).hexdigest()
 
 
+def _expected_candidate_rv_output_contract() -> dict[str, Any]:
+    # Lazy import avoids the candidate-training/loss-balance module import cycle.
+    from tools.model_candidate_train import candidate_rv_output_contract
+
+    return candidate_rv_output_contract()
+
+
+def _validate_rv_output_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    contract = dict(value)
+    observed = contract.get("rv_output_contract_digest")
+    payload = {key: item for key, item in contract.items() if key != "rv_output_contract_digest"}
+    if observed != _digest(payload):
+        raise LossBalanceError("RV-output contract digest mismatch")
+    return contract
+
+
 def validate_balance_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
     if set(policy) != set(POLICY_TEMPLATE):
         raise LossBalanceError("loss-balance policy fields are not exact")
@@ -604,6 +620,7 @@ def validate_balance_freeze(
     *,
     dataset_manifest: Mapping[str, Any] | None = None,
     expected_balance_digest: str | None = None,
+    expected_rv_output_contract_digest: str | None = None,
 ) -> dict[str, Any]:
     target = Path(path)
     if not target.is_file():
@@ -617,6 +634,19 @@ def validate_balance_freeze(
         raise LossBalanceError("loss-balance freeze digest mismatch")
     if expected_balance_digest is not None and observed != expected_balance_digest:
         raise LossBalanceError("unexpected loss-balance contract digest")
+    frozen_rv_digest = value.get("rv_output_contract_digest")
+    frozen_rv_contract = value.get("rv_output_contract")
+    if frozen_rv_digest is not None or frozen_rv_contract is not None:
+        if not isinstance(frozen_rv_contract, Mapping):
+            raise LossBalanceError("invalid frozen RV-output contract")
+        validated_rv_contract = _validate_rv_output_contract(frozen_rv_contract)
+        if validated_rv_contract["rv_output_contract_digest"] != frozen_rv_digest:
+            raise LossBalanceError("frozen RV-output contract digest mismatch")
+    if (
+        expected_rv_output_contract_digest is not None
+        and frozen_rv_digest != expected_rv_output_contract_digest
+    ):
+        raise LossBalanceError("loss-balance freeze RV-output contract mismatch")
     if value.get("balance_policy_digest") != balance_policy_digest():
         raise LossBalanceError("loss-balance policy digest mismatch")
     if set(value.get("architectures", {})) != set(ARCHITECTURES):
@@ -650,12 +680,13 @@ def run_real_calibration(
     import torch
     from tools.model_candidate_train import (
         _class_weights, _concat, load_sequence_datasets, make_candidate_model,
-        training_sequence_target_scales,
+        candidate_rv_output_contract, training_sequence_target_scales,
     )
     from tools.model_training_dataset import verify_dataset
 
     parent = validate_parent_objective()
     policy = load_balance_policy()
+    rv_output_contract = candidate_rv_output_contract()
     manifest = verify_dataset(dataset)
     assert_balance_freeze_ordering(reports_root=reports_root, dataset_digest=manifest["dataset_digest"])
     datasets, loaded_manifest = load_sequence_datasets(dataset)
@@ -701,6 +732,7 @@ def run_real_calibration(
         "parent_objective": {"objective_contract_digest": parent["objective_contract_digest"]},
         "balance_policy": {"digest": balance_policy_digest(policy), "policy": policy},
         "calibration_sample": {key: value for key, value in sample.items() if key != "records"},
+        "rv_output_contract": rv_output_contract,
         "architectures": serial,
         "overall_decision": {"status": "all_architectures_resolved" if safe else "candidate_loss_balance_unresolved"},
         "nontraining_evidence_consulted": False,
@@ -728,6 +760,12 @@ def freeze_balance_contract(report: Mapping[str, Any], path: Path | str) -> dict
         raise LossBalanceError("verified frozen dataset required for loss-balance freeze")
     if report.get("calibration_sample", {}).get("source") != "training_sequences_only":
         raise LossBalanceError("loss-balance freeze requires training sequences only")
+    rv_output_contract = report.get("rv_output_contract")
+    if not isinstance(rv_output_contract, Mapping):
+        raise LossBalanceError("new candidate RV-output contract required")
+    validated_rv_contract = _validate_rv_output_contract(rv_output_contract)
+    if validated_rv_contract != _expected_candidate_rv_output_contract():
+        raise LossBalanceError("new candidate RV-output contract mismatch")
     architectures = report.get("architectures", {})
     if set(architectures) != set(ARCHITECTURES) or any(
         item.get("balance_status") != "resolved" for item in architectures.values()
@@ -752,6 +790,8 @@ def freeze_balance_contract(report: Mapping[str, Any], path: Path | str) -> dict
         "parent_objective_contract_digest": PARENT_OBJECTIVE_DIGEST,
         "balance_policy_digest": report["balance_policy"]["digest"],
         "calibration_sample_digest": report["calibration_sample"]["endpoint_digest"],
+        "rv_output_contract": validated_rv_contract,
+        "rv_output_contract_digest": validated_rv_contract["rv_output_contract_digest"],
         "architectures": selected,
         "heterogeneous_architecture_objectives": len({x["selected_formulation"] for x in selected.values()}) > 1,
         "gradient_statistics_digest": _digest(selected),
