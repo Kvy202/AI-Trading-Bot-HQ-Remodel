@@ -19,6 +19,7 @@ import random
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -399,12 +400,61 @@ def _concat(symbol_datasets: Mapping[str, Mapping[str, Any]], split: str):
 
 def _class_weights(dataset: Any):
     torch = _torch()
-    labels = np.asarray([int(dataset[index]["y_ret_cls"]) for index in range(len(dataset))], dtype=np.int64)
+    if isinstance(dataset, torch.utils.data.ConcatDataset) and all(
+        isinstance(part, FrozenSequenceDataset) for part in dataset.datasets
+    ):
+        label_parts = [
+            np.asarray(part.labels["ret_cls"])[part.endpoints].astype(np.int64, copy=False)
+            for part in dataset.datasets
+        ]
+        labels = np.concatenate(label_parts) if label_parts else np.asarray([], dtype=np.int64)
+    else:
+        labels = np.asarray(
+            [int(dataset[index]["y_ret_cls"]) for index in range(len(dataset))],
+            dtype=np.int64,
+        )
     counts = np.bincount(labels, minlength=2)
     if np.any(counts == 0):
         raise ModelCandidateTrainingError("both training classes are required")
     total = int(counts.sum())
     return torch.tensor([total / (2 * counts[0]), total / (2 * counts[1])], dtype=torch.float32), counts
+
+
+def _timing(stage: str, started_at: float, **context: Any) -> float:
+    """Emit compact diagnostics that are intentionally excluded from experiment evidence."""
+    elapsed = time.perf_counter() - started_at
+    record = {
+        "stage": stage,
+        **context,
+        "elapsed_seconds": round(elapsed, 6),
+    }
+    print(
+        "model_candidate_timing=" + json.dumps(record, sort_keys=True, separators=(",", ":")),
+        file=sys.stderr,
+    )
+    return elapsed
+
+
+def _resolved_class_weight_evidence(
+    dataset: Any,
+    *,
+    class_weights: Sequence[float] | None,
+    class_counts: Sequence[int] | None,
+):
+    """Return seed-local tensors backed by either fresh or immutable shared evidence."""
+    torch = _torch()
+    if class_weights is None and class_counts is None:
+        started_at = time.perf_counter()
+        weights, counts = _class_weights(dataset)
+        _timing("class_weight_calculation", started_at)
+        return weights, counts
+    if class_weights is None or class_counts is None:
+        raise ModelCandidateTrainingError("precomputed class weights and counts must be provided together")
+    weights = torch.as_tensor(class_weights, dtype=torch.float32).detach().clone()
+    counts = np.asarray(class_counts, dtype=np.int64).copy()
+    if weights.shape != (2,) or counts.ndim != 1 or len(counts) < 2:
+        raise ModelCandidateTrainingError("precomputed class weights and counts must have width two")
+    return weights, counts
 
 
 def training_sequence_target_scales(
@@ -599,12 +649,16 @@ def train_classification_candidate(
     objective_contract_digest: str | None = None,
     formulation: Mapping[str, Any] | None = None,
     balance_contract_digest: str | None = None,
+    class_weights: Sequence[float] | None = None,
+    class_counts: Sequence[int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Train with the resolved objective; retain legacy mode for synthetic research."""
     torch = _torch()
     deterministic = set_deterministic_seed(seed)
     train_dataset = _concat(datasets_by_symbol, "train")
-    weights, counts = _class_weights(train_dataset)
+    weights, counts = _resolved_class_weight_evidence(
+        train_dataset, class_weights=class_weights, class_counts=class_counts
+    )
     scales = dict(target_scales or training_sequence_target_scales(datasets_by_symbol))
     effective_formulation = dict(formulation or formulation_descriptor("normalized_mse_fixed"))
     loader = torch.utils.data.DataLoader(
@@ -625,6 +679,7 @@ def train_classification_candidate(
     best_auc, best_loss, best_state, bad = -math.inf, math.inf, None, 0
     epochs: list[dict[str, Any]] = []
     for epoch in range(1, int(config["epochs"]) + 1):
+        epoch_started_at = time.perf_counter()
         model.train().cpu()
         component_sums = {
             "total_loss": 0.0, "classification_loss": 0.0,
@@ -670,11 +725,14 @@ def train_classification_candidate(
                 component_sums[name] += float(components[name].item()) * batch_rows
             seen += batch_rows
         scheduler.step()
+        _timing("training_epoch", epoch_started_at, seed=int(seed), epoch=epoch)
+        validation_started_at = time.perf_counter()
         validation = evaluate_classification_model(
             model, datasets_by_symbol, "validation", batch_size=int(config["batch_size"]),
             class_weights=weights.tolist(),
             target_scales=scales, objective=objective,
         )
+        _timing("validation_pass", validation_started_at, seed=int(seed), epoch=epoch)
         if validation["pooled"]["auc"] is None:
             raise ModelCandidateTrainingError("validation_failed")
         auc = float(validation["pooled"]["auc"])
@@ -699,11 +757,13 @@ def train_classification_candidate(
     if best_state is None:
         raise ModelCandidateTrainingError("training_failed")
     model.load_state_dict(best_state)
+    repeat_started_at = time.perf_counter()
     selected_validation = evaluate_classification_model(
         model, datasets_by_symbol, "validation", batch_size=int(config["batch_size"]),
         deterministic_repeat=True, class_weights=weights.tolist(),
         target_scales=scales, objective=objective,
     )
+    _timing("selected_deterministic_repeat_validation", repeat_started_at, seed=int(seed))
     history = {
         "seed": int(seed), "epochs": epochs, "best_epoch_auc": best_auc,
         "best_epoch_loss": best_loss, "epochs_completed": len(epochs),
@@ -1274,7 +1334,9 @@ def train_candidate_experiment(
     numerical, environment = _safe_environment_contract()
     record_incumbent_inventory()
     started_at = utc_now()
+    dataset_load_started_at = time.perf_counter()
     datasets, manifest = load_sequence_datasets(dataset)
+    _timing("load_sequence_datasets", dataset_load_started_at, model_kind=kind)
     try:
         balance_freeze = validate_balance_freeze(balance_freeze_path, dataset_manifest=manifest)
     except LossBalanceError as exc:
@@ -1296,6 +1358,11 @@ def train_candidate_experiment(
     target_scales = training_sequence_target_scales(datasets)
     if manifest.get("target_scales") != target_scales:
         raise ModelCandidateTrainingError("frozen training-sequence target scales mismatch")
+    class_weight_started_at = time.perf_counter()
+    experiment_weights, experiment_counts = _class_weights(_concat(datasets, "train"))
+    _timing("class_weight_calculation", class_weight_started_at, model_kind=kind)
+    shared_class_weights = tuple(float(value) for value in experiment_weights.tolist())
+    shared_class_counts = tuple(int(value) for value in experiment_counts.tolist())
     objective_contract_digest = str(objective_contract_report["objective_contract_digest"])
     balance_contract_digest = str(balance_freeze["balance_contract_digest"])
     record_validation_access(
@@ -1305,6 +1372,7 @@ def train_candidate_experiment(
     seed_results: list[dict[str, Any]] = []
     models: dict[int, Any] = {}
     for seed in policy["training_seeds"]:
+        seed_started_at = time.perf_counter()
         set_deterministic_seed(seed)
         model = make_candidate_model(kind, architecture["constructor"]).cpu()
         history, validation = train_classification_candidate(
@@ -1312,10 +1380,12 @@ def train_candidate_experiment(
             target_scales=target_scales,
             objective_contract_digest=objective_contract_digest,
             formulation=formulation, balance_contract_digest=balance_contract_digest,
+            class_weights=shared_class_weights, class_counts=shared_class_counts,
         )
         seed_results.append({"seed": seed, "validation": validation, "history": history})
         models[int(seed)] = model
         verify_incumbent_inventory()
+        _timing("seed_total", seed_started_at, model_kind=kind, seed=int(seed))
     selection = select_validation_seed(seed_results, policy)
     selected_seed = int(selection["selected_seed"])
     selected_model = models[selected_seed]
@@ -1350,12 +1420,13 @@ def train_candidate_experiment(
     selected_freeze["internal_test_first_access_at"] = utc_now()
     selected_freeze["freeze_digest"] = _manifest_digest(selected_freeze, "freeze_digest")
     atomic_write_json(freeze_directory / "selected_freeze.json", selected_freeze)
-    internal_weights, _ = _class_weights(_concat(datasets, "train"))
+    internal_test_started_at = time.perf_counter()
     internal = evaluate_classification_model(
         selected_model, datasets, "internal_test", batch_size=int(training_config["batch_size"]),
-        deterministic_repeat=True, class_weights=internal_weights.tolist(),
+        deterministic_repeat=True, class_weights=shared_class_weights,
         target_scales=target_scales, objective=objective,
     )
+    _timing("internal_test", internal_test_started_at, model_kind=kind, seed=selected_seed)
     internal["selection_evidence_allowed"] = False
     gate = internal_test_gate(internal, policy)
     target = _write_selected_candidate(
