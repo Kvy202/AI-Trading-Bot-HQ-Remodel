@@ -79,6 +79,7 @@ reports/model_training_datasets/
 reports/model_signal_research/
 reports/model_signal_backtest/
 reports/model_signal_selectivity/
+reports/model_executable_return_research/
 reports/model_candidate_confirmation/
 reports/model_candidate_seed_runs/
 
