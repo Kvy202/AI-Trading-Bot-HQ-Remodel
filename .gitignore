@@ -76,6 +76,7 @@ model_artifacts/candidates/
 # Generated Phase 24 candidate-training environments and evidence
 .venv-model-training/
 reports/model_training_datasets/
+reports/model_signal_research/
 reports/model_candidate_confirmation/
 reports/model_candidate_seed_runs/
 
