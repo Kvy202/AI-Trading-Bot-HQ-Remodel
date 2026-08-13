@@ -16,6 +16,7 @@ runtime.log
 
 # data & models (adjust as needed)
 data/
+data/hyperliquid_market_capture/
 oof/
 models/
 checkpoints/
