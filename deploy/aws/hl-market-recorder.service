@@ -1,0 +1,29 @@
+[Unit]
+Description=Passive Hyperliquid Mainnet Public Market Data Recorder
+Documentation=file:__INSTALL_DIR__/docs/HYPERLIQUID_MARKET_RECORDER_RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=__INSTALL_DIR__
+Environment=PYTHONPATH=__INSTALL_DIR__
+ExecStartPre=/usr/bin/mkdir -p __INSTALL_DIR__/data/hyperliquid_market_capture
+ExecStart=__INSTALL_DIR__/.venv/bin/python -u tools/hyperliquid_market_recorder.py --output-root data/hyperliquid_market_capture --heartbeat-seconds 5 --max-backoff-seconds 30 --log-level INFO
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=2
+KillSignal=SIGINT
+TimeoutStopSec=45
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
